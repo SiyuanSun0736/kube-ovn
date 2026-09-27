@@ -191,6 +191,7 @@ func isPodStatusPhaseAlive(p *v1.Pod) bool {
 
 func (c *Controller) enqueueAddPod(obj any) {
 	p := obj.(*v1.Pod)
+	c.enqueueVMIMigrationForBoundLauncher(nil, p)
 	if p.Spec.HostNetwork {
 		return
 	}
