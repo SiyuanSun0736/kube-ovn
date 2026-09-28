@@ -37,12 +37,13 @@ var testBaseTime = time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
 
 func newTestVMIMigration(name string, uid types.UID, createdAt time.Time, phase kubevirtv1.VirtualMachineInstanceMigrationPhase) *kubevirtv1.VirtualMachineInstanceMigration {
 	m := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name:              name,
-		Namespace:         metav1.NamespaceDefault,
-		UID:               uid,
-		CreationTimestamp: metav1.NewTime(createdAt),
-		Spec:              kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: testVMName},
-		Status:            kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: phase},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         metav1.NamespaceDefault,
+			UID:               uid,
+			CreationTimestamp: metav1.NewTime(createdAt),
+		}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: testVMName},
+		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: phase},
 	}
 	// the handler bails out early when the migration itself has no state, so every
 	// fixture carries one unless a test explicitly clears it
@@ -54,9 +55,10 @@ func newTestVMIMigration(name string, uid types.UID, createdAt time.Time, phase 
 // migrationUID leaves MigrationState nil, mimicking a VMI that never migrated.
 func newTestVMI(nodeName string, migrationUID types.UID) *kubevirtv1.VirtualMachineInstance {
 	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name:      testVMName,
-		Namespace: metav1.NamespaceDefault,
-		Status:    kubevirtv1.VirtualMachineInstanceStatus{NodeName: nodeName},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testVMName,
+			Namespace: metav1.NamespaceDefault,
+		}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: nodeName},
 	}
 	if migrationUID != "" {
 		vmi.Status.MigrationState = &kubevirtv1.VirtualMachineInstanceMigrationState{
@@ -79,13 +81,14 @@ func newTestMigrationAttachmentPod(name, nodeName string, uid types.UID) *corev1
 
 func newTestMigrationPod(name, nodeName string, uid types.UID, app string) *corev1.Pod {
 	return &corev1.Pod{
-		Name:      name,
-		Namespace: metav1.NamespaceDefault,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(uid),
-			kubevirtv1.AppLabel:          app,
-		},
-		Spec: corev1.PodSpec{NodeName: nodeName},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: metav1.NamespaceDefault,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(uid),
+				kubevirtv1.AppLabel:          app,
+			},
+		}, Spec: corev1.PodSpec{NodeName: nodeName},
 	}
 }
 
@@ -117,7 +120,7 @@ func newKubevirtFixture(t *testing.T, opts *FakeControllerOptions) *kubevirtFixt
 
 	ctrl := f.ctrl
 	ctrl.config.KubevirtClient = mockKubevirt
-	factory := informer.NewKubeVirtInformerFactoryWithOptions(nil, nil)
+	factory := informer.NewKubeVirtInformerFactory(nil, nil, nil, "")
 	ctrl.kubevirtInformerFactory = factory
 	f.vmimIndexer = factory.VirtualMachineInstanceMigration().GetIndexer()
 	ctrl.addOrUpdateVMIMigrationQueue = newTypedRateLimitingQueue[string]("AddOrUpdateVMIMigration", nil)
@@ -523,7 +526,7 @@ func TestHandleDeletePodMigrateOptionsCleanup(t *testing.T) {
 
 	setup := func(t *testing.T, jobUID, node string, migrations ...*kubevirtv1.VirtualMachineInstanceMigration) *kubevirtFixture {
 		t.Helper()
-		pod, subnet := podEventFixture()
+		pod, subnet := vmPodEventFixture()
 		pod.Name = "virt-launcher-vm1-source"
 		pod.OwnerReferences = []metav1.OwnerReference{{
 			APIVersion: kubevirtv1.SchemeGroupVersion.String(),
@@ -593,16 +596,17 @@ func TestHandleDeletePodMigrateOptionsCleanup(t *testing.T) {
 func TestDeletedPodOwnsMigrateOptions(t *testing.T) {
 	newPod := func(name, node string, created time.Time, jobUID string) *corev1.Pod {
 		pod := &corev1.Pod{
-			Name:              name,
-			Namespace:         metav1.NamespaceDefault,
-			UID:               types.UID(name),
-			CreationTimestamp: metav1.NewTime(created),
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: kubevirtv1.SchemeGroupVersion.String(),
-				Kind:       util.KindVirtualMachineInstance,
-				Name:       testVMName,
-			}},
-			Spec: corev1.PodSpec{NodeName: node},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         metav1.NamespaceDefault,
+				UID:               types.UID(name),
+				CreationTimestamp: metav1.NewTime(created),
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: kubevirtv1.SchemeGroupVersion.String(),
+					Kind:       util.KindVirtualMachineInstance,
+					Name:       testVMName,
+				}},
+			}, Spec: corev1.PodSpec{NodeName: node},
 		}
 		if jobUID != "" {
 			pod.Labels = map[string]string{kubevirtv1.MigrationJobLabel: jobUID}
@@ -651,7 +655,7 @@ func TestDeletedPodOwnsMigrateOptions(t *testing.T) {
 }
 
 func TestDeletedPodOwnsMigrateOptionsVMIErrors(t *testing.T) {
-	pod := &corev1.Pod{Name: "virt-launcher-vm1", Namespace: metav1.NamespaceDefault, UID: "pod-uid"}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "virt-launcher-vm1", Namespace: metav1.NamespaceDefault, UID: "pod-uid"}}
 
 	podOfVMI := func(vmiUID types.UID) *corev1.Pod {
 		p := pod.DeepCopy()
@@ -886,7 +890,7 @@ func TestEnqueueVMIMigration(t *testing.T) {
 }
 
 func TestEnqueueDeleteVM(t *testing.T) {
-	vm := &kubevirtv1.VirtualMachine{Name: testVMName, Namespace: metav1.NamespaceDefault}
+	vm := &kubevirtv1.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: metav1.NamespaceDefault}}
 
 	tests := []struct {
 		name   string
@@ -912,7 +916,7 @@ func TestHandleDeleteVM(t *testing.T) {
 	const portName = "vm1.default"
 
 	newIP := func() *kubeovnv1.IP {
-		return &kubeovnv1.IP{Name: portName}
+		return &kubeovnv1.IP{ObjectMeta: metav1.ObjectMeta{Name: portName}}
 	}
 
 	t.Run("invalid key is dropped without error", func(t *testing.T) {
@@ -928,8 +932,8 @@ func TestHandleDeleteVM(t *testing.T) {
 
 	t.Run("releases the ip, the ipam address and the port", func(t *testing.T) {
 		subnet := &kubeovnv1.Subnet{
-			Name: "test-subnet",
-			Spec: kubeovnv1.SubnetSpec{CIDRBlock: "10.0.0.0/24", Gateway: "10.0.0.1", Protocol: kubeovnv1.ProtocolIPv4},
+			ObjectMeta: metav1.ObjectMeta{Name: "test-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "10.0.0.0/24", Gateway: "10.0.0.1", Protocol: kubeovnv1.ProtocolIPv4},
 		}
 		f := newKubevirtFixture(t, &FakeControllerOptions{Subnets: []*kubeovnv1.Subnet{subnet}, IPs: []*kubeovnv1.IP{newIP()}})
 		ctrl := f.ctrl
@@ -976,13 +980,14 @@ func TestHandleAddOrUpdateVMIMigrationConfiguresPendingMigration(t *testing.T) {
 	)
 	migrationUID := types.UID("migration-uid")
 	targetPod := &corev1.Pod{
-		Name:      "virt-launcher-test-vmi-target",
-		Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(migrationUID),
-			kubevirtv1.AppLabel:          "virt-launcher",
-		},
-		Spec: corev1.PodSpec{NodeName: targetNode},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "virt-launcher-test-vmi-target",
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(migrationUID),
+				kubevirtv1.AppLabel:          "virt-launcher",
+			},
+		}, Spec: corev1.PodSpec{NodeName: targetNode},
 	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{targetPod}})
@@ -995,16 +1000,12 @@ func TestHandleAddOrUpdateVMIMigrationConfiguresPendingMigration(t *testing.T) {
 	fc.fakeController.config.KubevirtClient = kubevirtClient
 
 	vmiMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: migration, Namespace: namespace, UID: migrationUID,
-		Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: migration, Namespace: namespace, UID: migrationUID}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name: vmiName, Namespace: namespace,
-		Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
-	}
+	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil)
@@ -1026,13 +1027,14 @@ func TestHandleAddOrUpdateVMIMigrationIgnoresHotplugAttachmentPod(t *testing.T) 
 	)
 	migrationUID := types.UID("migration-uid")
 	attachmentPod := &corev1.Pod{
-		Name:      "hp-volume-test",
-		Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(migrationUID),
-			kubevirtv1.AppLabel:          "hotplug-disk",
-		},
-		Spec: corev1.PodSpec{NodeName: "target-node"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hp-volume-test",
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(migrationUID),
+				kubevirtv1.AppLabel:          "hotplug-disk",
+			},
+		}, Spec: corev1.PodSpec{NodeName: "target-node"},
 	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{attachmentPod}})
@@ -1045,16 +1047,12 @@ func TestHandleAddOrUpdateVMIMigrationIgnoresHotplugAttachmentPod(t *testing.T) 
 	fc.fakeController.config.KubevirtClient = kubevirtClient
 
 	vmiMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: migration, Namespace: namespace, UID: migrationUID,
-		Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: migration, Namespace: namespace, UID: migrationUID}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name: vmiName, Namespace: namespace,
-		Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: "source-node"},
-	}
+	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: "source-node"}}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil)
@@ -1078,13 +1076,14 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationWithoutMigrationState
 	)
 	migrationUID := types.UID("migration-uid")
 	targetLauncherPod := &corev1.Pod{
-		Name:      "virt-launcher-test-vmi-target",
-		Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(migrationUID),
-			kubevirtv1.AppLabel:          "virt-launcher",
-		},
-		Spec: corev1.PodSpec{NodeName: targetNode},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "virt-launcher-test-vmi-target",
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(migrationUID),
+				kubevirtv1.AppLabel:          "virt-launcher",
+			},
+		}, Spec: corev1.PodSpec{NodeName: targetNode},
 	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{targetLauncherPod}})
@@ -1097,16 +1096,12 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationWithoutMigrationState
 	fc.fakeController.config.KubevirtClient = kubevirtClient
 
 	vmiMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: migration, Namespace: namespace, UID: migrationUID,
-		Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: migration, Namespace: namespace, UID: migrationUID}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name: vmiName, Namespace: namespace,
-		Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
-	}
+	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil).Times(2)
@@ -1140,13 +1135,14 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationAfterVMIDeletion(t *t
 	)
 	migrationUID := types.UID("migration-uid")
 	targetPod := &corev1.Pod{
-		Name:      "virt-launcher-test-vmi-target",
-		Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(migrationUID),
-			kubevirtv1.AppLabel:          "virt-launcher",
-		},
-		Spec: corev1.PodSpec{NodeName: targetNode},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "virt-launcher-test-vmi-target",
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(migrationUID),
+				kubevirtv1.AppLabel:          "virt-launcher",
+			},
+		}, Spec: corev1.PodSpec{NodeName: targetNode},
 	}
 
 	// KubeVirt usually records the source pod while Pending, so both variants reach Failed.
@@ -1165,17 +1161,13 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationAfterVMIDeletion(t *t
 			fc.fakeController.config.KubevirtClient = kubevirtClient
 
 			vmiMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-				Name: migration, Namespace: namespace, UID: migrationUID,
-				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+				ObjectMeta: metav1.ObjectMeta{Name: migration, Namespace: namespace, UID: migrationUID}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
 					Phase:          kubevirtv1.MigrationPending,
 					MigrationState: migrationState,
 				},
 			}
-			vmi := &kubevirtv1.VirtualMachineInstance{
-				Name: vmiName, Namespace: namespace,
-				Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
-			}
+			vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
 
 			kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 			migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil).Times(2)
@@ -1211,13 +1203,11 @@ func TestHandleAddOrUpdateVMIMigrationSkipsMissingVMIWithActiveMigration(t *test
 		vmiName   = "test-vmi"
 	)
 	failedMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 	pendingMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationPending},
 	}
 
@@ -1245,8 +1235,7 @@ func TestHandleAddOrUpdateVMIMigrationPreservesNonMigrationPortOptionsWithoutVMI
 		nodeName  = "source-node"
 	)
 	vmiMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 
@@ -1286,23 +1275,22 @@ func TestHandleAddOrUpdateVMIMigrationSkipsStaleFailedMigrationCleanup(t *testin
 		portName   = "test-vmi.test"
 	)
 	failedMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-migration-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-migration-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 	pendingMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-migration-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-migration-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationPending},
 	}
 	targetLauncherPod := &corev1.Pod{
-		Name:      "virt-launcher-test-vmi-target",
-		Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(pendingMigration.UID),
-			kubevirtv1.AppLabel:          "virt-launcher",
-		},
-		Spec: corev1.PodSpec{NodeName: targetNode},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "virt-launcher-test-vmi-target",
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(pendingMigration.UID),
+				kubevirtv1.AppLabel:          "virt-launcher",
+			},
+		}, Spec: corev1.PodSpec{NodeName: targetNode},
 	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{targetLauncherPod}})
@@ -1312,10 +1300,7 @@ func TestHandleAddOrUpdateVMIMigrationSkipsStaleFailedMigrationCleanup(t *testin
 	migrationClient := kubecli.NewMockVirtualMachineInstanceMigrationInterface(mockCtrl)
 	vmiClient := kubecli.NewMockVirtualMachineInstanceInterface(mockCtrl)
 	fc.fakeController.config.KubevirtClient = kubevirtClient
-	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name: vmiName, Namespace: namespace,
-		Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
-	}
+	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 	migrationClient.EXPECT().Get(gomock.Any(), pendingMigration.Name, metav1.GetOptions{}).Return(pendingMigration, nil)
@@ -1344,22 +1329,21 @@ func TestHandleAddOrUpdateVMIMigrationSkipsStaleFailedMigrationWithMatchingVMISt
 		portName   = "test-vmi.test"
 	)
 	failedMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-migration-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-migration-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 	pendingMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-migration-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-migration-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationPending},
 	}
 	targetLauncherPod := &corev1.Pod{
-		Name: "virt-launcher-test-vmi-target", Namespace: namespace,
-		Labels: map[string]string{
-			kubevirtv1.MigrationJobLabel: string(pendingMigration.UID),
-			kubevirtv1.AppLabel:          "virt-launcher",
-		},
-		Spec: corev1.PodSpec{NodeName: targetNode},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "virt-launcher-test-vmi-target", Namespace: namespace,
+			Labels: map[string]string{
+				kubevirtv1.MigrationJobLabel: string(pendingMigration.UID),
+				kubevirtv1.AppLabel:          "virt-launcher",
+			},
+		}, Spec: corev1.PodSpec{NodeName: targetNode},
 	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{targetLauncherPod}})
@@ -1370,8 +1354,7 @@ func TestHandleAddOrUpdateVMIMigrationSkipsStaleFailedMigrationWithMatchingVMISt
 	vmiClient := kubecli.NewMockVirtualMachineInstanceInterface(mockCtrl)
 	fc.fakeController.config.KubevirtClient = kubevirtClient
 	vmi := &kubevirtv1.VirtualMachineInstance{
-		Name: vmiName, Namespace: namespace,
-		Status: kubevirtv1.VirtualMachineInstanceStatus{
+		ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{
 			NodeName: sourceNode,
 			MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
 				MigrationUID: failedMigration.UID, SourceNode: sourceNode, TargetNode: "failed-target-node",
@@ -1403,13 +1386,11 @@ func TestHandleAddOrUpdateVMIMigrationSkipsFailedCleanupWhenInformerLags(t *test
 		vmiName   = "test-vmi"
 	)
 	failedMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 	pendingMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-migration", Namespace: namespace, UID: types.UID("pending-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmiName},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationPending},
 	}
 
@@ -1432,8 +1413,7 @@ func TestHandleAddOrUpdateVMIMigrationSkipsFailedCleanupWhenInformerLags(t *test
 func TestHandleAddOrUpdateVMIMigrationRetriesFailedCleanupWhenMigrationListFails(t *testing.T) {
 	const namespace = "test"
 	failedMigration := &kubevirtv1.VirtualMachineInstanceMigration{
-		Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid"),
-		Spec:   kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: "test-vmi"},
+		ObjectMeta: metav1.ObjectMeta{Name: "failed-migration", Namespace: namespace, UID: types.UID("failed-uid")}, Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: "test-vmi"},
 		Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{Phase: kubevirtv1.MigrationFailed},
 	}
 
@@ -1459,9 +1439,11 @@ func TestEnqueueVMIMigrationForBoundLauncher(t *testing.T) {
 	c.addOrUpdateVMIMigrationQueue = newTypedRateLimitingQueue[string]("test", nil)
 
 	unbound := &corev1.Pod{
-		Name: "virt-launcher-vm-target", Namespace: "test",
-		Labels:      map[string]string{kubevirtv1.AppLabel: "virt-launcher"},
-		Annotations: map[string]string{kubevirtv1.MigrationJobNameAnnotation: "vm-migration"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "virt-launcher-vm-target", Namespace: "test",
+			Labels:      map[string]string{kubevirtv1.AppLabel: "virt-launcher"},
+			Annotations: map[string]string{kubevirtv1.MigrationJobNameAnnotation: "vm-migration"},
+		},
 	}
 	bound := unbound.DeepCopy()
 	bound.Spec.NodeName = "target-node"
@@ -1482,4 +1464,18 @@ func TestEnqueueVMIMigrationForBoundLauncher(t *testing.T) {
 	require.Equal(t, 1, c.addOrUpdateVMIMigrationQueue.Len())
 	key, _ = c.addOrUpdateVMIMigrationQueue.Get()
 	require.Equal(t, "test/vm-migration", key)
+}
+
+func vmPodEventFixture() (*corev1.Pod, *kubeovnv1.Subnet) {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pod", Namespace: metav1.NamespaceDefault, UID: "pod-uid",
+			Annotations: map[string]string{util.LogicalSwitchAnnotation: "subnet-a"},
+		}}, &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "subnet-a"},
+			Spec: kubeovnv1.SubnetSpec{
+				CIDRBlock: "10.0.0.0/24", Gateway: "10.0.0.1", Protocol: kubeovnv1.ProtocolIPv4,
+				Provider: util.OvnProvider, Vpc: util.DefaultVpc, Default: true,
+			},
+			Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 253},
+		}
 }

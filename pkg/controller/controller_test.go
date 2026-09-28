@@ -277,7 +277,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	}
 
 	// the kubevirt informer is created without a client: tests populate its indexer directly
-	ctrl.kubevirtInformerFactory = informer.NewKubeVirtInformerFactoryWithOptions(nil, nil)
+	ctrl.kubevirtInformerFactory = informer.NewKubeVirtInformerFactory(nil, nil, nil, "")
 
 	ctrl.config = &Configuration{
 		ClusterRouter:        "ovn-cluster",

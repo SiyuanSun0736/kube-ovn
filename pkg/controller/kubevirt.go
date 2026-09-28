@@ -578,7 +578,7 @@ func (c *Controller) hasNewerActiveVMIMigration(vmiMigration *kubevirtv1.Virtual
 }
 
 func (c *Controller) isKubevirtCRDInstalled() (bool, error) {
-	return util.APIResourceExists(c.config.KubevirtClient.Discovery(),
+	return apiResourceExists(c.config.KubevirtClient.Discovery(),
 		kubevirtv1.GroupVersion.String(),
 		util.KindVirtualMachine,
 		util.KindVirtualMachineInstance,
