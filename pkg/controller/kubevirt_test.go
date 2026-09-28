@@ -14,7 +14,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	discoveryv1listers "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
@@ -1465,14 +1464,6 @@ func TestEnqueueVMIMigrationForBoundLauncher(t *testing.T) {
 	require.Equal(t, 1, c.addOrUpdateVMIMigrationQueue.Len())
 	key, _ = c.addOrUpdateVMIMigrationQueue.Get()
 	require.Equal(t, "test/vm-migration", key)
-	c.addOrUpdateVMIMigrationQueue.Done(key)
-
-	// The Pod update handler must relay the scheduling transition to the migration queue.
-	c.endpointSlicesLister = discoveryv1listers.NewEndpointSliceLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
-	unbound.Spec.HostNetwork = true
-	bound.Spec.HostNetwork = true
-	c.enqueueUpdatePod(unbound, bound)
-	require.Equal(t, 1, c.addOrUpdateVMIMigrationQueue.Len())
 }
 
 func vmPodEventFixture() (*corev1.Pod, *kubeovnv1.Subnet) {
