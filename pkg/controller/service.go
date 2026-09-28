@@ -59,7 +59,7 @@ func (c *Controller) enqueueAddService(obj any) {
 		}
 	}
 
-	if c.config.EnableLbSvc || c.config.EnableBgpLbVip {
+	if c.config.EnablePodLbSvc || c.config.EnableBgpLbVip {
 		klog.V(3).Infof("enqueue add service %s for lb processing", key)
 		c.addServiceQueue.Add(key)
 	}
@@ -159,7 +159,7 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 
 // handleDeleteService cleans up resources associated with a deleted Service.
 //
-// When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
+// When EnableBgpLbVip=true and EnableOvnLB=false, this function has no interaction
 // with OVN whatsoever. The only cleanup that runs is cleanBgpLbVipService, which
 // is a pure IPAM-level operation (BGP withdrawal happens automatically when the
 // speaker no longer sees the bgp annotation on the Service object).
@@ -172,13 +172,13 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 
 	// OVN LB VIP cleanup is only relevant when the classic OVN LB mode is active;
 	// see deleteServiceOvnLBVips for details.
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		if err := c.deleteServiceOvnLBVips(service); err != nil {
 			return err
 		}
 	}
 
-	if c.config.EnableLbSvc && service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer {
+	if c.config.EnablePodLbSvc && service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer {
 		if err := c.deleteLbSvc(service.Svc); err != nil {
 			klog.Errorf("failed to delete service %s, %v", service.Svc.Name, err)
 			return err
@@ -196,7 +196,7 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 }
 
 // deleteServiceOvnLBVips removes ClusterIP VIPs from OVN load balancer tables for a
-// deleted Service. Only called when EnableLb=true (classic OVN LB mode).
+// deleted Service. Only called when EnableOvnLB=true (classic OVN LB mode).
 func (c *Controller) deleteServiceOvnLBVips(service *vpcService) error {
 	svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
 	if err != nil {
@@ -294,13 +294,13 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 
 	// OVN ClusterIP VIP management is only relevant in classic OVN LB mode;
 	// see syncServiceOvnLBVips for details.
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		if err := c.syncServiceOvnLBVips(key, svc, ips, ipsToDel); err != nil {
 			return err
 		}
 	}
 
-	if c.config.EnableLbSvc && svc.Spec.Type == v1.ServiceTypeLoadBalancer {
+	if c.config.EnablePodLbSvc && svc.Spec.Type == v1.ServiceTypeLoadBalancer {
 		changed, err := c.checkLbSvcDeployAnnotationChanged(svc)
 		if err != nil {
 			klog.Errorf("failed to check annotation change for lb svc %s: %v", key, err)
@@ -346,7 +346,7 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 		if vipName == "" && svcObject.hadBgpVipAnnotation && len(svc.Status.LoadBalancer.Ingress) > 0 {
 			// Annotation was removed from a controller-owned Service; clear the stale
 			// ingress so kube-proxy and the BGP speaker see a clean state.
-			// EnableBgpLbVip and EnableLbSvc are mutually exclusive (config validate),
+			// EnableBgpLbVip and EnablePodLbSvc are mutually exclusive (config validate),
 			// so no other LB controller owns the ingress field when this path runs.
 			targetSvc := svc.DeepCopy()
 			targetSvc.Status.LoadBalancer.Ingress = nil
@@ -370,7 +370,7 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 
 // syncServiceOvnLBVips reconciles ClusterIP VIPs in OVN load balancer tables on Service
 // update: adds missing VIPs, removes stale VIPs, and enqueues endpoint/SLR re-syncs as
-// needed. Only called when EnableLb=true (classic OVN LB mode).
+// needed. Only called when EnableOvnLB=true (classic OVN LB mode).
 func (c *Controller) syncServiceOvnLBVips(key string, svc *v1.Service, ips, ipsToDel []string) error {
 	// Re-derive ingress IPs from a fresh subnet check instead of trusting the
 	// ServiceExternalIPFromSubnetAnnotation annotation.  That annotation is
@@ -545,9 +545,9 @@ func parseVipAddr(vip string) string {
 //   - EnableBgpLbVip=true : pure IPAM path — binds a VIP CR to the Service's
 //     externalIPs and lets the BGP speaker announce it. No OVN LB objects are
 //     created or modified; OVN is not involved at all.
-//   - EnableLbSvc=true    : Pod-based path — creates a dedicated lb-svc Pod that
+//   - EnablePodLbSvc=true  : Pod-based path — creates a dedicated lb-svc Pod that
 //     provides external connectivity via iptables NAT inside OVN.
-//   - EnableLb=true       : classic OVN LB path — handled via the update/delete
+//   - EnableOvnLB=true    : classic OVN LB path — handled via the update/delete
 //     workers (add just enqueues endpoint sync).
 func (c *Controller) handleAddService(key string) error {
 	if c.config.EnableBgpLbVip {
@@ -557,7 +557,7 @@ func (c *Controller) handleAddService(key string) error {
 		klog.Infof("dispatch add service %s to bgp-lb-vip handler", key)
 		return c.handleAddBgpLbVipService(key)
 	}
-	if !c.config.EnableLbSvc {
+	if !c.config.EnablePodLbSvc {
 		return nil
 	}
 

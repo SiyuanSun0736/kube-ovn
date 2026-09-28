@@ -476,7 +476,7 @@ func TestHandleAddServicePrefersBgpLbVipWhenBothEnabled(t *testing.T) {
 		ctrl := fc.fakeController
 		ctrl.svcKeyMutex = keymutex.NewHashed(0)
 		ctrl.config.EnableBgpLbVip = true
-		ctrl.config.EnableLbSvc = true
+		ctrl.config.EnablePodLbSvc = true
 
 		svc := newService()
 		require.NoError(t, fc.fakeInformers.serviceInformer.Informer().GetIndexer().Add(svc))
@@ -492,7 +492,7 @@ func TestHandleAddServicePrefersBgpLbVipWhenBothEnabled(t *testing.T) {
 		ctrl := fc.fakeController
 		ctrl.svcKeyMutex = keymutex.NewHashed(0)
 		ctrl.config.EnableBgpLbVip = false
-		ctrl.config.EnableLbSvc = true
+		ctrl.config.EnablePodLbSvc = true
 
 		svc := newService()
 		require.NoError(t, fc.fakeInformers.serviceInformer.Informer().GetIndexer().Add(svc))

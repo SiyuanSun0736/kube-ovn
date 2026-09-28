@@ -583,7 +583,7 @@ func (c *Controller) gcLoadBalancer() error {
 		vpcLbs.Add(dnat.Name)
 	}
 
-	if !c.config.EnableLb {
+	if !c.config.EnableOvnLB {
 		// remove lb from logical switch
 		vpcs, err := c.vpcsLister.List(labels.Everything())
 		if err != nil {
@@ -1190,7 +1190,7 @@ func (c *Controller) gcLbSvcPods() error {
 }
 
 func (c *Controller) gcVPCDNS() error {
-	if !c.config.EnableLb {
+	if !c.config.EnableOvnLB {
 		return nil
 	}
 

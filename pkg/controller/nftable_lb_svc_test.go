@@ -48,7 +48,7 @@ func Test_nftableLbSvcQualifies(t *testing.T) {
 func TestNftableLbEventHelpersRespectFeatureGate(t *testing.T) {
 	t.Parallel()
 
-	c := &Controller{config: &Configuration{EnableLb: true}}
+	c := &Controller{config: &Configuration{EnableOvnLB: true}}
 	require.NotPanics(t, func() {
 		c.enqueueNftableLbServicesForPod(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod"}})
 		c.enqueueNftableLbServicesForEIP("eip0")
@@ -70,7 +70,7 @@ func TestEnqueueNftableLbSvcOwnersFromRules(t *testing.T) {
 	}
 
 	c := &Controller{
-		config:                       &Configuration{EnableLb: false, EnableNftableLbSvc: true},
+		config:                       &Configuration{EnableOvnLB: false, EnableNftableLbSvc: true},
 		iptablesDnatRulesLister:      kubeovnlister.NewIptablesDnatRuleLister(indexer),
 		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
 	}

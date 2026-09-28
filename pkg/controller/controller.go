@@ -695,7 +695,7 @@ func Run(ctx context.Context, config *Configuration) {
 	); err != nil {
 		util.LogFatalAndExit(err, "failed to create ovn sb client")
 	}
-	if config.EnableLb {
+	if config.EnableOvnLB {
 		controller.switchLBRuleLister = switchLBRuleInformer.Lister()
 		controller.switchLBRuleSynced = switchLBRuleInformer.Informer().HasSynced
 		controller.addSwitchLBRuleQueue = newTypedRateLimitingQueue("AddSwitchLBRule", custCrdRateLimiter)
@@ -787,7 +787,7 @@ func Run(ctx context.Context, config *Configuration) {
 		controller.ovnEipSynced, controller.ovnFipSynced, controller.ovnSnatRuleSynced,
 		controller.ovnDnatRuleSynced,
 	}
-	if controller.config.EnableLb {
+	if controller.config.EnableOvnLB {
 		cacheSyncs = append(cacheSyncs, controller.switchLBRuleSynced, controller.vpcDNSSynced)
 	}
 	if controller.config.EnableNP {
@@ -1000,7 +1000,7 @@ func Run(ctx context.Context, config *Configuration) {
 		util.LogFatalAndExit(err, "failed to add qos policy event handler")
 	}
 
-	if config.EnableLb {
+	if config.EnableOvnLB {
 		if _, err = switchLBRuleInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    controller.enqueueAddSwitchLBRule,
 			UpdateFunc: controller.enqueueUpdateSwitchLBRule,
@@ -1258,7 +1258,7 @@ func (c *Controller) shutdown() {
 	c.addOrUpdateVpcEgressGatewayQueue.ShutDown()
 	c.delVpcEgressGatewayQueue.ShutDown()
 
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		c.addSwitchLBRuleQueue.ShutDown()
 		c.delSwitchLBRuleQueue.ShutDown()
 		c.updateSwitchLBRuleQueue.ShutDown()
@@ -1414,9 +1414,9 @@ func (c *Controller) startWorkers(ctx context.Context) {
 
 	// K8s LB workers are needed by both the classic OVN LB mode and the
 	// Service-based LB modes (lb-svc / bgp-lb-vip).
-	k8sLBWorker := c.config.EnableLb || c.config.EnableLbSvc || c.config.EnableBgpLbVip
+	k8sLBWorker := c.config.EnableOvnLB || c.config.EnablePodLbSvc || c.config.EnableBgpLbVip
 	// OVN LB workers are only needed by the classic OVN LB mode.
-	ovnLBWorker := c.config.EnableLb
+	ovnLBWorker := c.config.EnableOvnLB
 
 	if k8sLBWorker {
 		go wait.Until(runWorker("add service", c.addServiceQueue, c.handleAddService), time.Second, ctx.Done())
@@ -1633,7 +1633,7 @@ func (c *Controller) initResourceOnce() {
 		util.LogFatalAndExit(err, "failed to sync crd vpc nat gateways")
 	}
 
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		if err := c.initVpcDNSConfig(); err != nil {
 			util.LogFatalAndExit(err, "failed to initialize vpc-dns")
 		}

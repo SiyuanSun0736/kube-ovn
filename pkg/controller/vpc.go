@@ -565,7 +565,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	vpc.Status.Router = key
 	vpc.Status.Standby = true
 	vpc.Status.VpcPeerings = newPeers
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		vpcLb, err := c.addLoadBalancer(key)
 		if err != nil {
 			klog.Error(err)

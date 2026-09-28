@@ -63,7 +63,7 @@ func (c *Controller) InitOVN() error {
 		return err
 	}
 
-	if c.config.EnableLb {
+	if c.config.EnableOvnLB {
 		if err = c.initLoadBalancer(); err != nil {
 			klog.Errorf("init load balancer failed: %v", err)
 			return err
@@ -162,7 +162,7 @@ func (c *Controller) initDefaultLogicalSwitch() error {
 			NatOutgoing:         true,
 			GatewayType:         kubeovnv1.GWDistributedType,
 			Protocol:            util.CheckProtocol(c.config.DefaultCIDR),
-			EnableLb:            &c.config.EnableLb,
+			EnableLb:            &c.config.EnableOvnLB,
 		},
 	}
 	if c.config.NetworkType == util.NetworkTypeVlan {

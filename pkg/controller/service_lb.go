@@ -390,7 +390,7 @@ func (c *Controller) checkAndReInitLbSvcPod(pod *corev1.Pod) error {
 		klog.Error(err)
 		return err
 	}
-	if lbsvc.Spec.Type != corev1.ServiceTypeLoadBalancer || !c.config.EnableLbSvc {
+	if lbsvc.Spec.Type != corev1.ServiceTypeLoadBalancer || !c.config.EnablePodLbSvc {
 		return nil
 	}
 

@@ -140,7 +140,7 @@ func (c *Controller) handleUpdateEndpointSlice(key string) error {
 		return nil
 	}
 
-	if c.config.EnableLb && c.config.EnableOVNLBPreferLocal {
+	if c.config.EnableOvnLB && c.config.EnableOVNLBPreferLocal {
 		if svc.Spec.Type == v1.ServiceTypeLoadBalancer && svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
 			if len(svc.Status.LoadBalancer.Ingress) > 0 {
 				for _, ingress := range svc.Status.LoadBalancer.Ingress {

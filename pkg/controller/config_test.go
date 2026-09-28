@@ -50,7 +50,7 @@ func TestConfigurationValidateModeFlags(t *testing.T) {
 
 			cfg := &Configuration{
 				EnableBgpLbVip: tt.enableBgpLb,
-				EnableLbSvc:    tt.enableLbSvc,
+				EnablePodLbSvc: tt.enableLbSvc,
 			}
 
 			err := cfg.validateModeFlags()
