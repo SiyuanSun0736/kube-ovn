@@ -51,6 +51,7 @@ const (
 	OVSDBWaitTimeout = 0
 
 	ExternalIDVendor           = "vendor"
+	ExternalIDVpcNatGateway    = "vpc-nat-gateway"
 	ExternalIDVpcEgressGateway = "vpc-egress-gateway"
 )
 
@@ -281,7 +282,7 @@ func (c *ovsDbClient) Transact(method string, operations []ovsdb.Operation) erro
 
 	start := time.Now()
 	results, err := c.Client.Transact(ctx, operations...)
-	elapsed := float64((time.Since(start)) / time.Millisecond)
+	elapsed := float64(time.Since(start) / time.Millisecond)
 
 	var dbType string
 	switch c.Schema().Name {

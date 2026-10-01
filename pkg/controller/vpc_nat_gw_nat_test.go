@@ -2,16 +2,13 @@ package controller
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
-	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -39,7 +36,7 @@ func TestValidateDnat(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "empty eip",
+			name: "neither eip nor clusterIP",
 			dnat: &kubeovnv1.IptablesDnatRule{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},
 				Spec: kubeovnv1.IptablesDnatRuleSpec{
@@ -51,7 +48,7 @@ func TestValidateDnat(t *testing.T) {
 				},
 			},
 			wantErr: true,
-			errMsg:  "eip cannot be empty",
+			errMsg:  "one of eip and clusterIP must be set",
 		},
 		{
 			name: "empty externalPort",
@@ -509,7 +506,7 @@ func TestDeleteFipInPod_NatGwExistsPodMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = fc.fakeController.deleteFipInPod("test-gw", "10.0.0.1")
-	require.Error(t, err, "should return error to retry when pod is temporarily absent")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
 // TestDeleteDnatInPod_NatGwGone verifies that deleteDnatInPod returns nil when
@@ -531,7 +528,7 @@ func TestDeleteDnatInPod_NatGwExistsPodMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = fc.fakeController.deleteDnatInPod("test-gw", "tcp", "10.0.0.1", "80")
-	require.Error(t, err, "should return error to retry when pod is temporarily absent")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
 // TestDeleteSnatInPod_NatGwGone verifies that deleteSnatInPod returns nil when
@@ -553,11 +550,11 @@ func TestDeleteSnatInPod_NatGwExistsPodMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = fc.fakeController.deleteSnatInPod("test-gw", "10.0.0.1", "192.168.1.0/24")
-	require.Error(t, err, "should return error to retry when pod is temporarily absent")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
-// shareDnat builds an IptablesDnatRule with the identity labels that getShareBackends
-// and isDnatDuplicated select on. dnatType may be "" (defaults to exclusive behavior).
+// shareDnat builds an IptablesDnatRule with the identity labels the share DNAT consumers
+// select on. dnatType may be "" (defaults to exclusive behavior).
 func shareDnat(name, gw, eip, eport, proto, intIP, intPort, dnatType string) *kubeovnv1.IptablesDnatRule {
 	return &kubeovnv1.IptablesDnatRule{
 		ObjectMeta: metav1.ObjectMeta{
@@ -576,17 +573,6 @@ func shareDnat(name, gw, eip, eport, proto, intIP, intPort, dnatType string) *ku
 			Type:         dnatType,
 		},
 	}
-}
-
-// dnatListerController returns a Controller whose iptablesDnatRulesLister is backed by the
-// given objects, so lister-based helpers can be unit tested without a running informer.
-func dnatListerController(t *testing.T, dnats ...*kubeovnv1.IptablesDnatRule) *Controller {
-	t.Helper()
-	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	for _, d := range dnats {
-		require.NoError(t, indexer.Add(d))
-	}
-	return &Controller{iptablesDnatRulesLister: kubeovnlister.NewIptablesDnatRuleLister(indexer)}
 }
 
 func TestDedupSortedBackends(t *testing.T) {
@@ -617,30 +603,6 @@ func TestDedupSortedBackends(t *testing.T) {
 	}
 }
 
-func TestGetShareBackends(t *testing.T) {
-	t.Parallel()
-
-	deleting := shareDnat("deleting", "gw", "eip", "80", "tcp", "10.0.0.5", "8080", kubeovnv1.DnatRuleTypeShare)
-	deleting.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
-
-	c := dnatListerController(t,
-		shareDnat("self", "gw", "eip", "80", "tcp", "10.0.0.9", "8080", kubeovnv1.DnatRuleTypeShare),
-		shareDnat("d1", "gw", "eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeShare),
-		shareDnat("d2", "gw", "eip", "80", "tcp", "10.0.0.2", "8080", kubeovnv1.DnatRuleTypeShare),
-		shareDnat("exclusive", "gw", "eip", "80", "tcp", "10.0.0.3", "8080", kubeovnv1.DnatRuleTypeExclusive),
-		shareDnat("other-proto", "gw", "eip", "80", "udp", "10.0.0.4", "8080", kubeovnv1.DnatRuleTypeShare),
-		shareDnat("other-eip", "gw", "eip2", "80", "tcp", "10.0.0.6", "8080", kubeovnv1.DnatRuleTypeShare),
-		shareDnat("incomplete", "gw", "eip", "80", "tcp", "", "8080", kubeovnv1.DnatRuleTypeShare),
-		deleting,
-	)
-
-	backends, err := c.getShareBackends("gw", "eip", "80", "tcp", "self")
-	require.NoError(t, err)
-	// Self is excluded; only ready share siblings with the same identity are returned.
-	// Exclusive, other protocol/eip, incomplete spec and deleting rules are filtered out.
-	assert.ElementsMatch(t, []string{"10.0.0.1:8080", "10.0.0.2:8080"}, backends)
-}
-
 func TestDnatCleanupEipName(t *testing.T) {
 	t.Parallel()
 
@@ -650,61 +612,6 @@ func TestDnatCleanupEipName(t *testing.T) {
 
 	dnat.Annotations = nil
 	assert.Equal(t, "new-eip", dnatCleanupEipName(dnat), "legacy rules fall back to the current spec EIP")
-}
-
-func TestIsDnatDuplicated(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		existing *kubeovnv1.IptablesDnatRule
-		newType  string
-		wantDup  bool
-	}{
-		{
-			name:     "exclusive vs existing exclusive is duplicate",
-			existing: shareDnat("other", "gw", "eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeExclusive),
-			newType:  kubeovnv1.DnatRuleTypeExclusive,
-			wantDup:  true,
-		},
-		{
-			name:     "share vs existing share coexist",
-			existing: shareDnat("other", "gw", "eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeShare),
-			newType:  kubeovnv1.DnatRuleTypeShare,
-			wantDup:  false,
-		},
-		{
-			name:     "exclusive vs existing share is duplicate",
-			existing: shareDnat("other", "gw", "eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeShare),
-			newType:  kubeovnv1.DnatRuleTypeExclusive,
-			wantDup:  true,
-		},
-		{
-			name:     "share vs existing exclusive is duplicate",
-			existing: shareDnat("other", "gw", "eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeExclusive),
-			newType:  kubeovnv1.DnatRuleTypeShare,
-			wantDup:  true,
-		},
-		{
-			name:     "different protocol is not duplicate",
-			existing: shareDnat("other", "gw", "eip", "80", "udp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeExclusive),
-			newType:  kubeovnv1.DnatRuleTypeExclusive,
-			wantDup:  false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			c := dnatListerController(t, tt.existing)
-			dup, err := c.isDnatDuplicated("gw", "eip", "new", "80", "tcp", tt.newType)
-			assert.Equal(t, tt.wantDup, dup)
-			if tt.wantDup {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
 }
 
 // assertEnqueueAddRouting checks that the add handler routes a live object to the add queue and a
@@ -734,7 +641,8 @@ func TestEnqueueAddIptablesFip(t *testing.T) {
 	t.Cleanup(c.addIptablesFipQueue.ShutDown)
 	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
 	now := metav1.Now()
-	assertEnqueueAddRouting(t, c.addIptablesFipQueue, c.updateIptablesFipQueue, c.enqueueAddIptablesFip,
+	assertEnqueueAddRouting(
+		t, c.addIptablesFipQueue, c.updateIptablesFipQueue, c.enqueueAddIptablesFip,
 		&kubeovnv1.IptablesFIPRule{ObjectMeta: metav1.ObjectMeta{Name: "live-fip"}},
 		&kubeovnv1.IptablesFIPRule{ObjectMeta: metav1.ObjectMeta{Name: "terminating-fip", DeletionTimestamp: &now}},
 	)
@@ -749,7 +657,8 @@ func TestEnqueueAddIptablesDnatRule(t *testing.T) {
 	t.Cleanup(c.addIptablesDnatRuleQueue.ShutDown)
 	t.Cleanup(c.updateIptablesDnatRuleQueue.ShutDown)
 	now := metav1.Now()
-	assertEnqueueAddRouting(t, c.addIptablesDnatRuleQueue, c.updateIptablesDnatRuleQueue, c.enqueueAddIptablesDnatRule,
+	assertEnqueueAddRouting(
+		t, c.addIptablesDnatRuleQueue, c.updateIptablesDnatRuleQueue, c.enqueueAddIptablesDnatRule,
 		&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Name: "live-dnat"}},
 		&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Name: "terminating-dnat", DeletionTimestamp: &now}},
 	)
@@ -784,7 +693,8 @@ func TestEnqueueAddIptablesSnatRule(t *testing.T) {
 	t.Cleanup(c.addIptablesSnatRuleQueue.ShutDown)
 	t.Cleanup(c.updateIptablesSnatRuleQueue.ShutDown)
 	now := metav1.Now()
-	assertEnqueueAddRouting(t, c.addIptablesSnatRuleQueue, c.updateIptablesSnatRuleQueue, c.enqueueAddIptablesSnatRule,
+	assertEnqueueAddRouting(
+		t, c.addIptablesSnatRuleQueue, c.updateIptablesSnatRuleQueue, c.enqueueAddIptablesSnatRule,
 		&kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "live-snat"}},
 		&kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "terminating-snat", DeletionTimestamp: &now}},
 	)

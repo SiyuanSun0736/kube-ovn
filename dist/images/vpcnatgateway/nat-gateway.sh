@@ -33,10 +33,16 @@
 #
 # ============================================================================
 
+# Where the interface configuration is persisted. It lives in the container's
+# writable layer, so a restarted vpc-nat-gw container starts without it and the
+# init command has to write it again. NAT_GW_ENV_FILE only exists so that tests
+# can keep the absolute system path untouched.
+NAT_GW_ENV_FILE=${NAT_GW_ENV_FILE:-/etc/kube-ovn/nat-gateway.env}
+
 # Read interfaces from persistent file
-if [ -f /etc/kube-ovn/nat-gateway.env ]; then
+if [ -f "$NAT_GW_ENV_FILE" ]; then
     # shellcheck disable=SC1091
-    source /etc/kube-ovn/nat-gateway.env
+    source "$NAT_GW_ENV_FILE"
 fi
 # Default interfaces
 VPC_INTERFACE=${VPC_INTERFACE:-"eth0"}
@@ -45,12 +51,17 @@ EXTERNAL_INTERFACE=${EXTERNAL_INTERFACE:-"net1"}
 # In production, leave this as "false" to reduce log volume
 QOS_DEBUG=${QOS_DEBUG:-"false"}
 
-# Resolve iptables/iptables-save from $PATH.
-# If you need iptables-legacy, should change the system alternatives inside the container image
-# (e.g. update-alternatives --set iptables /usr/sbin/iptables-legacy) rather than modifying this script.
-# If the image has both backends installed, always use the default.
 iptables_cmd=$(which iptables)
 iptables_save_cmd=$(which iptables-save)
+# Fall back to the legacy flavor only when the default iptables is not the nftables backend and
+# the legacy tools actually work (centos-7-class images). The nft share DNAT maps this script
+# also programs live in the nftables backend, so when plain iptables is nf_tables-flavored the
+# hairpin and SNAT rules must land there too, or the gateway runs a split data plane.
+if ! iptables --version 2>/dev/null | grep -q nf_tables && iptables-legacy -t nat -S INPUT 1 2>/dev/null; then
+    # use iptables-legacy for centos 7
+    iptables_cmd=$(which iptables-legacy)
+    iptables_save_cmd=$(which iptables-legacy-save)
+fi
 
 function show_help() {
     echo "NAT Gateway Configuration Script"
@@ -68,6 +79,9 @@ function show_help() {
     echo "  subnet-route-del         - Delete VPC internal routes"
     echo "  eip-add                  - Add external IP"
     echo "  eip-del                  - Delete external IP"
+    echo "  vip-addr-sync            - Hold exactly the given share-DNAT VIPs (Service ClusterIPs) on lo"
+    echo "  vip-hairpin-add          - Add a per-identity hairpin SNAT rule for a VIP"
+    echo "  vip-hairpin-del          - Delete a per-identity hairpin SNAT rule for a VIP"
     echo "  floating-ip-add          - Add floating IP mapping"
     echo "  floating-ip-del          - Delete floating IP mapping"
     echo "  dnat-add                 - Add DNAT rule"
@@ -147,9 +161,9 @@ function init() {
         exit 1
     fi
     # Store interfaces persistently
-    mkdir -p /etc/kube-ovn
-    echo "VPC_INTERFACE=$VPC_INTERFACE" > /etc/kube-ovn/nat-gateway.env
-    echo "EXTERNAL_INTERFACE=$EXTERNAL_INTERFACE" >> /etc/kube-ovn/nat-gateway.env
+    mkdir -p "$(dirname "$NAT_GW_ENV_FILE")"
+    echo "VPC_INTERFACE=$VPC_INTERFACE" > "$NAT_GW_ENV_FILE"
+    echo "EXTERNAL_INTERFACE=$EXTERNAL_INTERFACE" >> "$NAT_GW_ENV_FILE"
 
     # run once is enough
     $iptables_save_cmd | grep DNAT_FILTER && exit 0
@@ -206,6 +220,11 @@ function init() {
     else
         echo "INFO: No IP addresses on $EXTERNAL_INTERFACE, skipping gratuitous ARP (no-IPAM mode or waiting for EIP allocation)"
     fi
+
+    # The controller records this Pod as initialized only after this command succeeds, so the
+    # chains have to exist by then. The chain creation above does not go through exec_cmd, so
+    # without this check a failed iptables call would still end the script with exit code 0.
+    check_inited
 }
 
 
@@ -288,8 +307,8 @@ function add_eip() {
 }
 
 function del_eip() {
-    # make sure inited
-    check_inited
+    # Deletion is idempotent. A restarted gateway may not have initialized its
+    # NAT chains yet, in which case the EIP is already absent.
     for rule in "$@"
     do
         arr=(${rule//,/ })
@@ -299,12 +318,182 @@ function del_eip() {
         if [ -n "$ipCidr" ]; then
             exec_cmd "ip addr del $ipCidr dev $EXTERNAL_INTERFACE"
         fi
+
         # Remove hairpin SNAT rule for this EIP
         local hairpin_rule="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT --ctorigdst $eip_without_prefix -j SNAT --to-source $eip_without_prefix"
         # Check if the rule exists before attempting to delete it
         if $iptables_cmd -t nat -C HAIRPIN_SNAT $hairpin_rule --random-fully >/dev/null 2>&1; then
             exec_cmd "$iptables_cmd -t nat -D HAIRPIN_SNAT $hairpin_rule --random-fully"
         fi
+    done
+}
+
+# ===== share-DNAT VIPs (nftable LoadBalancer services) =====
+#
+# A Service handled by the nft share-DNAT feature is reachable from the VPC both through its EIP
+# and through its ClusterIP. Both are programmed as nft share-DNAT identities by the controller
+# and both need the same local support here:
+#   - the ClusterIP is held on lo (/32) so the gateway owns the VIP locally;
+#   - VPC-originated traffic that was DNAT'd back into the VPC is SNAT'd to this gateway's own VPC
+#     address, so the backend's reply returns to the exact instance that holds the conntrack.
+#
+# The SNAT source is deliberately the gateway's own address and not the VIP: with more than one
+# gateway replica, a reply addressed to the VIP can be load balanced to another replica, which has
+# no conntrack entry for the connection. The gateway's own address is instance-local, so the reply
+# always lands on the replica that performed the DNAT. (add_eip keeps its VIP-wide rule that SNATs
+# to the EIP for hand-managed EIP/FIP rules; the per-identity rules added here are more specific
+# and are inserted before it, see vip_hairpin_add.)
+#
+# TODO: unify the hairpin SNAT source on the gateway's own VPC-side address. The HAIRPIN_SNAT chain
+# currently carries two policies: add_eip/del_eip install one VIP-wide rule per EIP that SNATs to
+# the EIP itself (pre-existing, and the only one a hand-managed EIP rule has), while vip_hairpin_add
+# installs a per-identity rule that SNATs to the instance's own address (this feature). Only the
+# second is correct when the gateway has more than one replica, because an EIP-sourced reply is
+# delivered to whichever replica the VIP is routed to, which has no conntrack for the connection;
+# a single-replica gateway happens to be correct either way (its VPC address is spec.lanIp).
+# Unifying therefore means: build every hairpin rule with the gateway instance's VPC address as the
+# source (that is what "the gateway's lanIp" is in the single-replica case, and each replica's own
+# address under HA), and let that one rule shape cover the VIPs of this feature as well (including
+# the ClusterIPs, which have no EIP and so get no add_eip rule today, and which is why the
+# per-identity rules exist). The egress SNAT rules are not affected: EXCLUSIVE_SNAT and SHARED_SNAT
+# must keep SNATing to the EIP, that is what egress NAT means.
+
+function local_vpc_ipv4() {
+    # The address the gateway uses to talk to the VPC. Each replica has its own, which is what
+    # makes the hairpin SNAT instance-local.
+    local ip
+    ip=$(ip -4 addr show dev "$VPC_INTERFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+    if [ -z "$ip" ]; then
+        echo "Error: no IPv4 address on VPC interface $VPC_INTERFACE" >&2
+        return 1
+    fi
+    echo "$ip"
+}
+
+# The label scopes the addresses this feature owns on lo, so the sync can release the ones no
+# service needs any more without touching anything else the gateway holds there.
+VIP_ADDR_LABEL="lo:ko-vip"
+
+function vip_addr_sync() {
+    check_inited
+    local want=" $* "
+    local vip addr ip
+    for vip in "$@"
+    do
+        if ! [[ "$vip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid vip in vip-addr-sync: $vip" >&2
+            exit 1
+        fi
+    done
+    # Release what the controller no longer asks for. This is the only path that removes these
+    # addresses, so a VIP whose service is gone cannot outlive the next sync of its gateway.
+    for addr in $(ip -4 addr show dev lo label "$VIP_ADDR_LABEL" | awk '/inet /{print $2}')
+    do
+        ip=${addr%/*}
+        if [[ "$want" != *" $ip "* ]]; then
+            exec_cmd "ip addr del $addr dev lo"
+        fi
+    done
+    for vip in "$@"
+    do
+        # /32 on lo keeps the VIP from claiming a whole ClusterIP range on the VPC interface.
+        if ! ip -4 addr show dev lo label "$VIP_ADDR_LABEL" | grep -qw "$vip/32"; then
+            exec_cmd "ip addr add $vip/32 dev lo label $VIP_ADDR_LABEL"
+        fi
+    done
+}
+
+function vip_hairpin_add() {
+    check_inited
+    local local_ip
+    local_ip=$(local_vpc_ipv4) || exit 1
+    for rule in "$@"
+    do
+        IFS=',' read -r vip port protocol <<< "$rule"
+        # The controller may pass the protocol in either case (like add_nft_dnat_map accepts);
+        # the kernel only knows the lower case names.
+        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        if [ -z "$vip" ] || [ -z "$port" ] || [ -z "$protocol" ]; then
+            echo "Error: invalid vip-hairpin-add rule: $rule" >&2
+            exit 1
+        fi
+        if ! [[ "$vip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid vip in vip-hairpin-add rule: $vip" >&2
+            exit 1
+        fi
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "Error: invalid port in vip-hairpin-add rule: $port" >&2
+            exit 1
+        fi
+        case "$protocol" in
+            tcp|udp) ;;
+            *)
+                echo "Error: invalid protocol in vip-hairpin-add rule: $protocol" >&2
+                exit 1
+                ;;
+        esac
+
+        # --ctorigdstport matches the destination port before DNAT rewrote it, so the rule stays
+        # scoped to one service identity even though the packet's port is already the backend's.
+        # The stable comment lets deletion recover the complete installed rule (including its old
+        # --to-source) after the interface address changes or disappears.
+        local marker="kube-ovn-vip-hairpin-$protocol-$vip-$port"
+        local hairpin_rule="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -p $protocol -m conntrack --ctstate DNAT --ctorigdst $vip --ctorigdstport $port -m comment --comment $marker -j SNAT --to-source $local_ip"
+        if ! $iptables_cmd -t nat -C HAIRPIN_SNAT $hairpin_rule --random-fully >/dev/null 2>&1; then
+            # Insert at the head: add_eip installs a VIP-wide hairpin rule (SNAT to the EIP) that
+            # would otherwise match this traffic first and SNAT it to the VIP instead.
+            exec_cmd "$iptables_cmd -t nat -I HAIRPIN_SNAT 1 $hairpin_rule --random-fully"
+        fi
+    done
+}
+
+function vip_hairpin_del() {
+    # Deletion is idempotent and does not read the current interface address. The source address
+    # may have changed or disappeared since add; recover the exact installed rule by its stable
+    # identity comment so stale SNAT rules cannot survive either case.
+    for rule in "$@"
+    do
+        IFS=',' read -r vip port protocol <<< "$rule"
+        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        if [ -z "$vip" ] || [ -z "$port" ] || [ -z "$protocol" ]; then
+            echo "Error: invalid vip-hairpin-del rule: $rule" >&2
+            exit 1
+        fi
+        if ! [[ "$vip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid vip in vip-hairpin-del rule: $vip" >&2
+            exit 1
+        fi
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "Error: invalid port in vip-hairpin-del rule: $port" >&2
+            exit 1
+        fi
+        case "$protocol" in
+            tcp|udp) ;;
+            *)
+                echo "Error: invalid protocol in vip-hairpin-del rule: $protocol" >&2
+                exit 1
+                ;;
+        esac
+
+        local marker="kube-ovn-vip-hairpin-$protocol-$vip-$port"
+        local saved_rules saved_rule
+        # Match the complete quoted comment: a bare substring search would also hit identities
+        # whose port only shares a decimal prefix (80 matches 8080).
+        saved_rules=$($iptables_save_cmd -t nat | grep HAIRPIN_SNAT | grep -F -- "\"$marker\"" || true)
+        while IFS= read -r saved_rule
+        do
+            [ -z "$saved_rule" ] && continue
+            saved_rule=$(echo "$saved_rule" | sed 's/^-A //')
+            saved_rule=${saved_rule//\"/}
+            if ! $iptables_cmd -t nat -D $saved_rule; then
+                # Another reconcile may have deleted the same rule after iptables-save.
+                # Only suppress the error when the desired absent state was reached.
+                if $iptables_cmd -t nat -C $saved_rule >/dev/null 2>&1; then
+                    >&2 echo "failed to delete hairpin rule \"$saved_rule\""
+                    exit 1
+                fi
+            fi
+        done <<< "$saved_rules"
     done
 }
 
@@ -352,8 +541,8 @@ function del_floating_ip() {
     # NOTE: Current FIP CRD/controller path sends one rule per invocation.
     # The for-loop is currently of limited practical value.
     # TODO: Consider removing the for-loop and avoid cache optimizations driven only by loop batching.
-    # make sure inited
-    check_inited
+    # Deletion is idempotent. A restarted gateway may not have initialized its
+    # NAT chains yet, in which case there is no FIP rule to remove.
     for eip in "$@"
     do
         # delete DNAT rule: match "-d <eip>/32" (/32 suffix prevents prefix match)
@@ -386,6 +575,13 @@ function add_snat() {
     # NOTE: Current SNAT CRD/controller path sends one rule per invocation.
     # The for-loop is currently of limited practical value.
     # TODO: Consider removing the for-loop and avoid cache optimizations driven only by loop batching.
+    #
+    # Ordering: iptables evaluates rules in a chain top-down (first-match wins).
+    # When multiple SHARED_SNAT rules have overlapping CIDRs (e.g., 10.0.0.0/16 and
+    # 10.0.1.0/24), the more specific rule must come first to honor longest-prefix
+    # match. We therefore insert each new rule at the position right after all
+    # existing rules whose prefix length is equal to or greater (more specific)
+    # than the new rule's prefix, yielding a descending-prefix order in the chain.
     # make sure inited
     check_inited
     local all_shared_snat_rules
@@ -398,9 +594,32 @@ function add_snat() {
         randomFullyOption=${arr[2]}
         # check if exact (eip, internalCIDR) pair already exists (idempotent)
         ruleMatch=$(echo "$all_shared_snat_rules" | grep -w -- "-s $internalCIDR" | grep -E -- "--to-source $eip(\$| )")
-        if [ -z "$ruleMatch" ]; then
-            exec_cmd "$iptables_cmd -t nat -A SHARED_SNAT -o $EXTERNAL_INTERFACE -s $internalCIDR -j SNAT --to-source $eip $randomFullyOption"
+        if [ -n "$ruleMatch" ]; then
+            continue
         fi
+        # Compute insert position: 1 + number of existing SHARED_SNAT rules whose
+        # source CIDR prefix length is >= new rule's prefix length. This keeps the
+        # chain sorted by descending prefix length so longer/more-specific matches
+        # are evaluated first. The controller normalizes bare IPv4 inputs to
+        # "<ip>/32" before sending (see normalizeSnatInternalCIDR), so every
+        # internalCIDR here is guaranteed to carry an explicit prefix length.
+        local new_prefix=${internalCIDR##*/}
+        local pos
+        pos=$(echo "$all_shared_snat_rules" | awk -v p="$new_prefix" '
+            /^-A SHARED_SNAT / {
+                if (match($0, /-s [0-9.]+\/[0-9]+/)) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/.*\//, "", s)
+                    if (s + 0 >= p + 0) n++
+                }
+            }
+            END { print n + 1 }
+        ')
+        exec_cmd "$iptables_cmd -t nat -I SHARED_SNAT $pos -o $EXTERNAL_INTERFACE -s $internalCIDR -j SNAT --to-source $eip $randomFullyOption"
+        # Keep the local snapshot in sync so subsequent iterations in this
+        # invocation compute position correctly.
+        all_shared_snat_rules="$all_shared_snat_rules
+-A SHARED_SNAT -o $EXTERNAL_INTERFACE -s $internalCIDR -j SNAT --to-source $eip $randomFullyOption"
     done
 }
 function del_snat() {
@@ -424,7 +643,6 @@ function del_snat() {
         fi
     done
 }
-
 
 # Hairpin SNAT: Enables internal VM to access another internal VM's EIP/FIP
 # Packet flow when VM A (internal) accesses VM B's EIP (external IP):
@@ -506,6 +724,10 @@ function del_dnat() {
 #   └── Per-identity chains: dnat-XXXXX (one per eip:port:protocol)
 #       └── Rule: numgen random mod N dnat to ip addr . port map { backends }
 #
+# Protocols: tcp and udp for now. The transport protocol is just a key field of the service map
+# (inet_proto) and the port is read from the transport header (th dport), exactly like kube-proxy's
+# nftables proxier, so nothing here is protocol specific -- see the TODO on util.ValidateProtocol.
+#
 # Atomicity: all operations use `nft -f` (single netlink batch transaction).
 # When backends change, only the per-identity chain is flushed + rebuilt.
 # The vmap element is stable (only added/removed when an identity is created/destroyed).
@@ -547,29 +769,50 @@ function nft_transaction_ignore_errors() {
     printf '%s\n' "$@" | nft -f - 2>/dev/null || true
 }
 
+# Compute the identity hash (md5 prefix of eip:dport:protocol). This is the suffix used by
+# the per-identity chain name (dnat-<idhash>) and the prefix of the per-endpoint affinity
+# objects (ep-<idhash>-<bkhash>, aff-<idhash>-<bkhash>), which lets us enumerate and clean up
+# only the affinity objects that belong to one identity.
 function nft_identity_hash() {
     local eip=$1 dport=$2 protocol=$3
     echo -n "${eip}:${dport}:${protocol}" | md5sum | cut -c1-12
 }
 
+# Compute the per-endpoint hash (md5 prefix of ip:port). Combined with the identity hash it
+# yields a stable per-backend name, so affinity state for a surviving backend is preserved
+# when other backends are added or removed (kube-proxy names endpoint objects by endpoint,
+# not by index, for the same reason). 16 hex chars (64 bits) keeps collisions negligible even
+# for identities with thousands of backends, while still staying well under nft name limits.
 function nft_backend_hash() {
     local ip=$1 port=$2
     echo -n "${ip}:${port}" | md5sum | cut -c1-16
 }
 
+# Remove per-endpoint affinity chains/sets of one identity that are no longer wanted.
+# Args: idhash, keep (space-separated list of backend hashes to keep; empty removes all).
+# Stale endpoint chains are unreferenced once the identity chain has been rebuilt, so they
+# are safe to flush+delete here; all operations are best-effort (idempotent cleanup).
 function cleanup_nft_affinity_objects() {
     local idhash=$1 keep=$2
-    local table_dump obj bk
+    local obj bk
+
+    # nft 1.0.x does not support `list chains ip <table>` or `list sets ip <table>`.
+    # Enumerate the table once and select only objects owned by this identity.
+    local table_dump
     table_dump=$(nft list table ip "$NFT_TABLE" 2>/dev/null || true)
+
     for obj in $(printf '%s\n' "$table_dump" | grep -oE "chain ep-${idhash}-[0-9a-f]+" | awk '{print $2}'); do
         bk=${obj#ep-${idhash}-}
-        if ! printf ' %s ' "$keep" | grep -q " ${bk} "; then
-            nft_transaction_ignore_errors "flush chain ip $NFT_TABLE $obj" "delete chain ip $NFT_TABLE $obj"
+        if ! printf ' %s ' $keep | grep -q " ${bk} "; then
+            nft_transaction_ignore_errors \
+                "flush chain ip $NFT_TABLE $obj" \
+                "delete chain ip $NFT_TABLE $obj"
         fi
     done
+
     for obj in $(printf '%s\n' "$table_dump" | grep -oE "set aff-${idhash}-[0-9a-f]+" | awk '{print $2}'); do
         bk=${obj#aff-${idhash}-}
-        if ! printf ' %s ' "$keep" | grep -q " ${bk} "; then
+        if ! printf ' %s ' $keep | grep -q " ${bk} "; then
             nft_transaction_ignore_errors "delete set ip $NFT_TABLE $obj"
         fi
     done
@@ -579,12 +822,18 @@ function add_nft_dnat_map() {
     # Add or update share-type DNAT backends for a given identity.
     # Uses atomic nft transaction: ensure infrastructure + flush per-identity chain + re-add rule.
     # All nft add operations are idempotent (no-op if already exists).
-    # Format: eip,dport,protocol,ip1:port1@ip2:port2@ip3:port3
+    # Format: eip,dport,protocol,affinity,timeout,ip1:port1@ip2:port2@ip3:port3
+    #   affinity: "none" (stateless numgen-random map) or "clientip" (per-backend affinity sets)
+    #   timeout:  client-IP sticky window in seconds (only used when affinity=clientip)
+    # Legacy format (eip,dport,protocol,backends) is still accepted for compatibility with an
+    # older controller during a rolling upgrade; it is treated as affinity=none.
     # Backends are '@'-separated (not ';') because the rule is passed as a single argument
     # through pod-exec into a shell context, where ';' would act as a command separator.
     check_inited
     for rule in "$@"
     do
+        # Detect the format by field count (backends never contain ',', they use '@'):
+        # 4 fields = legacy (no affinity), 6 fields = new (affinity + timeout).
         local nfields affinity timeout
         nfields=$(awk -F',' '{print NF}' <<< "$rule")
         if [ "$nfields" -eq 4 ]; then
@@ -614,17 +863,23 @@ function add_nft_dnat_map() {
             echo "Error: invalid external port in nft-dnat-map rule: $dport"
             exit 1
         fi
-        if [ "$protocol" != "tcp" ] && [ "$protocol" != "udp" ] && [ "$protocol" != "TCP" ] && [ "$protocol" != "UDP" ]; then
-            echo "Error: invalid protocol in nft-dnat-map rule: $protocol"
-            exit 1
-        fi
+        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        case "$protocol" in
+            tcp|udp) ;;
+            *)
+                echo "Error: invalid protocol in nft-dnat-map rule: $protocol"
+                exit 1
+                ;;
+        esac
         if [ "$affinity" != "none" ] && [ "$affinity" != "clientip" ]; then
             echo "Error: invalid affinity in nft-dnat-map rule: $affinity"
             exit 1
         fi
-        if [ "$affinity" = "clientip" ] && { ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ "$timeout" -lt 1 ] || [ "$timeout" -gt 86400 ]; }; then
-            echo "Error: invalid affinity timeout in nft-dnat-map rule: $timeout"
-            exit 1
+        if [ "$affinity" = "clientip" ]; then
+            if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ "$timeout" -lt 1 ] || [ "$timeout" -gt 86400 ]; then
+                echo "Error: invalid affinity timeout in nft-dnat-map rule: $timeout"
+                exit 1
+            fi
         fi
 
         # Parse backends and count them
@@ -636,13 +891,22 @@ function add_nft_dnat_map() {
             exit 1
         fi
 
-        # Determine per-identity chain name
+        # Map protocol name to nft inet_proto keyword (already normalized above)
+        local nft_proto
+        nft_proto=$protocol
+
+        # Determine per-identity chain name and identity hash.
+        # Both are computed from the protocol as the controller sent it, exactly as before (the
+        # protocol is normalized to lower case earlier, for the whitelist above). A rule that
+        # somehow carried an upper case protocol would previously hash differently than today, so
+        # its old per-identity chain would be orphaned instead of reused; the webhook only accepts
+        # the lower case names, so this is a note rather than a live concern.
         local identity_chain idhash
         identity_chain=$(nft_identity_chain_name "$eip" "$dport" "$protocol")
         idhash=$(nft_identity_hash "$eip" "$dport" "$protocol")
 
-        # Build numgen random mod N map entries (following kube-proxy pattern)
-        local map_entries=""
+        # Validate backends up front (shared by both affinity modes)
+        local i ip port
         for i in "${!backend_list[@]}"; do
             IFS=':' read -r ip port <<< "${backend_list[$i]}"
             if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
@@ -653,16 +917,11 @@ function add_nft_dnat_map() {
                 echo "Error: invalid backend port in nft-dnat-map rule: $port"
                 exit 1
             fi
-            if [ -n "$map_entries" ]; then
-                map_entries="$map_entries, "
-            fi
-            map_entries="$map_entries$i : $ip . $port"
         done
 
-        # Map protocol name to nft inet_proto keyword
-        local nft_proto
-        nft_proto=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
-
+        # Common infrastructure commands (idempotent): table, base chain, service vmap,
+        # and the base-chain dispatch rule. The base chain is share-dnat-exclusive; flushing
+        # it wipes any other rule in it (see NFT_PREROUTING_CHAIN).
         local -a cmds=(
             "add table ip $NFT_TABLE"
             "add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }"
@@ -671,11 +930,23 @@ function add_nft_dnat_map() {
             "add rule ip $NFT_TABLE $NFT_PREROUTING_CHAIN ip daddr . meta l4proto . th dport vmap @$NFT_SERVICES_MAP"
             "add chain ip $NFT_TABLE $identity_chain"
         )
+
         local keep_bkhashes=""
 
         if [ "$affinity" = "clientip" ]; then
-            local bkhash ep_chain aff_set vmap_entries=""
-            local -a ep_chains=() bkhashes=()
+            # Client-IP session affinity (kube-proxy nftables pattern):
+            #   per-backend chain ep-<idhash>-<bkhash>:
+            #       update @aff-<idhash>-<bkhash> { ip saddr }   # record/refresh source IP
+            #       meta l4proto <proto> dnat to <ip>:<port>
+            #   identity chain:
+            #       ip saddr @aff-<...> goto ep-<...>            # pin known clients
+            #       numgen random mod N vmap { i : goto ep-<...> }  # random for new clients
+            # `add set`/`add chain` are idempotent, so surviving backends keep their affinity
+            # state across backend changes; stale backends are cleaned up afterwards.
+            local bkhash ep_chain aff_set
+            local vmap_entries=""
+            local -a ep_chains=()
+            local -a bkhashes=()
             for i in "${!backend_list[@]}"; do
                 IFS=':' read -r ip port <<< "${backend_list[$i]}"
                 bkhash=$(nft_backend_hash "$ip" "$port")
@@ -684,41 +955,51 @@ function add_nft_dnat_map() {
                 ep_chains[$i]="$ep_chain"
                 bkhashes[$i]="$bkhash"
                 keep_bkhashes="$keep_bkhashes $bkhash"
+
                 cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
                 cmds+=("add chain ip $NFT_TABLE $ep_chain")
                 cmds+=("flush chain ip $NFT_TABLE $ep_chain")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain update @$aff_set { ip saddr }")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain meta l4proto $nft_proto dnat to ${ip}:${port}")
             done
+
             cmds+=("flush chain ip $NFT_TABLE $identity_chain")
             for i in "${!backend_list[@]}"; do
                 cmds+=("add rule ip $NFT_TABLE $identity_chain ip saddr @aff-${idhash}-${bkhashes[$i]} goto ${ep_chains[$i]}")
-                [ -n "$vmap_entries" ] && vmap_entries="$vmap_entries, "
+                if [ -n "$vmap_entries" ]; then
+                    vmap_entries="$vmap_entries, "
+                fi
                 vmap_entries="$vmap_entries$i : goto ${ep_chains[$i]}"
             done
             cmds+=("add rule ip $NFT_TABLE $identity_chain numgen random mod $count vmap { $vmap_entries }")
         else
+            # Stateless: single per-identity rule with a numgen random dnat map.
+            # (the `meta l4proto $nft_proto` match is technically redundant here, since a packet
+            #  only reaches this chain via the vmap key that already selects by protocol; it is
+            #  kept for parity with kube-proxy's per-service dnat rule and as an explicit guard)
+            local map_entries=""
+            for i in "${!backend_list[@]}"; do
+                IFS=':' read -r ip port <<< "${backend_list[$i]}"
+                if [ -n "$map_entries" ]; then
+                    map_entries="$map_entries, "
+                fi
+                map_entries="$map_entries$i : $ip . $port"
+            done
             cmds+=("flush chain ip $NFT_TABLE $identity_chain")
             cmds+=("add rule ip $NFT_TABLE $identity_chain meta l4proto $nft_proto dnat ip addr . port to numgen random mod $count map { $map_entries }")
         fi
+
         cmds+=("add element ip $NFT_TABLE $NFT_SERVICES_MAP { $eip . $nft_proto . $dport : goto $identity_chain }")
 
-        # Atomic transaction:
-        # 1. Ensure table, base chain, vmap exist (idempotent)
-        # 2. Flush + re-add dispatch rule in base chain
-        #    (base chain is share-dnat-exclusive; flush wipes any other rule in it, see NFT_PREROUTING_CHAIN)
-        # 3. Flush per-identity chain + add new dnat rule
-        #    (the `meta l4proto $nft_proto` match is technically redundant here, since a packet
-        #     only reaches this chain via the vmap key that already selects by protocol; it is
-        #     kept for parity with kube-proxy's per-service dnat rule and as an explicit guard)
-        # 4. Ensure vmap element points to this chain
-        if ! nft_transaction "${cmds[@]}"
-        then
+        if ! nft_transaction "${cmds[@]}"; then
             echo "Error: failed to update nft share dnat for $eip:$dport ($protocol)"
             exit 1
         fi
 
+        # Remove affinity chains/sets for backends that no longer exist (or all of them when
+        # affinity is disabled). Stale endpoint chains are unreferenced after the rebuild above.
         cleanup_nft_affinity_objects "$idhash" "$keep_bkhashes"
+
         echo "Updated nft share dnat: $eip:$dport ($protocol, affinity=$affinity) -> $backends (chain=$identity_chain)"
     done
 }
@@ -757,14 +1038,19 @@ function del_nft_dnat_map() {
             echo "Error: invalid external port in nft-dnat-map identity: $dport"
             exit 1
         fi
-        if [ "$protocol" != "tcp" ] && [ "$protocol" != "udp" ] && [ "$protocol" != "TCP" ] && [ "$protocol" != "UDP" ]; then
-            echo "Error: invalid protocol in nft-dnat-map identity: $protocol"
-            exit 1
-        fi
+        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        case "$protocol" in
+            tcp|udp) ;;
+            *)
+                echo "Error: invalid protocol in nft-dnat-map identity: $protocol"
+                exit 1
+                ;;
+        esac
 
-        local identity_chain nft_proto
+        local identity_chain nft_proto idhash
+        nft_proto=$protocol
         identity_chain=$(nft_identity_chain_name "$eip" "$dport" "$protocol")
-        nft_proto=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        idhash=$(nft_identity_hash "$eip" "$dport" "$protocol")
 
         # Delete vmap element and per-identity chain.
         # These are separate operations because nft -f is transactional (all-or-nothing):
@@ -775,7 +1061,8 @@ function del_nft_dnat_map() {
             "flush chain ip $NFT_TABLE $identity_chain" \
             "delete chain ip $NFT_TABLE $identity_chain"
 
-        cleanup_nft_affinity_objects "$(nft_identity_hash "$eip" "$dport" "$protocol")" ""
+        # Remove any per-backend client-IP affinity chains/sets belonging to this identity.
+        cleanup_nft_affinity_objects "$idhash" ""
 
         # Clean up conntrack entries for this identity
         conntrack -D -d "$eip" -p "$nft_proto" --dport "$dport" 2>/dev/null || true
@@ -811,7 +1098,8 @@ function burst_mb_to_bytes() {
 # Log debug message only if QOS_DEBUG is enabled
 # Args: message
 function qos_debug() {
-    [ "$QOS_DEBUG" = "true" ] && echo "DEBUG: $*" >&2
+    [ "$QOS_DEBUG" = "true" ] || return 0
+    echo "DEBUG: $*" >&2
 }
 
 # Dump all tc QoS rules on a device for debugging
@@ -887,37 +1175,14 @@ function verify_tc_filter_exists() {
     fi
 }
 
-# Verify a tc filter does NOT exist for a specific IP (after deletion)
-# Args: dev, ip (e.g., "192.168.1.1"), match_direction (src/dst)
-# Returns: 0 if NOT found (good), 1 if still exists (bad)
-# Only outputs debug info when QOS_DEBUG=true
-function verify_tc_filter_deleted() {
-    local dev=$1
-    local ip=$2
-    local match_direction=$3
-
-    local ip_escaped
-    ip_escaped=$(escape_for_regex "$ip/32")
-
-    local filter_output
-    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null)
-
-    if echo "$filter_output" | grep -qiE "match ip $match_direction $ip_escaped"; then
-        echo "ERROR: Filter for $ip ($match_direction) still exists on $dev after deletion!" >&2
-        return 1
-    else
-        qos_debug "Verified filter for $ip ($match_direction) was deleted from $dev"
-        return 0
-    fi
-}
-
 # ============================================================================
 # End of QoS Debugging and Verification Functions
 # ============================================================================
 
 # Generate a unique classid from IP address for HTB class
 # Uses all 4 octets with weighted sum to minimize collision probability
-# Range: 0x1-0x7ffe (1-32766) - uses hex format for tc compatibility
+# Range: 0x1-0x7ffe (1-32766). The shared default class 1:9999 is
+# hexadecimal 0x9999, so it is outside this range.
 # Note: Same IP will always produce same classid (deterministic)
 # Collision probability is low for typical deployments (<100 EIPs)
 #
@@ -937,7 +1202,7 @@ function ip_to_classid() {
     # Weighted hash using prime multipliers for better distribution
     # Formula ensures different IPs get different classids in most cases
     local hash=$(( (octets[0] * 251 + octets[1] * 241 + octets[2] * 239 + octets[3] * 233) % 32766 ))
-    # classid range: 0x1-0x7fff (add 1 to avoid 0)
+    # classid range: 0x1-0x7ffe (add 1 to avoid 0)
     printf "0x%x" $((hash + 1))
 }
 
@@ -956,22 +1221,25 @@ function find_available_classid() {
     # Strip 0x prefix for grep matching
     local classid_no_prefix=${classid_hex#0x}
 
-    # Check if this classid is already in use
     local filter_output
-    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null | grep -E "flowid 1:$classid_no_prefix\b" || true)
+    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null)
+    local class_pattern="flowid 1:$classid_no_prefix([^0-9a-fA-F]|$)"
 
-    if [ -n "$filter_output" ]; then
-        # Classid is in use, check if it's for the same IP
+    if echo "$filter_output" | grep -qE "$class_pattern"; then
         local target_ip_escaped
         target_ip_escaped=$(escape_for_regex "$target_ip/32")
-        if echo "$filter_output" | grep -qiE "match ip $match_direction $target_ip_escaped"; then
-            # Same IP, safe to reuse classid (this is an update scenario)
+        if echo "$filter_output" | awk -v class_pattern="$class_pattern" -v match_pattern="match ip $match_direction $target_ip_escaped([^0-9./]|$)" '
+            /flowid/ { owns_class = $0 ~ class_pattern }
+            tolower($0) ~ tolower(match_pattern) && owns_class { found = 1 }
+            END { exit !found }
+        '; then
             printf "0x%x" $classid
             return
         fi
 
-        # Collision with different IP - find alternative classid
-        # Try offsets in a different range to avoid further collision
+        # Collision with different IP - find alternative classid.
+        # Ten deterministic probes bound the script latency; widen this to a
+        # preloaded full-range scan only if real gateways exhaust the chain.
         local attempts=0
         while [ $attempts -lt 10 ]; do
             classid=$((classid + 3571))  # Use prime offset for better distribution
@@ -981,7 +1249,6 @@ function find_available_classid() {
             if [ $classid -lt 1 ]; then
                 classid=1
             fi
-
             local new_classid_hex
             new_classid_hex=$(printf "0x%x" $classid)
             local existing
@@ -994,43 +1261,74 @@ function find_available_classid() {
             attempts=$((attempts + 1))
         done
 
-        # If all attempts failed, use the original classid anyway (very rare)
-        # The old filter will be replaced
-        echo "WARNING: find_available_classid failed to find available classid after 10 attempts for IP '$target_ip' on dev '$dev'. Using classid 0x$(printf '%x' $classid) which may cause collision." >&2
+        echo "ERROR: no available EIP QoS classid for IP '$target_ip' on dev '$dev'" >&2
+        return 1
     fi
 
     printf "0x%x" $classid
 }
 
 # Delete existing HTB u32 filter and class
-# Args: dev, ip_escaped (regex-escaped IP/32, e.g., "192\.168\.1\.1/32"), match_direction (src/dst)
+# Args: dev, ip_escaped, match_direction, class_range (eip/natgw), priority (optional)
 function delete_htb_filter_and_class() {
     local dev=$1
     local ip_escaped=$2
     local match_direction=$3
+    local class_range=$4
+    local priority=${5:-}
 
-    qos_debug "delete_htb_filter_and_class called: dev=$dev, ip_escaped=$ip_escaped, match_direction=$match_direction"
+    qos_debug "delete_htb_filter_and_class called: dev=$dev, ip_escaped=$ip_escaped, match_direction=$match_direction, class_range=$class_range"
 
     local filter_output
     # -p: use human-readable IP format (192.168.1.1 instead of hex c0a80101)
-    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null)
+    if ! filter_output=$(tc -p filter show dev "$dev" parent 1:); then
+        echo "ERROR: failed to list QoS filters on $dev" >&2
+        return 1
+    fi
 
     qos_debug "filter_output length: ${#filter_output}"
 
     # Use -i for case-insensitive match (tc output may use "IP" or "ip" depending on version)
     if echo "$filter_output" | grep -qiE "match ip $match_direction $ip_escaped"; then
         qos_debug "Found matching filter for $ip_escaped on $dev"
-        # Extract filter info: grep -iB2 gets 2 lines before the match line
-        # tc output format is stable: flowid line is typically 1-2 lines before match line
-        # Then we use a second grep to precisely extract the flowid line from context
-        # This two-step approach is simple and reliable across tc versions
-        local filter_info
-        filter_info=$(echo "$filter_output" | grep -iB2 "match ip $match_direction $ip_escaped" | head -3)
-        qos_debug "filter_info: $filter_info"
-        # Only extract from the line containing 'flowid' (the actual filter line, not hash table declaration)
+        # Keep the flowid immediately preceding the matching IP line. A fixed number
+        # of preceding lines is unsafe when multiple filters share the same priority.
+        local match_pattern="match ip $match_direction $ip_escaped([^0-9./]|$)"
+        local class_pattern
+        case "$class_range" in
+            # EIP classes are 0x1-0x7ffe, NatGw classes 0x8000-0xfeff. tc prints classids without
+            # leading zeros, so an EIP class can start with [89a-f] (e.g. 1:ab8): match the EIP
+            # range by digit count, not by its first hex digit.
+            eip) class_pattern='flowid 1:([0-9a-fA-F]|[0-9a-fA-F][0-9a-fA-F]|[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]|[0-7][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])([^0-9a-fA-F]|$)' ;;
+            natgw) class_pattern='flowid 1:[89a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]([^0-9a-fA-F]|$)' ;;
+            *) echo "ERROR: unknown QoS class range '$class_range'" >&2; return 1 ;;
+        esac
         local flowid_line
-        flowid_line=$(echo "$filter_info" | grep "flowid" | head -1)
+        flowid_line=$(echo "$filter_output" | awk -v pattern="$match_pattern" -v class_pattern="$class_pattern" -v priority="$priority" '
+            /flowid/ {
+                priority_pattern = "pref " priority "([^0-9]|$)"
+                flowid = ($0 ~ class_pattern && (priority == "" || $0 ~ priority_pattern)) ? $0 : ""
+            }
+            tolower($0) ~ tolower(pattern) && flowid != "" { print flowid; exit }
+        ')
         qos_debug "flowid_line: $flowid_line"
+        # tc rewrites some requested priorities before storing them (a configured
+        # priority 0 is stored as 49152), so a filter written before this
+        # constraint may carry no pref matching the rule. Such a filter is only
+        # accepted when it is the sole candidate for this identity, so a filter
+        # belonging to a different rule is never picked up by accident.
+        if [ -z "$flowid_line" ] && [ -n "$priority" ]; then
+            local candidates
+            candidates=$(echo "$filter_output" | awk -v pattern="$match_pattern" -v class_pattern="$class_pattern" '
+                /flowid/ { flowid = ($0 ~ class_pattern) ? $0 : "" }
+                tolower($0) ~ tolower(pattern) && flowid != "" { print flowid }
+            ')
+            if [ "$(printf '%s\n' "$candidates" | grep -c .)" -eq 1 ]; then
+                flowid_line=$candidates
+                qos_debug "Single filter matches this identity without a matching pref: $flowid_line"
+            fi
+        fi
+        [ -n "$flowid_line" ] || return 0
         local old_handle old_prio old_classid
         old_handle=$(echo "$flowid_line" | grep -oE 'fh [0-9a-f:]+' | awk '{print $2}')
         old_prio=$(echo "$flowid_line" | grep -oE 'pref [0-9]+' | awk '{print $2}')
@@ -1038,106 +1336,77 @@ function delete_htb_filter_and_class() {
         # Add 0x prefix so tc class del interprets it as hex (tc accepts 0x prefix)
         old_classid=$(echo "$flowid_line" | grep -oE 'flowid 1:[0-9a-fA-F]+' | sed 's/flowid 1:/0x/')
         qos_debug "Extracted - old_handle=$old_handle, old_prio=$old_prio, old_classid=$old_classid"
-        if [ -n "$old_handle" ] && [ -n "$old_prio" ]; then
-            qos_debug "Deleting filter: tc filter del dev $dev parent 1: prio $old_prio handle $old_handle u32"
-            tc filter del dev "$dev" parent 1: prio $old_prio handle $old_handle u32 2>/dev/null || true
-        else
-            qos_debug "Missing old_handle or old_prio, cannot delete filter"
+        if [ -z "$old_handle" ] || [ -z "$old_prio" ] || [ -z "$old_classid" ]; then
+            echo "ERROR: failed to parse QoS filter identity for $ip_escaped on $dev" >&2
+            return 1
         fi
-        if [ -n "$old_classid" ]; then
-            qos_debug "Deleting class: tc class del dev $dev classid 1:$old_classid"
-            tc class del dev "$dev" classid 1:$old_classid 2>/dev/null || true
-        else
-            qos_debug "Missing old_classid, cannot delete class"
+        qos_debug "Deleting filter: tc filter del dev $dev parent 1: prio $old_prio handle $old_handle u32"
+        if ! tc filter del dev "$dev" parent 1: prio "$old_prio" handle "$old_handle" u32; then
+            echo "ERROR: failed to delete QoS filter for $ip_escaped on $dev" >&2
+            return 1
+        fi
+        qos_debug "Deleting class: tc class del dev $dev classid 1:$old_classid"
+        if ! tc class del dev "$dev" classid 1:"$old_classid" 2>/dev/null; then
+            echo "WARNING: failed to delete orphan QoS class 1:$old_classid on $dev" >&2
         fi
 
-        # Verify deletion was successful
-        # Extract IP from escaped pattern for verification
-        local ip_for_verify
-        ip_for_verify=$(echo "$ip_escaped" | sed 's/\\//g' | sed 's|/32||')
-        if ! verify_tc_filter_deleted "$dev" "$ip_for_verify" "$match_direction"; then
-            echo "WARNING: Filter deletion verification failed for $ip_for_verify on $dev" >&2
-        fi
     else
         qos_debug "No matching filter found for pattern 'match ip $match_direction $ip_escaped' on $dev"
     fi
 }
 
-# Delete existing HTB matchall filter and class (egress with HTB qdisc)
+# Delete existing HTB matchall filter and class by its fixed target classid.
 # Args:
 #   dev: network device name
-#   target_classid: (optional) specific classid to delete, handles orphaned classes
-#
-# Why target_classid is needed:
-#   When QoS policy is updated, the old class may become orphaned if:
-#   1. Filter was deleted but class deletion failed (e.g., classid parsing failed)
-#   2. Filter doesn't exist (deleted by another operation) so grep finds nothing
-#   Without target_classid, orphaned classes cause "RTNETLINK answers: File exists"
-#   error when adding new class with the same classid.
+#   target_classid: classid of the matchall rule to delete
 #
 # Note: tc requires filter to be deleted BEFORE its associated class can be deleted.
-#   This function first deletes the filter (if found), then deletes the class.
+#   This function first deletes the exact filter (if found), then the class.
 function delete_htb_matchall_filter_and_class() {
     local dev=$1
-    local target_classid=${2:-}  # Optional: specific classid to delete (handles orphaned classes)
+    local target_classid=${2:-}
+    if [ -z "$target_classid" ]; then
+        qos_debug "delete_htb_matchall_filter_and_class called without a target classid on $dev; skipping"
+        return
+    fi
 
     local filter_output
-    filter_output=$(tc filter show dev "$dev" parent 1: 2>/dev/null)
+    if ! filter_output=$(tc filter show dev "$dev" parent 1:); then
+        echo "ERROR: failed to list matchall filters on $dev" >&2
+        return 1
+    fi
 
-    if echo "$filter_output" | grep -qw "matchall"; then
-        # Directly grep the matchall filter line that contains 'flowid'
-        # This avoids the issue of grep -B2 picking up unrelated u32 filter lines
-        local flowid_line
-        flowid_line=$(echo "$filter_output" | grep "matchall.*flowid" | head -1)
-        local old_handle old_prio old_classid
+    local target_no_prefix=${target_classid#0x}
+    local flowid_line
+    # Multiple matchall filters can coexist on the same parent, so only the
+    # filter whose flowid is exactly the requested classid may be removed.
+    flowid_line=$(echo "$filter_output" | grep -iE "flowid 1:${target_no_prefix}([^0-9a-fA-F]|$)" | head -1)
+    qos_debug "delete_htb_matchall_filter_and_class: target=$target_classid, flowid_line=$flowid_line"
+    if [ -n "$flowid_line" ]; then
+        local old_handle old_prio
         # matchall filter uses "handle 0xNNNN" format, not "fh" like u32 filters
         old_handle=$(echo "$flowid_line" | grep -oE 'handle 0x[0-9a-fA-F]+' | sed 's/handle //')
         old_prio=$(echo "$flowid_line" | grep -oE 'pref [0-9]+' | awk '{print $2}')
-        # tc filter show outputs classid WITHOUT 0x prefix (e.g., "flowid 1:ff00")
-        # Add 0x prefix so tc class del interprets it as hex (tc accepts 0x prefix)
-        old_classid=$(echo "$flowid_line" | grep -oE 'flowid 1:[0-9a-fA-F]+' | sed 's/flowid 1:/0x/')
-        if [ -n "$old_handle" ] && [ -n "$old_prio" ]; then
-            tc filter del dev "$dev" parent 1: prio "$old_prio" handle "$old_handle" matchall 2>/dev/null || true
+        if [ -z "$old_handle" ] || [ -z "$old_prio" ]; then
+            echo "ERROR: failed to parse matchall filter identity for class $target_classid on $dev" >&2
+            return 1
         fi
-        if [ -n "$old_classid" ]; then
-            tc class del dev "$dev" classid 1:$old_classid 2>/dev/null || true
-        fi
-    fi
-
-    # Also delete the target classid if provided (handles orphaned classes)
-    # This ensures cleanup even if no filter exists pointing to this class
-    if [ -n "$target_classid" ]; then
-        tc class del dev "$dev" classid 1:$target_classid 2>/dev/null || true
-    fi
-}
-
-# Delete HTB filter and class by classid (fallback when IP grep doesn't match)
-# Args: dev, classid_hex (e.g., "0x4586")
-function delete_htb_filter_by_classid() {
-    local dev=$1
-    local classid_hex=$2
-
-    # tc filter show outputs classid WITHOUT 0x prefix (e.g., "flowid 1:4586")
-    # Strip 0x prefix for grep matching
-    local classid_no_prefix=${classid_hex#0x}
-    local filter_by_classid
-    filter_by_classid=$(tc filter show dev "$dev" parent 1: 2>/dev/null | grep -E "flowid 1:$classid_no_prefix\b" || true)
-    if [ -n "$filter_by_classid" ]; then
-        local old_prio old_handle
-        old_prio=$(echo "$filter_by_classid" | grep -oE 'pref [0-9]+' | head -1 | awk '{print $2}')
-        # u32 filters use "fh xxx:yyy" format, matchall filters use "handle 0xNNN" format
-        old_handle=$(echo "$filter_by_classid" | grep -oE 'fh [0-9a-f:]+' | head -1 | awk '{print $2}')
-        # Fallback: if fh format not found, try matchall handle format
-        [ -z "$old_handle" ] && old_handle=$(echo "$filter_by_classid" | grep -oE 'handle 0x[0-9a-fA-F]+' | head -1 | sed 's/handle //')
-        if [ -n "$old_prio" ] && [ -n "$old_handle" ]; then
-            # Try both u32 and matchall since we don't know the filter type
-            tc filter del dev "$dev" parent 1: prio "$old_prio" handle "$old_handle" u32 2>/dev/null || true
-            tc filter del dev "$dev" parent 1: prio "$old_prio" handle "$old_handle" matchall 2>/dev/null || true
+        qos_debug "Deleting matchall filter: tc filter del dev $dev parent 1: prio $old_prio handle $old_handle matchall"
+        if ! tc filter del dev "$dev" parent 1: prio "$old_prio" handle "$old_handle" matchall; then
+            echo "ERROR: failed to delete matchall filter for class $target_classid on $dev" >&2
+            return 1
         fi
     fi
 
-    # Delete class regardless of filter existence
-    tc class del dev "$dev" classid 1:$classid_hex 2>/dev/null || true
+    local class_output
+    if ! class_output=$(tc class show dev "$dev" classid 1:"$target_classid"); then
+        echo "ERROR: failed to list matchall class $target_classid on $dev" >&2
+        return 1
+    fi
+    if [ -n "$class_output" ] && ! tc class del dev "$dev" classid 1:"$target_classid"; then
+        echo "ERROR: failed to delete matchall class $target_classid on $dev" >&2
+        return 1
+    fi
 }
 
 # Get or create the IFB device name for a given interface
@@ -1178,14 +1447,8 @@ function setup_ifb_device() {
     # Setup ingress qdisc on the physical interface to redirect traffic to IFB
     tc qdisc add dev "$dev" ingress 2>/dev/null || true
 
-    # Setup HTB qdisc on IFB device for traffic shaping
-    # Use default class 9999 for unclassified traffic (no rate limit)
-    tc qdisc add dev "$ifb_dev" root handle 1: htb default 9999 2>/dev/null || true
-
-    # Create default class 9999 for unclassified traffic (very high rate = no limit)
-    # Without this class, unclassified traffic would be DROPPED because the default class doesn't exist
-    # Use 10000mbit as "unlimited" rate (effectively no limit for normal network speeds)
-    tc class add dev "$ifb_dev" parent 1: classid 1:9999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+    # The HTB root and the default class 1:9999 on the IFB device are owned by
+    # ensure_qos_root, which every caller runs right after this function.
 
     # Add redirect action from physical interface ingress to IFB
     # Check if redirect filter already exists
@@ -1203,6 +1466,18 @@ function setup_ifb_device() {
     echo "$ifb_dev"
 }
 
+# Reconcile the HTB root qdisc and the default class 1:9999 on a device. Both
+# are shared by every QoS rule on that device, so this only ever creates or
+# refreshes them and never touches a per-rule class.
+# Args: dev
+function ensure_qos_root() {
+    local dev=$1
+    if ! tc qdisc show dev "$dev" | grep -q "htb 1:"; then
+        exec_cmd "tc qdisc replace dev $dev root handle 1: htb default 9999"
+    fi
+    exec_cmd "tc class replace dev $dev parent 1: classid 1:9999 htb rate 10000mbit ceil 10000mbit"
+}
+
 # Delete IFB filter and class for a specific IP
 # Args: ifb_dev, ip_escaped (regex-escaped IP/32), match_direction (src/dst)
 function delete_ifb_filter_and_class() {
@@ -1210,8 +1485,8 @@ function delete_ifb_filter_and_class() {
     local ip_escaped=$2
     local match_direction=$3
 
-    # Reuse the HTB deletion logic since IFB uses HTB
-    delete_htb_filter_and_class "$ifb_dev" "$ip_escaped" "$match_direction"
+    # Reuse the HTB deletion logic since IFB uses HTB.
+    delete_htb_filter_and_class "$ifb_dev" "$ip_escaped" "$match_direction" eip
 }
 
 # EIP-level ingress QoS using IFB + HTB (TCP-friendly, queues instead of drops)
@@ -1247,26 +1522,22 @@ function eip_ingress_qos_add() {
 
         qos_debug "Processing ingress QoS rule - v4ip=$v4ip, priority=$priority, rate=$rate, burst=$burst, dev=$dev"
 
-        # Setup IFB device and get its name
         local ifb_dev
         ifb_dev=$(setup_ifb_device "$dev")
+        ensure_qos_root "$ifb_dev"
         qos_debug "IFB device = $ifb_dev"
 
-        # Delete any existing filter/class for this IP on IFB
+        # Replace cannot update an existing u32 filter on all supported tc versions.
         local v4ip_escaped
         v4ip_escaped=$(escape_for_regex "$v4ip/32")
-        qos_debug "Calling delete_ifb_filter_and_class for ingress"
-        delete_ifb_filter_and_class "$ifb_dev" "$v4ip_escaped" "$matchDirection"
+        delete_ifb_filter_and_class "$ifb_dev" "$v4ip_escaped" "$matchDirection" || return 1
 
         # Generate classid for this IP (reuse the same function as egress)
         local initial_classid
         initial_classid=$(ip_to_classid "$v4ip")
         local classid
-        classid=$(find_available_classid "$ifb_dev" "$initial_classid" "$v4ip" "$matchDirection")
+        classid=$(find_available_classid "$ifb_dev" "$initial_classid" "$v4ip" "$matchDirection") || return 1
         qos_debug "classid for $v4ip = $classid (initial was $initial_classid)"
-
-        # Delete any orphaned class with this classid
-        tc class del dev "$ifb_dev" classid 1:$classid 2>/dev/null || true
 
         # Convert burst from MB to bytes (handles decimal values like 1.5)
         local burst_bytes
@@ -1279,8 +1550,8 @@ function eip_ingress_qos_add() {
         # Create HTB class with rate limiting on IFB device
         # rate: guaranteed bandwidth, ceil: maximum bandwidth (same for hard limit)
         # burst/cburst: use bytes to avoid tc parsing issues with decimal MB values
-        qos_debug "Creating class: tc class add dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
-        exec_cmd "tc class add dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+        qos_debug "Creating class: tc class replace dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+        exec_cmd "tc class replace dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
 
         # Add fq_codel as leaf qdisc for better handling of bursty traffic
         # fq_codel provides:
@@ -1295,8 +1566,8 @@ function eip_ingress_qos_add() {
         exec_cmd "tc qdisc replace dev $ifb_dev parent 1:$classid fq_codel"
 
         # Create filter to classify traffic matching dst IP (ingress to this EIP) to this class
-        qos_debug "Creating filter: tc filter add dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match ip $matchDirection $v4ip/32 flowid 1:$classid"
-        exec_cmd "tc filter add dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match ip $matchDirection $v4ip/32 flowid 1:$classid"
+        qos_debug "Creating filter: tc filter replace dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match ip $matchDirection $v4ip/32 flowid 1:$classid"
+        exec_cmd "tc filter replace dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match ip $matchDirection $v4ip/32 flowid 1:$classid"
 
         # Verify the rules were created correctly
         qos_debug "Verifying ingress QoS rules for $v4ip..."
@@ -1340,31 +1611,20 @@ function eip_egress_qos_add() {
 
         qos_debug "Processing egress QoS rule - v4ip=$v4ip, priority=$priority, rate=$rate, burst=$burst, dev=$dev"
 
-        # Create root HTB qdisc if not exists (default class 9999 for unclassified traffic)
-        tc qdisc add dev $dev root handle 1: htb default 9999 2>/dev/null || true
+        ensure_qos_root "$dev"
 
-        # Create default class 9999 for unclassified traffic (very high rate = no limit)
-        # Without this class, unclassified traffic would be DROPPED because the default class doesn't exist
-        # Use 10000mbit as "unlimited" rate (effectively no limit for normal network speeds)
-        tc class add dev "$dev" parent 1: classid 1:9999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
-
-        # Delete any existing filter/class for this IP first (use IP/32 for CIDR match)
+        # Replace cannot update an existing u32 filter on all supported tc versions.
         local v4ip_escaped
         v4ip_escaped=$(escape_for_regex "$v4ip/32")
-        qos_debug "Calling delete_htb_filter_and_class for egress"
-        delete_htb_filter_and_class "$dev" "$v4ip_escaped" "src"
+        delete_htb_filter_and_class "$dev" "$v4ip_escaped" "src" eip || return 1
 
         # ip_to_classid returns classid WITH 0x prefix (e.g., "0x4586")
         # find_available_classid also returns WITH 0x prefix
         local initial_classid
         initial_classid=$(ip_to_classid "$v4ip")
         local classid
-        classid=$(find_available_classid "$dev" "$initial_classid" "$v4ip" "src")
+        classid=$(find_available_classid "$dev" "$initial_classid" "$v4ip" "src") || return 1
         qos_debug "classid for $v4ip = $classid (initial was $initial_classid)"
-
-        # Delete any orphaned class with this classid (safe because find_available_classid
-        # already verified it's either unused or belongs to this IP)
-        tc class del dev $dev classid 1:$classid 2>/dev/null || true
 
         # Convert burst from MB to bytes (handles decimal values like 1.5)
         local burst_bytes
@@ -1377,8 +1637,8 @@ function eip_egress_qos_add() {
         # Create HTB class with rate limiting
         # rate: guaranteed bandwidth, ceil: maximum bandwidth (same for hard limit)
         # burst/cburst: use bytes to avoid tc parsing issues with decimal MB values
-        qos_debug "Creating class: tc class add dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
-        exec_cmd "tc class add dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+        qos_debug "Creating class: tc class replace dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+        exec_cmd "tc class replace dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
 
         # Add fq_codel as leaf qdisc for better handling of bursty traffic
         # This provides fair queuing and active queue management for egress traffic
@@ -1387,7 +1647,7 @@ function eip_egress_qos_add() {
 
         # Create filter to classify traffic matching src IP to this class
         # tc u32 match requires CIDR format, so append /32 for single IP
-        exec_cmd "tc filter add dev $dev parent 1: protocol ip prio $priority handle $classid u32 match ip src $v4ip/32 flowid 1:$classid"
+        exec_cmd "tc filter replace dev $dev parent 1: protocol ip prio $priority handle $classid u32 match ip src $v4ip/32 flowid 1:$classid"
 
         # Verify the rules were created correctly
         qos_debug "Verifying egress QoS rules for $v4ip..."
@@ -1431,20 +1691,24 @@ function cidr_to_classid() {
     IFS='.' read -r -a octets <<< "$ip"
     # Use weighted sum with different primes than ip_to_classid
     local hash=$(( (octets[0] * 11 + octets[1] * 13 + octets[2] * 17 + octets[3] * 19) % 32511 ))
-    # Range: 0x8000-0xfeff (32768-65279, avoids collision with matchall range)
+    # Range: 0x8000-0xfeff, excluding shared default class 0x9999.
     local classid=$((hash + 32768))
+    if [ "$classid" -eq $((0x9999)) ]; then
+        classid=$((0xfeff))
+    fi
     printf "0x%x" $classid
 }
 
 # Find an available classid for NatGw-level QoS, handling collision with different CIDR
-# Args: dev, initial_classid (hex format), target_cidr, match_direction (src/dst)
-# Returns: available classid in hex format (may be same as initial if no collision or collision with same CIDR)
+# Args: dev, initial_classid, target_cidr, match_direction, priority
+# Returns: available classid in hex format (may be the initial class for the same rule)
 # Note: This function handles the 0x8000-0xfeff range (NatGw QoS)
 function find_available_classid_for_cidr() {
     local dev=$1
     local classid_hex=$2
     local target_cidr=$3
     local match_direction=$4
+    local priority=$5
 
     # Convert hex to decimal for arithmetic
     local classid=$((classid_hex))
@@ -1452,22 +1716,28 @@ function find_available_classid_for_cidr() {
     # Strip 0x prefix for grep matching
     local classid_no_prefix=${classid_hex#0x}
 
-    # Check if this classid is already in use
     local filter_output
-    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null | grep -E "flowid 1:$classid_no_prefix\b" || true)
+    filter_output=$(tc -p filter show dev "$dev" parent 1: 2>/dev/null)
+    local class_pattern="flowid 1:$classid_no_prefix([^0-9a-fA-F]|$)"
 
-    if [ -n "$filter_output" ]; then
-        # Classid is in use, check if it's for the same CIDR
+    if echo "$filter_output" | grep -qE "$class_pattern"; then
         local target_cidr_escaped
         target_cidr_escaped=$(escape_for_regex "$target_cidr")
-        if echo "$filter_output" | grep -qiE "match ip $match_direction $target_cidr_escaped"; then
-            # Same CIDR, safe to reuse classid (this is an update scenario)
+        if echo "$filter_output" | awk -v class_pattern="$class_pattern" -v match_pattern="match ip $match_direction $target_cidr_escaped([^0-9./]|$)" -v priority="$priority" '
+            /flowid/ {
+                same_rule = $0 ~ class_pattern && $0 ~ ("pref " priority "([^0-9]|$)")
+            }
+            tolower($0) ~ tolower(match_pattern) && same_rule { found = 1 }
+            END { exit !found }
+        '; then
             printf "0x%x" $classid
             return
         fi
 
-        # Collision with different CIDR - find alternative classid
-        # Range: 0x8000-0xfeff (32768-65279, avoids matchall range 0xff00-0xfffe)
+        # Collision with different CIDR - find alternative classid.
+        # Range: 0x8000-0xfeff (32768-65279, avoids matchall range 0xff00-0xfffe).
+        # Ten deterministic probes bound the script latency; widen this to a
+        # preloaded full-range scan only if real gateways exhaust the chain.
         local attempts=0
         while [ $attempts -lt 10 ]; do
             classid=$((classid + 3571))  # Use prime offset for better distribution
@@ -1476,6 +1746,9 @@ function find_available_classid_for_cidr() {
             fi
             if [ $classid -lt 32768 ]; then
                 classid=32768
+            fi
+            if [ "$classid" -eq $((0x9999)) ]; then
+                classid=$((classid + 1))
             fi
 
             local new_classid_hex
@@ -1490,9 +1763,8 @@ function find_available_classid_for_cidr() {
             attempts=$((attempts + 1))
         done
 
-        # If all attempts failed, use the original classid anyway (very rare)
-        # The old filter will be replaced
-        echo "WARNING: find_available_classid_for_cidr failed to find available classid after 10 attempts for CIDR '$target_cidr' on dev '$dev'. Using classid 0x$(printf '%x' $classid) which may cause collision." >&2
+        echo "ERROR: no available NAT gateway QoS classid for CIDR '$target_cidr' on dev '$dev'" >&2
+        return 1
     fi
 
     printf "0x%x" $classid
@@ -1536,35 +1808,28 @@ function qos_add() {
             # Ingress: use IFB + HTB for TCP-friendly traffic shaping
             local ifb_dev
             ifb_dev=$(setup_ifb_device "$dev")
+            ensure_qos_root "$ifb_dev"
 
             # cidr_to_classid returns classid WITH 0x prefix (e.g., "0x8000")
             local initial_classid=$(cidr_to_classid "$cidr" "$priority")
             local classid
 
-            # Delete existing rule for this IP/matchall before adding new one
             if [ "$classifierType" == "u32" ]; then
                 local cidr_escaped
                 cidr_escaped=$(escape_for_regex "$cidr")
-                delete_htb_filter_and_class "$ifb_dev" "$cidr_escaped" "$matchDirection"
-
-                # Check for collision and find available classid
-                classid=$(find_available_classid_for_cidr "$ifb_dev" "$initial_classid" "$cidr" "$matchDirection")
+                delete_htb_filter_and_class "$ifb_dev" "$cidr_escaped" "$matchDirection" natgw "$priority" || return 1
+                classid=$(find_available_classid_for_cidr "$ifb_dev" "$initial_classid" "$cidr" "$matchDirection" "$priority") || return 1
             elif [ "$classifierType" == "matchall" ]; then
-                # Pass initial_classid to ensure orphaned classes are cleaned up
-                delete_htb_matchall_filter_and_class "$ifb_dev" "$initial_classid"
-                # matchall uses fixed classid, no collision detection needed
                 classid=$initial_classid
+                delete_htb_matchall_filter_and_class "$ifb_dev" "$classid" || return 1
             fi
-
-            # Delete any orphaned class with this classid
-            tc class del dev "$ifb_dev" classid 1:$classid 2>/dev/null || true
 
             # Convert burst from MB to bytes (handles decimal values like 1.5)
             local burst_bytes
             burst_bytes=$(burst_mb_to_bytes "$burst")
 
             # Create HTB class on IFB
-            exec_cmd "tc class add dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+            exec_cmd "tc class replace dev $ifb_dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
 
             # Add fq_codel as leaf qdisc for better handling of bursty traffic
             # Use 'replace' instead of 'add' to make this idempotent
@@ -1572,47 +1837,35 @@ function qos_add() {
 
             # Create filter on IFB
             if [ "$classifierType" == "u32" ]; then
-                exec_cmd "tc filter add dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match $matchType $matchDirection $cidr flowid 1:$classid"
+                exec_cmd "tc filter replace dev $ifb_dev parent 1: protocol ip prio $priority handle $classid u32 match $matchType $matchDirection $cidr flowid 1:$classid"
             elif [ "$classifierType" == "matchall" ]; then
-                exec_cmd "tc filter add dev $ifb_dev parent 1: protocol ip prio $priority handle $classid matchall flowid 1:$classid"
+                exec_cmd "tc filter replace dev $ifb_dev parent 1: protocol ip prio $priority handle $classid matchall flowid 1:$classid"
             fi
 
         elif [ "$qdiscType" == "egress" ]; then
             # Egress: use HTB class (queue packets instead of dropping)
-            tc qdisc add dev $dev root handle 1: htb default 9999 2>/dev/null || true
-
-            # Create default class 9999 for unclassified traffic (very high rate = no limit)
-            # Without this class, unclassified traffic would be DROPPED because the default class doesn't exist
-            tc class add dev "$dev" parent 1: classid 1:9999 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+            ensure_qos_root "$dev"
 
             # cidr_to_classid returns classid WITH 0x prefix (e.g., "0x8000")
             local initial_classid=$(cidr_to_classid "$cidr" "$priority")
             local classid
 
-            # Delete existing rule for this IP/matchall before adding new one
             if [ "$classifierType" == "u32" ]; then
                 local cidr_escaped
                 cidr_escaped=$(escape_for_regex "$cidr")
-                delete_htb_filter_and_class "$dev" "$cidr_escaped" "$matchDirection"
-
-                # Check for collision and find available classid
-                classid=$(find_available_classid_for_cidr "$dev" "$initial_classid" "$cidr" "$matchDirection")
+                delete_htb_filter_and_class "$dev" "$cidr_escaped" "$matchDirection" natgw "$priority" || return 1
+                classid=$(find_available_classid_for_cidr "$dev" "$initial_classid" "$cidr" "$matchDirection" "$priority") || return 1
             elif [ "$classifierType" == "matchall" ]; then
-                # Pass initial_classid to ensure orphaned classes are cleaned up
-                delete_htb_matchall_filter_and_class "$dev" "$initial_classid"
-                # matchall uses fixed classid, no collision detection needed
                 classid=$initial_classid
+                delete_htb_matchall_filter_and_class "$dev" "$classid" || return 1
             fi
-
-            # Delete any orphaned class with this classid (must be after filter deletion)
-            tc class del dev "$dev" classid 1:$classid 2>/dev/null || true
 
             # Convert burst from MB to bytes (handles decimal values like 1.5)
             local burst_bytes
             burst_bytes=$(burst_mb_to_bytes "$burst")
 
             # Create HTB class
-            exec_cmd "tc class add dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
+            exec_cmd "tc class replace dev $dev parent 1: classid 1:$classid htb rate ${rate}mbit ceil ${rate}mbit burst ${burst_bytes} cburst ${burst_bytes}"
 
             # Add fq_codel as leaf qdisc for better handling of bursty traffic
             # Use 'replace' instead of 'add' to make this idempotent
@@ -1620,9 +1873,9 @@ function qos_add() {
 
             # Create filter
             if [ "$classifierType" == "u32" ]; then
-                exec_cmd "tc filter add dev $dev parent 1: protocol ip prio $priority handle $classid u32 match $matchType $matchDirection $cidr flowid 1:$classid"
+                exec_cmd "tc filter replace dev $dev parent 1: protocol ip prio $priority handle $classid u32 match $matchType $matchDirection $cidr flowid 1:$classid"
             elif [ "$classifierType" == "matchall" ]; then
-                exec_cmd "tc filter add dev $dev parent 1: protocol ip prio $priority handle $classid matchall flowid 1:$classid"
+                exec_cmd "tc filter replace dev $dev parent 1: protocol ip prio $priority handle $classid matchall flowid 1:$classid"
             fi
         fi
     done
@@ -1673,41 +1926,26 @@ function qos_del() {
                 continue
             fi
 
-            # cidr_to_classid returns classid WITH 0x prefix (e.g., "0x8000")
-            local classid=$(cidr_to_classid "$cidr" "$priority")
-
-            # For u32 filter, find and delete by IP match
             if [ "$classifierType" == "u32" ]; then
                 local cidr_escaped
                 cidr_escaped=$(escape_for_regex "$cidr")
-                delete_htb_filter_and_class "$ifb_dev" "$cidr_escaped" "$matchDirection"
+                delete_htb_filter_and_class "$ifb_dev" "$cidr_escaped" "$matchDirection" natgw "$priority" || return 1
             elif [ "$classifierType" == "matchall" ]; then
-                delete_htb_matchall_filter_and_class "$ifb_dev" "$classid"
+                delete_htb_matchall_filter_and_class "$ifb_dev" "$(cidr_to_classid "$cidr" "$priority")" || return 1
             fi
-
-            # Also try to delete filter by classid (handles case where grep pattern didn't match)
-            delete_htb_filter_by_classid "$ifb_dev" "$classid"
-
         elif [ "$qdiscType" == "egress" ]; then
             # Ensure HTB root qdisc exists
             if ! tc qdisc show dev "$dev" | grep -q "htb 1:"; then
                 continue
             fi
 
-            # cidr_to_classid returns classid WITH 0x prefix (e.g., "0x8000")
-            local classid=$(cidr_to_classid "$cidr" "$priority")
-
-            # For u32 filter, find and delete by IP match (handles collision case)
             if [ "$classifierType" == "u32" ]; then
                 local cidr_escaped
                 cidr_escaped=$(escape_for_regex "$cidr")
-                delete_htb_filter_and_class "$dev" "$cidr_escaped" "$matchDirection"
+                delete_htb_filter_and_class "$dev" "$cidr_escaped" "$matchDirection" natgw "$priority" || return 1
             elif [ "$classifierType" == "matchall" ]; then
-                delete_htb_matchall_filter_and_class "$dev" "$classid"
+                delete_htb_matchall_filter_and_class "$dev" "$(cidr_to_classid "$cidr" "$priority")" || return 1
             fi
-
-            # Also try to delete filter by classid (handles case where grep pattern didn't match)
-            delete_htb_filter_by_classid "$dev" "$classid"
         fi
     done
 }
@@ -1742,17 +1980,10 @@ function eip_ingress_qos_del() {
             continue
         fi
 
-        # ip_to_classid returns classid WITH 0x prefix (e.g., "0x4586")
-        local classid
-        classid=$(ip_to_classid "$v4ip")
-
         # Use helper function to delete HTB filter and class by IP match on IFB
         local v4ip_escaped
         v4ip_escaped=$(escape_for_regex "$v4ip/32")
-        delete_ifb_filter_and_class "$ifb_dev" "$v4ip_escaped" "$matchDirection"
-
-        # Also try to delete filter by classid (handles case where grep pattern didn't match)
-        delete_htb_filter_by_classid "$ifb_dev" "$classid"
+        delete_ifb_filter_and_class "$ifb_dev" "$v4ip_escaped" "$matchDirection" || return 1
     done
 }
 
@@ -1780,17 +2011,10 @@ function eip_egress_qos_del() {
             continue
         fi
 
-        # ip_to_classid returns classid WITH 0x prefix (e.g., "0x4586")
-        local classid
-        classid=$(ip_to_classid "$v4ip")
-
         # Use helper function to delete HTB filter and class by IP match
         local v4ip_escaped
         v4ip_escaped=$(escape_for_regex "$v4ip/32")
-        delete_htb_filter_and_class "$dev" "$v4ip_escaped" "src"
-
-        # Also try to delete filter by classid (handles case where grep pattern didn't match)
-        delete_htb_filter_by_classid "$dev" "$classid"
+        delete_htb_filter_and_class "$dev" "$v4ip_escaped" "src" eip || return 1
     done
 }
 
@@ -1821,6 +2045,18 @@ case $opt in
     eip-del)
         echo "eip-del $*"
         del_eip "$@"
+        ;;
+    vip-addr-sync)
+        echo "vip-addr-sync $*"
+        vip_addr_sync "$@"
+        ;;
+    vip-hairpin-add)
+        echo "vip-hairpin-add $*"
+        vip_hairpin_add "$@"
+        ;;
+    vip-hairpin-del)
+        echo "vip-hairpin-del $*"
+        vip_hairpin_del "$@"
         ;;
     dnat-add)
         echo "dnat-add $*"
@@ -1857,6 +2093,10 @@ case $opt in
     get-iptables-version)
         echo "get-iptables-version $*"
         get_iptables_version "$@"
+        ;;
+    check-inited)
+        # Exit status is the answer: 0 when this Pod holds the chains the data plane needs.
+        check_inited
         ;;
     help|--help|-h)
         show_help

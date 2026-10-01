@@ -44,7 +44,7 @@ type updateSvcObject struct {
 func (c *Controller) enqueueAddService(obj any) {
 	svc := obj.(*v1.Service)
 	key := cache.MetaObjectToName(svc).String()
-	c.enqueueNftableLbService(key)
+	c.enqueueGwNftableLbService(key)
 	klog.V(3).Infof("enqueue add endpoint %s", key)
 	c.addOrUpdateEndpointSliceQueue.Add(key)
 
@@ -82,11 +82,14 @@ func (c *Controller) enqueueDeleteService(obj any) {
 		return
 	}
 
+	// The gateway nftable LB mode owns only the EIP data plane of such a Service; its ClusterIP
+	// VIPs keep belonging to the classic implementation, so its cleanup always runs here.
 	klog.Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
-	c.enqueueNftableLbService(svc.Namespace + "/" + svc.Name)
+	c.enqueueGwNftableLbService(svc.Namespace + "/" + svc.Name)
 
-	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
-	if ok || (svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
+	if svc.Annotations[util.SwitchLBRuleVipsAnnotation] != "" ||
+		(svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") ||
+		svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
 		if c.config.EnableNP {
 			netpols, err := c.svcMatchNetworkPolicies(svc)
 			if err != nil {
@@ -99,7 +102,7 @@ func (c *Controller) enqueueDeleteService(obj any) {
 		}
 
 		ips := util.ServiceClusterIPs(*svc)
-		if ok {
+		if vip := svc.Annotations[util.SwitchLBRuleVipsAnnotation]; vip != "" {
 			ips = strings.Split(vip, ",")
 		}
 
@@ -141,7 +144,11 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 	}
 
 	key := cache.MetaObjectToName(newSvc).String()
-	c.enqueueNftableLbService(key)
+	// The gateway mode's reconcile only depends on the Service fields gwNftableLbSvcChanged
+	// compares, so an unrelated status or annotation churn does not wake it.
+	if gwNftableLbSvcChanged(oldSvc, newSvc) {
+		c.enqueueGwNftableLbService(key)
+	}
 	klog.V(3).Infof("enqueue update service %s", key)
 	if len(ipsToDel) != 0 {
 		ipsToDelStr := strings.Join(ipsToDel, ",")

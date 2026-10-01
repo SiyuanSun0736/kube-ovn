@@ -1,13 +1,17 @@
 package webhook
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	ovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -130,5 +134,98 @@ func TestValidateQoSPolicyRef(t *testing.T) {
 		err := validateQoSPolicyRef(t.Context(), reader, "dying-qos")
 		require.ErrorContains(t, err, "terminating")
 		require.ErrorContains(t, err, "wait for its deletion to complete")
+	})
+}
+
+// TestIptablesDnatUpdateServiceRecord pins that the mutable-accounting escape hatch for Service
+// records honors the same identity semantics everywhere: an empty controller identity disables
+// identity checking, so it must not funnel record updates into the immutable branches, while the
+// record's content is still validated.
+// hookCache is a cache.Cache limited to reads on the objects the test seeded; the informer
+// methods of the embedded interface are never exercised by the admission paths under test.
+type hookCache struct {
+	cache.Cache
+	reader client.Reader
+}
+
+func (f *hookCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return f.reader.Get(ctx, key, obj, opts...)
+}
+
+func (f *hookCache) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	return f.reader.List(ctx, list, opts...)
+}
+
+func TestIptablesDnatUpdateServiceRecord(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, ovnv1.AddToScheme(scheme))
+	gw := &ovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: "gw0"}}
+	// hookCache serves only reads: the embedded nil cache.Cache satisfies the rest of the
+	// interface the hook never calls in these paths.
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
+	cacheClient := &hookCache{reader: reader}
+
+	newRecord := func(affinity string) *ovnv1.IptablesDnatRule {
+		return &ovnv1.IptablesDnatRule{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "web.80.tcp.10.0.0.5.8080",
+				Labels: map[string]string{
+					util.NftableLbSvcNsLabel:     "default",
+					util.NftableLbSvcNameLabel:   "web",
+					util.NftableLbSvcUIDLabel:    "svc-uid",
+					util.NftableLbSvcRecordLabel: "true",
+					util.VpcNatGatewayNameLabel:  "gw0",
+					util.VpcDnatEPortLabel:       "80",
+				},
+			}, Spec: ovnv1.IptablesDnatRuleSpec{
+				Type: ovnv1.DnatRuleTypeShare, ClusterIP: "10.96.1.5",
+				ExternalPort: "80", Protocol: "tcp", InternalIP: "10.0.0.5", InternalPort: "8080",
+				SessionAffinity: affinity, SessionAffinityTimeoutSeconds: func() int32 {
+					if affinity == ovnv1.DnatSessionAffinityClientIP {
+						return 300
+					}
+					return 0
+				}(),
+			},
+		}
+	}
+	dnatUpdate := func(t *testing.T, username string, oldObj, newObj any) admission.Request {
+		t.Helper()
+		req := updateRequest(t, oldObj, newObj)
+		req.UserInfo.Username = username
+		return req
+	}
+	newHook := func(identity string) *ValidatingHook {
+		return &ValidatingHook{decoder: admission.NewDecoder(scheme), cache: cacheClient, controllerIdentity: identity}
+	}
+
+	old := newRecord(ovnv1.DnatSessionAffinityNone)
+	updated := newRecord(ovnv1.DnatSessionAffinityClientIP)
+
+	t.Run("empty identity still lets the accounting update through", func(t *testing.T) {
+		resp := newHook("").iptablesDnatUpdateHook(t.Context(), dnatUpdate(t, "some-controller-user", old, updated))
+		require.True(t, resp.Allowed, "with identity checking disabled the record update must not hit the immutable branches")
+	})
+	t.Run("empty identity still validates the record content", func(t *testing.T) {
+		broken := updated.DeepCopy()
+		delete(broken.Labels, util.VpcNatGatewayNameLabel)
+		resp := newHook("").iptablesDnatUpdateHook(t.Context(), dnatUpdate(t, "some-controller-user", old, broken))
+		require.False(t, resp.Allowed)
+		require.Contains(t, resp.Result.Message, "gateway label is required")
+	})
+	t.Run("matching identity keeps the existing behavior", func(t *testing.T) {
+		resp := newHook("system:serviceaccount:kube-system:kube-ovn-controller").iptablesDnatUpdateHook(
+			t.Context(), dnatUpdate(t, "system:serviceaccount:kube-system:kube-ovn-controller", old, updated),
+		)
+		require.True(t, resp.Allowed)
+	})
+	t.Run("a stranger is still held by the immutable branches", func(t *testing.T) {
+		resp := newHook("system:serviceaccount:kube-system:kube-ovn-controller").iptablesDnatUpdateHook(
+			t.Context(), dnatUpdate(t, "system:serviceaccount:other:intruder", old, updated),
+		)
+		require.False(t, resp.Allowed)
+		require.Contains(t, resp.Result.Message, "immutable")
 	})
 }

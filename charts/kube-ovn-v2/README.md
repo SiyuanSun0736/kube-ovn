@@ -840,7 +840,10 @@ false
   "OVSDB_CON_TIMEOUT": 3,
   "OVSDB_INACTIVITY_TIMEOUT": 10,
   "SET_VXLAN_TX_OFF": false,
+  "enableBgpLbVip": false,
   "enableExternalVpcs": false,
+  "enableGwNftableLoadbalancerService": false,
+  "enableGwNftableServiceClusterIp": false,
   "enableHardwareOffload": false,
   "enableKeepVmIps": true,
   "enableLiveMigrationOptimization": true,
@@ -859,6 +862,15 @@ false
 			<td>Features of Kube-OVN we wish to enable/disable.</td>
 		</tr>
 		<tr>
+			<td>features.enableBgpLbVip</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable BGP LB VIP: use a bgp_lb_vip CRD as the IP source for LoadBalancer Services instead of a NAT-gateway EIP. Mutually exclusive with enableLoadbalancerService.</td>
+		</tr>
+		<tr>
 			<td>features.enableExternalVpcs</td>
 			<td>bool</td>
 			<td><pre lang="json">
@@ -866,6 +878,24 @@ false
 </pre>
 </td>
 			<td>Enable external VPCs</td>
+		</tr>
+		<tr>
+			<td>features.enableGwNftableLoadbalancerService</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService.</td>
+		</tr>
+		<tr>
+			<td>features.enableGwNftableServiceClusterIp</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.</td>
 		</tr>
 		<tr>
 			<td>features.enableHardwareOffload</td>
@@ -910,7 +940,7 @@ true
 false
 </pre>
 </td>
-			<td>Enable Kube-OVN loadbalancer services</td>
+			<td>Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise) and is mutually exclusive with enableGwNftableLoadbalancerService and enableGwNftableServiceClusterIp.</td>
 		</tr>
 		<tr>
 			<td>features.enableNatGateways</td>
@@ -2050,4 +2080,3 @@ false
 	</tr>
 	</tbody>
 </table>
-

@@ -23,12 +23,15 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/keymutex"
 
@@ -76,7 +79,11 @@ type FakeControllerOptions struct {
 	NetworkAttachments []*nadv1.NetworkAttachmentDefinition
 	Pods               []*corev1.Pod
 	Namespaces         []*corev1.Namespace
+	EndpointSlices     []*discoveryv1.EndpointSlice
 	ConfigMaps         []*corev1.ConfigMap
+	Vpcs               []*kubeovnv1.Vpc
+	Services           []*corev1.Service
+	StatefulSets       []*appsv1.StatefulSet
 }
 
 // newFakeControllerWithOptions creates a fake controller with optional pre-populated objects
@@ -108,6 +115,15 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	for _, pod := range opts.Pods {
 		kubeObjects = append(kubeObjects, pod)
 	}
+	for _, slice := range opts.EndpointSlices {
+		kubeObjects = append(kubeObjects, slice)
+	}
+	for _, svc := range opts.Services {
+		kubeObjects = append(kubeObjects, svc)
+	}
+	for _, sts := range opts.StatefulSets {
+		kubeObjects = append(kubeObjects, sts)
+	}
 	for _, cm := range opts.ConfigMaps {
 		kubeObjects = append(kubeObjects, cm)
 	}
@@ -126,6 +142,14 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 
 	// Create fake KubeOVN client
 	kubeovnClient := kubeovnfake.NewSimpleClientset()
+	for _, vpc := range opts.Vpcs {
+		_, err := kubeovnClient.KubeovnV1().Vpcs().Create(
+			context.Background(), vpc, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for _, subnet := range opts.Subnets {
 		_, err := kubeovnClient.KubeovnV1().Subnets().Create(
 			context.Background(), subnet, metav1.CreateOptions{},
@@ -202,10 +226,19 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	// Create informer factories
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	serviceInformer := kubeInformerFactory.Core().V1().Services()
+	// The gateway nftable LB feature looks Services up by gateway and by EIP through informer
+	// indexes, so the fake registers the same indexes the controller does.
+	if err := serviceInformer.Informer().AddIndexers(cache.Indexers{
+		IndexGwNftableLbServiceByEip:     indexGwNftableLbServiceByEip,
+		IndexGwNftableLbServiceByGateway: indexGwNftableLbServiceByGateway,
+	}); err != nil {
+		return nil, err
+	}
 	namespaceInformer := kubeInformerFactory.Core().V1().Namespaces()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 	configMapInformer := kubeInformerFactory.Core().V1().ConfigMaps()
+	endpointSliceInformer := kubeInformerFactory.Discovery().V1().EndpointSlices()
 
 	nadInformerFactory := nadinformers.NewSharedInformerFactory(nadClient, 0)
 	nadInformer := nadInformerFactory.K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
@@ -242,8 +275,10 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	// Create controller with all informers
 	ctrl := &Controller{
 		servicesLister:          serviceInformer.Lister(),
+		svcIndexer:              serviceInformer.Informer().GetIndexer(),
 		namespacesLister:        namespaceInformer.Lister(),
 		podsLister:              podInformer.Lister(),
+		endpointSlicesLister:    endpointSliceInformer.Lister(),
 		nodesLister:             nodeInformer.Lister(),
 		configMapsLister:        configMapInformer.Lister(),
 		vpcsLister:              vpcInformer.Lister(),
@@ -262,6 +297,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		iptablesDnatRulesLister: iptablesDnatRuleInformer.Lister(),
 		iptablesSnatRulesLister: iptablesSnatRuleInformer.Lister(),
 		vpcNatGwKeyMutex:        keymutex.NewHashed(0),
+		vpcNatGwExecKeyMutex:    keymutex.NewHashed(0),
 		deletingPodObjMap:       xsync.NewMap[string, *corev1.Pod](),
 		OVNNbClient:             mockOvnClient,
 		OVNSbClient:             mockOvnSbClient,

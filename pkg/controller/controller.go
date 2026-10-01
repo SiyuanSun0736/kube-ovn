@@ -67,9 +67,40 @@ const (
 	// bgpVipIndexName is the informer indexer key used to look up Services by their
 	// ovn.kubernetes.io/bgp-vip annotation value. Shared between controller.go (indexer
 	// registration) and vip.go (ByIndex call) so a rename is caught at compile time.
-	bgpVipIndexName            = "bgpVipAnnotation"
-	IndexServiceByNftableLbEip = "byNftableLbEip"
+	bgpVipIndexName = "bgpVipAnnotation"
+	// IndexGwNftableLbServiceByEip indexes a gateway nftable LB LoadBalancer Service by the EIP
+	// it references, so the conflict resolver can find competing services in O(matched).
+	IndexGwNftableLbServiceByEip = "byGwNftableLbEip"
+	// IndexGwNftableLbServiceByGateway indexes gateway nftable LB Services by the gateway they
+	// name, so a gateway event only wakes the Services it serves.
+	IndexGwNftableLbServiceByGateway = "byGwNftableLbGateway"
 )
+
+// indexGwNftableLbServiceByEip indexes a gateway nftable LB LoadBalancer Service by the EIP it
+// references, so the conflict resolver can find competing services in O(matched).
+func indexGwNftableLbServiceByEip(obj any) ([]string, error) {
+	svc, ok := obj.(*corev1.Service)
+	if !ok || !nftableLbSvcCandidate(svc) {
+		return nil, nil
+	}
+	// Only a LoadBalancer Service depends on an EIP (its ingress IP). A ClusterIP Service has
+	// none, so it is indexed under the gateway instead (see indexGwNftableLbServiceByGateway),
+	// which is what its data plane depends on.
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer || svc.Annotations[util.EipAnnotation] == "" {
+		return nil, nil
+	}
+	return []string{svc.Annotations[util.EipAnnotation]}, nil
+}
+
+// indexGwNftableLbServiceByGateway indexes a handled Service by its gateway, so gateway
+// instance replacement can wake exactly the Services it serves, whichever kind of Service they are.
+func indexGwNftableLbServiceByGateway(obj any) ([]string, error) {
+	svc, ok := obj.(*corev1.Service)
+	if !ok || !nftableLbSvcCandidate(svc) {
+		return nil, nil
+	}
+	return []string{svc.Annotations[util.VpcNatGatewayAnnotation]}, nil
+}
 
 // Controller is kube-ovn main controller that watch ns/pod/node/svc/ep and operate ovn
 type Controller struct {
@@ -123,6 +154,10 @@ type Controller struct {
 	updateVpcSubnetQueue          workqueue.TypedRateLimitingInterface[string]
 	vpcNatGwKeyMutex              keymutex.KeyMutex
 	vpcNatGwExecKeyMutex          keymutex.KeyMutex
+	// execRulesInPod runs one gateway-script command in one Pod of a resolved gateway (see
+	// execNatGwRulesInPods). Tests substitute it to observe what a reconciler programs without a
+	// kubelet; nil uses execNatGwRules.
+	execRulesInPod func(pod *corev1.Pod, operation string, rules []string) error
 
 	vpcEgressGatewayLister           kubeovnlister.VpcEgressGatewayLister
 	vpcEgressGatewaySynced           cache.InformerSynced
@@ -245,13 +280,13 @@ type Controller struct {
 	serviceSynced  cache.InformerSynced
 	// svcByBgpVipIndexer indexes Services by their ovn.kubernetes.io/bgp-vip annotation value,
 	// enabling O(k) lookup of Services bound to a specific bgp_lb_vip instead of a full list scan.
-	svcByBgpVipIndexer           cache.Indexer
-	svcIndexer                   cache.Indexer
-	addServiceQueue              workqueue.TypedRateLimitingInterface[string]
-	addOrUpdateNftableLbSvcQueue workqueue.TypedRateLimitingInterface[string]
-	deleteServiceQueue           workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue           workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex                  keymutex.KeyMutex
+	svcByBgpVipIndexer             cache.Indexer
+	svcIndexer                     cache.Indexer
+	addServiceQueue                workqueue.TypedRateLimitingInterface[string]
+	addOrUpdateGwNftableLbSvcQueue workqueue.TypedRateLimitingInterface[string]
+	deleteServiceQueue             workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue             workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex                    keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced
@@ -395,7 +430,8 @@ func Run(ctx context.Context, config *Configuration) {
 			listOption.AllowWatchBookmarks = true
 		}))
 
-	attachNetInformerFactory := netAttach.NewSharedInformerFactoryWithOptions(config.AttachNetClient, 0,
+	attachNetInformerFactory := netAttach.NewSharedInformerFactoryWithOptions(
+		config.AttachNetClient, 0,
 		netAttach.WithTweakListOptions(func(listOption *metav1.ListOptions) {
 			listOption.AllowWatchBookmarks = true
 		}),
@@ -440,13 +476,8 @@ func Run(ctx context.Context, config *Configuration) {
 			}
 			return keys, nil
 		},
-		IndexServiceByNftableLbEip: func(obj any) ([]string, error) {
-			svc, ok := obj.(*corev1.Service)
-			if !ok || svc.Annotations[util.EipAnnotation] == "" {
-				return nil, nil
-			}
-			return []string{svc.Annotations[util.EipAnnotation]}, nil
-		},
+		IndexGwNftableLbServiceByEip:     indexGwNftableLbServiceByEip,
+		IndexGwNftableLbServiceByGateway: indexGwNftableLbServiceByGateway,
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")
 	}
@@ -599,14 +630,14 @@ func Run(ctx context.Context, config *Configuration) {
 		deleteNodeQueue: newTypedRateLimitingQueue[string]("DeleteNode", nil),
 		nodeKeyMutex:    keymutex.NewHashed(numKeyLocks),
 
-		servicesLister:               serviceInformer.Lister(),
-		serviceSynced:                serviceInformer.Informer().HasSynced,
-		svcIndexer:                   serviceInformer.Informer().GetIndexer(),
-		addServiceQueue:              newTypedRateLimitingQueue[string]("AddService", nil),
-		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
-		deleteServiceQueue:           newTypedRateLimitingQueue[*vpcService]("DeleteService", nil),
-		updateServiceQueue:           newTypedRateLimitingQueue[*updateSvcObject]("UpdateService", nil),
-		svcKeyMutex:                  keymutex.NewHashed(numKeyLocks),
+		servicesLister:                 serviceInformer.Lister(),
+		serviceSynced:                  serviceInformer.Informer().HasSynced,
+		svcIndexer:                     serviceInformer.Informer().GetIndexer(),
+		addServiceQueue:                newTypedRateLimitingQueue[string]("AddService", nil),
+		addOrUpdateGwNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateGwNftableLbSvc", nil),
+		deleteServiceQueue:             newTypedRateLimitingQueue[*vpcService]("DeleteService", nil),
+		updateServiceQueue:             newTypedRateLimitingQueue[*updateSvcObject]("UpdateService", nil),
+		svcKeyMutex:                    keymutex.NewHashed(numKeyLocks),
 
 		endpointSlicesLister:          endpointSliceInformer.Lister(),
 		endpointSlicesSynced:          endpointSliceInformer.Informer().HasSynced,
@@ -1235,7 +1266,7 @@ func (c *Controller) shutdown() {
 	c.addServiceQueue.ShutDown()
 	c.deleteServiceQueue.ShutDown()
 	c.updateServiceQueue.ShutDown()
-	c.addOrUpdateNftableLbSvcQueue.ShutDown()
+	c.addOrUpdateGwNftableLbSvcQueue.ShutDown()
 	c.addOrUpdateEndpointSliceQueue.ShutDown()
 
 	c.addVlanQueue.ShutDown()
@@ -1418,6 +1449,14 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	// OVN LB workers are only needed by the classic OVN LB mode.
 	ovnLBWorker := c.config.EnableOvnLB
 
+	// TODO: Consolidate the OVN LB workers below, including the WorkerNum-scaled workers,
+	// under a single EnableOvnLB condition instead of scattering the same gate.
+	// Gateway mode consumes Service and EndpointSlice informer events through its own queue. The
+	// worker runs even with both feature gates off: nothing is programmed then, but the queue is
+	// the only owner of the controller finalizer the feature put on Services, and startup Adds
+	// replay finalizing Services so their cleanup keeps working.
+	go wait.Until(runWorker("add/update gateway nftable lb service", c.addOrUpdateGwNftableLbSvcQueue, c.handleAddOrUpdateGwNftableLbService), time.Second, ctx.Done())
+
 	if k8sLBWorker {
 		go wait.Until(runWorker("add service", c.addServiceQueue, c.handleAddService), time.Second, ctx.Done())
 		// run in a single worker to avoid delete the last vip, which will lead ovn to delete the loadbalancer
@@ -1455,10 +1494,6 @@ func (c *Controller) startWorkers(ctx context.Context) {
 		if k8sLBWorker {
 			go wait.Until(runWorker("update service", c.updateServiceQueue, c.handleUpdateService), time.Second, ctx.Done())
 		}
-		if c.config.EnableNftableLbSvc {
-			go wait.Until(runWorker("add/update nftable lb service", c.addOrUpdateNftableLbSvcQueue, c.handleAddOrUpdateNftableLbService), time.Second, ctx.Done())
-		}
-
 		if ovnLBWorker {
 			go wait.Until(runWorker("add/update endpoint slice", c.addOrUpdateEndpointSliceQueue, c.handleUpdateEndpointSlice), time.Second, ctx.Done())
 		}
@@ -1559,13 +1594,6 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("add iptables snat rule", c.addIptablesSnatRuleQueue, c.handleAddIptablesSnatRule), time.Second, ctx.Done())
 	go wait.Until(runWorker("update iptables snat rule", c.updateIptablesSnatRuleQueue, c.handleUpdateIptablesSnatRule), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete iptables snat rule", c.delIptablesSnatRuleQueue, c.handleDelIptablesSnatRule), time.Second, ctx.Done())
-
-	if c.config.EnableNftableLbSvc {
-		if err := c.enqueueNftableLbSvcOwnersFromRules(); err != nil {
-			util.LogFatalAndExit(err, "failed to enqueue nftable lb service owners")
-		}
-		go wait.Until(runWorker("add/update nftable lb service", c.addOrUpdateNftableLbSvcQueue, c.handleAddOrUpdateNftableLbService), time.Second, ctx.Done())
-	}
 
 	go wait.Until(runWorker("add qos policy", c.addQoSPolicyQueue, c.handleAddQoSPolicy), time.Second, ctx.Done())
 	go wait.Until(runWorker("update qos policy", c.updateQoSPolicyQueue, c.handleUpdateQoSPolicy), time.Second, ctx.Done())

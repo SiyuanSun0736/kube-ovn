@@ -210,7 +210,8 @@ func newBgpLbVipController(t *testing.T, vip *kubeovnv1.Vip, svc *v1.Service) *C
 	ctrl.config.KubeClient = fc.fakeController.config.KubeClient
 	if svc != nil {
 		_, err = ctrl.config.KubeClient.CoreV1().Services(svc.Namespace).Create(
-			context.Background(), svc, metav1.CreateOptions{})
+			context.Background(), svc, metav1.CreateOptions{},
+		)
 		if err != nil {
 			// already exists from fake construction — ignore
 			_ = err
@@ -302,7 +303,8 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 		require.NoError(t, ctrl.handleAddBgpLbVipService(key))
 
 		updated, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(
-			context.Background(), svcName, metav1.GetOptions{})
+			context.Background(), svcName, metav1.GetOptions{},
+		)
 		require.NoError(t, err)
 		require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)
 		// The speaker now gates on bgp-vip / allow-shared-ip directly;
@@ -355,7 +357,8 @@ func TestReconcileBgpLbVipServiceLocked(t *testing.T) {
 	require.NoError(t, ctrl.reconcileBgpLbVipServiceLocked(key, svc))
 
 	updated, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(
-		context.Background(), svcName, metav1.GetOptions{})
+		context.Background(), svcName, metav1.GetOptions{},
+	)
 	require.NoError(t, err)
 	require.Empty(t, updated.Spec.ExternalIPs)
 	require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)

@@ -77,36 +77,6 @@ func TestHandleAddSkipsTerminating(t *testing.T) {
 	require.NotContains(t, stored.Labels, util.QoSPolicyUIDLabel)
 }
 
-// TestGetShareDnatAffinityPreservesClientIP verifies that rebuilding a shared identity keeps the
-// affinity settings from its remaining backend.
-func TestGetShareDnatAffinityPreservesClientIP(t *testing.T) {
-	sibling := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "sibling-dnat",
-			Labels: map[string]string{
-				util.VpcNatGatewayNameLabel: "gw",
-				util.VpcDnatEPortLabel:      "80",
-			},
-		},
-		Spec: kubeovnv1.IptablesDnatRuleSpec{
-			EIP: "eip", ExternalPort: "80", InternalPort: "8080",
-			InternalIP: "10.0.0.9", Protocol: "tcp",
-			Type:                          kubeovnv1.DnatRuleTypeShare,
-			SessionAffinity:               kubeovnv1.DnatSessionAffinityClientIP,
-			SessionAffinityTimeoutSeconds: 600,
-		},
-	}
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{sibling},
-	})
-	require.NoError(t, err)
-
-	affinity, timeout, err := fc.fakeController.getShareDnatAffinity("gw", "eip", "80", "tcp", "dnat")
-	require.NoError(t, err)
-	require.Equal(t, kubeovnv1.DnatSessionAffinityClientIP, affinity)
-	require.Equal(t, int32(600), timeout)
-}
-
 func TestSyncVpcNatGatewayCRKeepsQoSLabels(t *testing.T) {
 	old := vpcNatEnabled
 	vpcNatEnabled = "true"
@@ -141,64 +111,6 @@ func TestSyncVpcNatGatewayCRKeepsQoSLabels(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "qos", stored.Labels[util.QoSLabel])
 	require.Equal(t, "qos-uid", stored.Labels[util.QoSPolicyUIDLabel])
-}
-
-// TestCleanupShareDnatInPodNatGwGone verifies the rebuild branch is skipped once the gateway is
-// gone. A sibling share backend is left behind on purpose so the cleanup takes the rebuild path,
-// which talks to the gateway pod; without the guard it retries forever and never releases the
-// finalizer.
-func TestCleanupShareDnatInPodNatGwGone(t *testing.T) {
-	t.Parallel()
-
-	sibling := func(gwName string) *kubeovnv1.IptablesDnatRule {
-		return &kubeovnv1.IptablesDnatRule{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "sibling-dnat",
-				Labels: map[string]string{
-					util.VpcNatGatewayNameLabel: gwName,
-					util.VpcDnatEPortLabel:      "80",
-				},
-			},
-			Spec: kubeovnv1.IptablesDnatRuleSpec{
-				EIP: "eip", ExternalPort: "80", InternalPort: "8080",
-				InternalIP: "10.0.0.9", Protocol: "tcp",
-				Type: kubeovnv1.DnatRuleTypeShare,
-			},
-		}
-	}
-
-	t.Run("gateway missing", func(t *testing.T) {
-		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-			IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{sibling("missing-gw")},
-		})
-		require.NoError(t, err)
-		backends, err := fc.fakeController.getShareBackends("missing-gw", "eip", "80", "tcp", "dnat")
-		require.NoError(t, err)
-		require.NotEmpty(t, backends, "the rebuild branch must be reachable")
-
-		require.NoError(t, fc.fakeController.cleanupShareDnatInPod(
-			"dnat", "missing-gw", "eip", "tcp", "10.0.0.1", "80", "dnat",
-		))
-	})
-
-	t.Run("gateway terminating", func(t *testing.T) {
-		now := metav1.Now()
-		gw := fakeGw("dying-gw")
-		gw.DeletionTimestamp = &now
-		gw.Finalizers = []string{util.KubeOVNControllerFinalizer}
-		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-			VpcNatGateways:    []*kubeovnv1.VpcNatGateway{gw},
-			IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{sibling("dying-gw")},
-		})
-		require.NoError(t, err)
-		backends, err := fc.fakeController.getShareBackends("dying-gw", "eip", "80", "tcp", "dnat")
-		require.NoError(t, err)
-		require.NotEmpty(t, backends, "the rebuild branch must be reachable")
-
-		require.NoError(t, fc.fakeController.cleanupShareDnatInPod(
-			"dnat", "dying-gw", "eip", "tcp", "10.0.0.1", "80", "dnat",
-		))
-	})
 }
 
 // TestSyncVpcNatGatewayCRDanglingQoSDoesNotBlockStartup covers a gateway left pointing at a policy
@@ -326,11 +238,13 @@ func TestFipRebindSwapsClaimBetweenPodOperations(t *testing.T) {
 		return stored.Labels[util.EipUIDLabel]
 	}
 
-	t.Run("old claim is kept while the old rule removal fails", func(t *testing.T) {
-		// Status points at the live gateway, whose pod is absent, so the removal errors out.
+	t.Run("gateway without a running instance keeps no old rule", func(t *testing.T) {
+		// Status points at the live gateway, but no instance is running: the rules only lived in
+		// the container's writable layer, so the old claim can be swapped right away. The new rule
+		// itself cannot be programmed without an instance, which is the error returned here.
 		c := setup(t, newFip("gw"))
 		require.Error(t, c.handleUpdateIptablesFip("fip"))
-		require.Equal(t, "old-uid", storedLabel(t, c), "releasing the old EIP here would orphan its rule")
+		require.Equal(t, "new-uid", storedLabel(t, c), "no instance holds the old rule, so nothing is orphaned by the swap")
 	})
 
 	t.Run("new claim is written before the new rule", func(t *testing.T) {
@@ -1133,11 +1047,10 @@ func TestEipRecoversWhenBoundQoSPolicyBecomesUsable(t *testing.T) {
 		}},
 	})
 	require.NoError(t, err)
-	require.Error(t, staleController.fakeController.handleUpdateIptablesEip("stale-eip"), "uid mismatch must reconcile the data plane")
-	stored, err = staleController.fakeController.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "stale-eip", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.False(t, stored.Status.Ready, "a failed generation rebind must not leave the eip ready")
-	require.Equal(t, "old-uid", stored.Labels[util.QoSPolicyUIDLabel])
+	// No gateway instance is running, so the rebind has no data plane to reconcile and is
+	// deferred until one appears (the replacement instance starts empty and is programmed from
+	// the live CRs): the call itself succeeds and the stale claim is left for that reconcile.
+	require.NoError(t, staleController.fakeController.handleUpdateIptablesEip("stale-eip"))
 }
 
 func TestReadyEipAndFipAddReplayRouteGenerationMismatchToUpdate(t *testing.T) {

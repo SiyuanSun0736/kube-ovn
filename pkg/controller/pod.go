@@ -194,7 +194,6 @@ func (c *Controller) enqueueAddPod(obj any) {
 	if p.Spec.HostNetwork {
 		return
 	}
-	c.enqueueNftableLbServicesForPod(p)
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
@@ -268,7 +267,6 @@ func (c *Controller) enqueueDeletePod(obj any) {
 	if p.Spec.HostNetwork {
 		return
 	}
-	c.enqueueNftableLbServicesForPod(p)
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
@@ -326,7 +324,7 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	if newPod.Spec.HostNetwork || oldPod.ResourceVersion == newPod.ResourceVersion {
 		return
 	}
-	c.enqueueNftableLbServicesForPod(newPod)
+	// EndpointSlice is the only backend event source for share-DNAT Services.
 
 	podNets, err := c.getPodKubeovnNets(newPod)
 	if err != nil {
@@ -957,6 +955,15 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 }
 
 // do the same thing as update pod
+// natGwPodPendingInit reports whether a gateway Pod still needs the init command.
+func natGwPodPendingInit(pod *v1.Pod) bool {
+	if pod.Labels[util.VpcNatGatewayLabel] != "true" {
+		return false
+	}
+	_, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]
+	return !hasInit
+}
+
 func (c *Controller) reconcileRouteSubnets(pod *v1.Pod, needRoutePodNets []*kubeovnNet) error {
 	// the lb-svc pod has dependencies on Running state, check it when pod state get updated
 	if err := c.checkAndReInitLbSvcPod(pod); err != nil {

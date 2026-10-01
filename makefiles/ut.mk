@@ -4,6 +4,7 @@
 ut:
 	ginkgo -mod=mod --show-node-events --poll-progress-after=60s $(GINKGO_OUTPUT_OPT) -v test/unittest
 	go test -coverprofile=profile.cov $$(go list ./pkg/... | grep -vw '^github.com/kubeovn/kube-ovn/pkg/client')
+	bash dist/images/vpcnatgateway/nat_gateway_vip_test.sh
 
 .PHONY: ovs-sandbox
 ovs-sandbox: clean-ovs-sandbox

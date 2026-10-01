@@ -48,6 +48,13 @@ func (v *ValidatingHook) VpcNatGwCreateOrUpdateHook(ctx context.Context, req adm
 				gw.Name, gwOld.Spec.Namespace, gw.Spec.Namespace)
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
 		}
+		// Changing the VPC would leave routes, NAT state and interfaces in the old VPC; moving a
+		// running gateway is not a supported migration. Delete and recreate it instead.
+		if gwOld.Spec.Vpc != gw.Spec.Vpc {
+			err := fmt.Errorf("VpcNatGateway %q: spec.vpc is immutable (old: %q, new: %q); delete and recreate the gateway to move it",
+				gw.Name, gwOld.Spec.Vpc, gw.Spec.Vpc)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
 	}
 
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
@@ -72,6 +79,25 @@ func (v *ValidatingHook) VpcNatGwDeleteHook(ctx context.Context, req admission.R
 	}
 	if len(eipList.Items) != 0 {
 		err := fmt.Errorf("vpc-nat-gateway \"%s\" cannot be deleted if any eip is in use", req.Name)
+		return ctrlwebhook.Errored(http.StatusBadRequest, err)
+	}
+
+	// A rule serving a ClusterIP has no EIP, so the EIP check above cannot see it. Without this
+	// the gateway could be deleted while such rules still program its data plane, leaving rules
+	// (and the VPC routes of their VIPs) behind with no gateway left to clean them up. Service
+	// accounting records carry the gateway label when created.
+	dnatList := ovnv1.IptablesDnatRuleList{}
+	if err := v.client.List(ctx, &dnatList); err != nil {
+		return ctrlwebhook.Errored(http.StatusInternalServerError, err)
+	}
+	for i := range dnatList.Items {
+		dnat := &dnatList.Items[i]
+		// A terminating rule is already on its way out and must not block the gateway forever.
+		if dnat.Spec.EIP != "" || dnat.Labels[util.VpcNatGatewayNameLabel] != req.Name || !dnat.DeletionTimestamp.IsZero() {
+			continue
+		}
+		err := fmt.Errorf("vpc-nat-gateway %q cannot be deleted while dnat rule %q serves clusterIP %s on it",
+			req.Name, dnat.Name, dnat.Spec.ClusterIP)
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
@@ -251,6 +277,15 @@ func (v *ValidatingHook) iptablesDnatCreateHook(ctx context.Context, req admissi
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
+	if err := v.validateNftableLbOwnerLabels(req, nil, dnat.Labels); err != nil {
+		return ctrlwebhook.Errored(http.StatusForbidden, err)
+	}
+	if dnat.Spec.Type == ovnv1.DnatRuleTypeShare && !util.IsNftableLbSvcRecord(dnat.Labels) {
+		return ctrlwebhook.Errored(http.StatusBadRequest, fmt.Errorf(
+			"dnat %q: type=share is reserved for nftable LB Service accounting records", dnat.Name,
+		))
+	}
+
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
@@ -277,7 +312,44 @@ func (v *ValidatingHook) iptablesDnatUpdateHook(ctx context.Context, req admissi
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
-	if dnatNew.Spec != dnatOld.Spec {
+	if err := v.validateNftableLbOwnerLabels(req, dnatOld.Labels, dnatNew.Labels); err != nil {
+		return ctrlwebhook.Errored(http.StatusForbidden, err)
+	}
+
+	if dnatNew.Spec == dnatOld.Spec {
+		// The owner labels decide which rules aggregate their backends into one nft map, so a
+		// change to them has to pass the same identity validation as a spec change would.
+		if util.NftableLbSvcOwnerID(dnatOld.Labels) != util.NftableLbSvcOwnerID(dnatNew.Labels) {
+			if err := v.ValidateIptablesDnat(ctx, &dnatNew); err != nil {
+				return ctrlwebhook.Errored(http.StatusBadRequest, err)
+			}
+		}
+		return ctrlwebhook.Allowed("by pass")
+	}
+
+	// Service records are mutable accounting data, not forwarding intent. Only the authenticated
+	// controller can change their spec; validate the new record, but do not apply ordinary DNAT
+	// immutability rules that exist to protect a data-plane writer. An empty identity disables
+	// identity checking everywhere (see validateNftableLbOwnerLabels), so it must not funnel
+	// record updates into the immutable branches either.
+	if (v.controllerIdentity == "" || req.UserInfo.Username == v.controllerIdentity) &&
+		util.IsNftableLbSvcRecord(dnatOld.Labels) && util.IsNftableLbSvcRecord(dnatNew.Labels) {
+		if err := v.ValidateIptablesDnat(ctx, &dnatNew); err != nil {
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		return ctrlwebhook.Allowed("by pass")
+	}
+
+	// A rule serving a ClusterIP is created and deleted together with the Service it comes
+	// from, and never updated: its identity is its address, so any spec change would silently
+	// reprogram a different VIP. Delete and recreate the rule instead.
+	if dnatOld.Spec.ClusterIP != "" {
+		return ctrlwebhook.Errored(http.StatusBadRequest, fmt.Errorf(
+			"dnat %q serves clusterIP %s and is immutable after creation; delete and recreate it to change it",
+			dnatNew.Name, dnatOld.Spec.ClusterIP,
+		))
+	}
+	{
 		// Type is immutable after creation
 		oldType := dnatOld.Spec.Type
 		if oldType == "" {
@@ -588,13 +660,45 @@ func validateIptablesDnatProtocol(protocol string) error {
 }
 
 func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.IptablesDnatRule) error {
-	if dnat.Spec.EIP == "" {
-		return errors.New("parameter \"eip\" cannot be empty")
+	// A rule addresses at least one VIP. An EIP is the public one (allocated by the EIP and bound
+	// on the external interface), a ClusterIP is the internal one (held on lo). A Service handled
+	// by the nftable LB service feature carries both on one rule, its ingress IP and its ClusterIP
+	// aligned on the same identity; a ClusterIP Service only carries the ClusterIP.
+	if dnat.Spec.EIP == "" && dnat.Spec.ClusterIP == "" {
+		return errors.New(`parameter "eip" or "clusterIP" cannot be empty`)
 	}
-	eip := &ovnv1.IptablesEIP{}
-	key := types.NamespacedName{Name: dnat.Spec.EIP}
-	if err := v.cache.Get(ctx, key, eip); err != nil {
-		return err
+
+	var eip *ovnv1.IptablesEIP
+	if dnat.Spec.EIP != "" {
+		eip = &ovnv1.IptablesEIP{}
+		key := types.NamespacedName{Name: dnat.Spec.EIP}
+		if err := v.cache.Get(ctx, key, eip); err != nil {
+			return err
+		}
+		gateway := dnat.Labels[util.VpcNatGatewayNameLabel]
+		if gateway != "" && eip.Spec.NatGwDp != "" && gateway != eip.Spec.NatGwDp {
+			return fmt.Errorf("dnat %q: gateway label %q does not serve eip %q (natGwDp %q)",
+				dnat.Name, gateway, dnat.Spec.EIP, eip.Spec.NatGwDp)
+		}
+	} else {
+		// Without an eip the gateway comes from the controller-owned label, and the internal VIP
+		// flow only exists for Service share records.
+		gateway := dnat.Labels[util.VpcNatGatewayNameLabel]
+		if gateway == "" {
+			return fmt.Errorf("dnat %q: gateway label is required with clusterIP when there is no eip", dnat.Name)
+		}
+		gw := &ovnv1.VpcNatGateway{}
+		if err := v.cache.Get(ctx, types.NamespacedName{Name: gateway}, gw); err != nil {
+			return fmt.Errorf("dnat %q: gateway %q: %w", dnat.Name, gateway, err)
+		}
+	}
+	if dnat.Spec.ClusterIP != "" {
+		if net.ParseIP(dnat.Spec.ClusterIP) == nil || util.CheckProtocol(dnat.Spec.ClusterIP) != ovnv1.ProtocolIPv4 {
+			return fmt.Errorf("dnat %q: clusterIP %q must be an IPv4 address", dnat.Name, dnat.Spec.ClusterIP)
+		}
+		if dnat.Spec.Type != ovnv1.DnatRuleTypeShare {
+			return fmt.Errorf("dnat %q: clusterIP requires type=%s", dnat.Name, ovnv1.DnatRuleTypeShare)
+		}
 	}
 
 	if dnat.Spec.ExternalPort == "" {
@@ -631,7 +735,7 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 	// Share type DNAT is implemented with IPv4-only nft rules (ip daddr / ip saddr).
 	// Reject it for a v6-only EIP. EIPs that are still being allocated (both addresses
 	// empty) are allowed here; the controller requeues until the IPv4 address is ready.
-	if dnatType == ovnv1.DnatRuleTypeShare && eip.Spec.V4ip == "" && eip.Spec.V6ip != "" {
+	if eip != nil && dnatType == ovnv1.DnatRuleTypeShare && eip.Spec.V4ip == "" && eip.Spec.V6ip != "" {
 		return fmt.Errorf("dnat %q cannot use type=share: EIP %q is IPv6-only, share dnat only supports IPv4", dnat.Name, dnat.Spec.EIP)
 	}
 
@@ -651,11 +755,16 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 		return fmt.Errorf("dnat %q has invalid sessionAffinity %q", dnat.Name, dnat.Spec.SessionAffinity)
 	}
 
-	// Check type conflict with existing DNAT rules sharing the same identity
-	if eip.Spec.NatGwDp != "" {
+	// Check type conflict with existing DNAT rules sharing the same identity. The identity is the
+	// VIP the rule addresses, whichever flow it belongs to.
+	gwName := dnat.Labels[util.VpcNatGatewayNameLabel]
+	if eip != nil {
+		gwName = eip.Spec.NatGwDp
+	}
+	if gwName != "" {
 		dnatList := &ovnv1.IptablesDnatRuleList{}
 		if err := v.cache.List(ctx, dnatList, cli.MatchingLabels{
-			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
+			util.VpcNatGatewayNameLabel: gwName,
 			util.VpcDnatEPortLabel:      dnat.Spec.ExternalPort,
 		}); err != nil {
 			return fmt.Errorf("failed to list iptables DNAT rules: %w", err)
@@ -666,8 +775,8 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 			if existing.Name == dnat.Name {
 				continue
 			}
-			// Only check same identity (EIP + Protocol)
-			if existing.Spec.EIP != dnat.Spec.EIP || existing.Spec.Protocol != dnat.Spec.Protocol {
+			// Only check same identity (VIP + Protocol)
+			if !sameDnatIdentitySpec(&existing.Spec, &dnat.Spec) || existing.Spec.Protocol != dnat.Spec.Protocol {
 				continue
 			}
 
@@ -686,15 +795,51 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 	}
 
 	// Check FIP/DNAT exclusivity: FIP claims all traffic to the EIP (EXCLUSIVE_DNAT),
-	// which shadows any port-specific DNAT rules (SHARED_DNAT) for the same EIP.
-	fipList := &ovnv1.IptablesFIPRuleList{}
-	if err := v.cache.List(ctx, fipList, eipUIDSelector(eip)); err != nil {
-		return fmt.Errorf("failed to list iptables FIP rules: %w", err)
-	}
-	if len(fipList.Items) != 0 {
-		return fmt.Errorf("EIP %q is already used by FIP rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", dnat.Spec.EIP, fipList.Items[0].Name)
+	// which shadows any port-specific DNAT rules (SHARED_DNAT) for the same EIP. A ClusterIP
+	// rule has no EIP, so the FIP plane cannot shadow it.
+	if eip != nil {
+		fipList := &ovnv1.IptablesFIPRuleList{}
+		if err := v.cache.List(ctx, fipList, eipUIDSelector(eip)); err != nil {
+			return fmt.Errorf("failed to list iptables FIP rules: %w", err)
+		}
+		if len(fipList.Items) != 0 {
+			return fmt.Errorf("EIP %q is already used by FIP rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", dnat.Spec.EIP, fipList.Items[0].Name)
+		}
 	}
 
+	return nil
+}
+
+// sameDnatIdentitySpec mirrors the controller's identity rule: an EIP is the identity whenever
+// either side has one, otherwise the ClusterIP is. It is duplicated here because the webhook must
+// reject a conflicting rule before it is created.
+func sameDnatIdentitySpec(a, b *ovnv1.IptablesDnatRuleSpec) bool {
+	if a.EIP != "" || b.EIP != "" {
+		return a.EIP == b.EIP
+	}
+	return a.ClusterIP == b.ClusterIP
+}
+
+// nftableLbSvcOwnerLabels are controller-owned accounting metadata. They identify which Service
+// produced a record; records themselves never aggregate or write data-plane state.
+var nftableLbSvcOwnerLabels = []string{
+	util.NftableLbSvcNsLabel,
+	util.NftableLbSvcNameLabel,
+	util.NftableLbSvcUIDLabel,
+	util.NftableLbSvcRecordLabel,
+}
+
+func (v *ValidatingHook) validateNftableLbOwnerLabels(req admission.Request, oldLabels, newLabels map[string]string) error {
+	// An empty identity disables the check: it is the escape hatch for a deployment whose
+	// controller authenticates as a user this webhook cannot be told about.
+	if v.controllerIdentity == "" || req.UserInfo.Username == v.controllerIdentity {
+		return nil
+	}
+	for _, key := range nftableLbSvcOwnerLabels {
+		if oldLabels[key] != newLabels[key] {
+			return fmt.Errorf("label %q is owned by the kube-ovn controller and cannot be set by %q", key, req.UserInfo.Username)
+		}
+	}
 	return nil
 }
 

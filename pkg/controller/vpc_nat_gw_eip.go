@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -24,7 +25,6 @@ import (
 
 func (c *Controller) enqueueAddIptablesEip(obj any) {
 	eip := obj.(*kubeovnv1.IptablesEIP)
-	c.enqueueNftableLbServicesForEIP(eip.Name)
 	key := cache.MetaObjectToName(eip).String()
 	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesEipQueue, key, "iptables eip", eip.DeletionTimestamp) {
@@ -35,6 +35,8 @@ func (c *Controller) enqueueAddIptablesEip(obj any) {
 	}
 	klog.Infof("enqueue add iptables eip %s", key)
 	c.addIptablesEipQueue.Add(key)
+	// A gateway-mode Service that references this EIP may have been waiting for it to be created.
+	c.enqueueGwNftableLbServicesForEIP(eip.Name)
 }
 
 // enqueueIptablesEipReferrers wakes NAT rules that may have been waiting for this EIP to become ready.
@@ -117,7 +119,6 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	oldEip := oldObj.(*kubeovnv1.IptablesEIP)
 	newEip := newObj.(*kubeovnv1.IptablesEIP)
-	c.enqueueNftableLbServicesForEIP(newEip.Name)
 	if !newEip.DeletionTimestamp.IsZero() ||
 		oldEip.Status.Redo != newEip.Status.Redo ||
 		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy {
@@ -135,6 +136,9 @@ func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 		if err := c.enqueueIptablesEipReferrers(newEip, usable); err != nil {
 			klog.Errorf("failed to enqueue referrers of eip %s: %v", newEip.Name, err)
 		}
+		// The share records of a gateway-mode Service carry the EIP address, so they have to be
+		// rewritten (or released) when it appears, disappears or becomes unusable.
+		c.enqueueGwNftableLbServicesForEIP(newEip.Name)
 	}
 }
 
@@ -154,7 +158,6 @@ func (c *Controller) enqueueDelIptablesEip(obj any) {
 		klog.Warningf("unexpected type: %T", obj)
 		return
 	}
-	c.enqueueNftableLbServicesForEIP(eip.Name)
 
 	key := cache.MetaObjectToName(eip).String()
 	klog.Infof("enqueue del iptables eip %s", key)
@@ -162,6 +165,9 @@ func (c *Controller) enqueueDelIptablesEip(obj any) {
 	if err := c.enqueueIptablesEipReferrers(eip, false); err != nil {
 		klog.Errorf("failed to enqueue referrers of deleted eip %s: %v", key, err)
 	}
+	// The Service owns the share records that reference this EIP and has to release them, or the
+	// EIP's finalizer waits for rules nothing else deletes.
+	c.enqueueGwNftableLbServicesForEIP(eip.Name)
 
 	// Re-trigger QoS reconcile so it can drop its finalizer once unused. DeleteFunc runs after
 	// the informer cache dropped this EIP; the queue key is the policy name.
@@ -350,6 +356,15 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 		}
 		if nat != "" {
 			klog.Infof("eip %s is still being used by NAT rules: %s, waiting for them to be deleted", key, nat)
+			return nil
+		}
+		if c.nftableLbSvcTeardownHoldsEip(cachedEip) {
+			// No NAT rule claims the EIP any more, but a referencing Service has not finished its
+			// teardown: its cleanup reads the identity witness (the address) from this very
+			// object, because its records may be gone and its ingress never published. Releasing
+			// now would strand the programmed identities with no witness left at all.
+			klog.Infof("eip %s: no nat rules left, but a nftable lb service has not settled its teardown, holding deletion", key)
+			c.updateIptablesEipQueue.AddAfter(key, 5*time.Second)
 			return nil
 		}
 
@@ -594,8 +609,14 @@ func (c *Controller) createEipInPod(dp, addrV4, ns string) error {
 	return c.execNatGwRules(gwPod, natGwEipAdd, []string{addrV4})
 }
 
-// natGwDeleted returns true when the VpcNatGateway CRD is gone or terminating.
-func (c *Controller) natGwDeleted(dp string) (bool, error) {
+// natGwDataPlaneGone reports whether the gateway has no data plane left to clean up, so an
+// in-pod cleanup can be skipped instead of retried forever. That is the case when the
+// VpcNatGateway no longer exists, when it is being deleted, and when none of its instances is
+// running: the gateway data plane (iptables rules, nft maps, addresses) lives in the container's
+// writable layer, so an instance that is not running holds no state, and a replacement instance
+// starts empty and is programmed from the CRs that are still live at that point.
+// Other errors are returned as-is for the caller to handle.
+func (c *Controller) natGwDataPlaneGone(dp string) (bool, error) {
 	gw, err := c.vpcNatGatewayLister.Get(dp)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -603,15 +624,27 @@ func (c *Controller) natGwDeleted(dp string) (bool, error) {
 		}
 		return false, err
 	}
-	return !gw.DeletionTimestamp.IsZero(), nil
+	if !gw.DeletionTimestamp.IsZero() {
+		return true, nil
+	}
+	pods, err := c.listNatGwPods(gw)
+	if err != nil {
+		return false, err
+	}
+	for _, pod := range pods {
+		if pod.Status.Phase == corev1.PodRunning && pod.DeletionTimestamp == nil {
+			return false, nil
+		}
+	}
+	klog.Infof("nat gw %s has no running instance, skipping data plane cleanup", dp)
+	return true, nil
 }
 
 func (c *Controller) deleteEipInPod(dp, v4Cidr, ns string) error {
-	// If the NAT gateway CRD is gone the gateway (and its pod) have been deleted;
-	// there is nothing to clean up. If the CRD still exists but the pod is
-	// temporarily absent (e.g. being recreated), return the error so the
-	// reconciler retries until the pod is ready.
-	deleted, err := c.natGwDeleted(dp)
+	// A gateway with no running instance holds no data plane to clean up: the rules live in the
+	// container's writable layer, so a replacement instance starts empty and is programmed from
+	// the live CRs. Only a gateway that is known to be running has to be reached.
+	deleted, err := c.natGwDataPlaneGone(dp)
 	if err != nil {
 		klog.Error(err)
 		return err
@@ -805,8 +838,8 @@ func (c *Controller) addEipQoSInPod(
 func (c *Controller) delEipQoSInPod(dp, v4ip, ns string, direction kubeovnv1.QoSPolicyRuleDirection) error {
 	var operation string
 	// Same CRD / pod sentinel logic as deleteEipInPod: skip when the gateway is
-	// gone, retry when the pod is temporarily absent.
-	deleted, err := c.natGwDeleted(dp)
+	// gone, and a gateway with no running instance has no data plane left to clean up.
+	deleted, err := c.natGwDataPlaneGone(dp)
 	if err != nil {
 		klog.Error(err)
 		return err

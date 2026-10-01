@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,39 +35,64 @@ func fakeGw(name string) *kubeovnv1.VpcNatGateway {
 	}
 }
 
-func TestNatGwDeleted(t *testing.T) {
+func runningNatGwPod(gwName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.GenNatGwName(gwName) + "-0",
+			Namespace: metav1.NamespaceSystem,
+			Labels:    map[string]string{"app": util.GenNatGwName(gwName), util.VpcNatGatewayLabel: "true"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func TestNatGwDataPlaneGone(t *testing.T) {
 	t.Parallel()
 
-	t.Run("gateway CRD exists returns false", func(t *testing.T) {
+	t.Run("a running instance holds a data plane", func(t *testing.T) {
+		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("test-gw")},
+			Pods:           []*corev1.Pod{runningNatGwPod("test-gw")},
+		})
+		require.NoError(t, err)
+		gone, err := fc.fakeController.natGwDataPlaneGone("test-gw")
+		require.NoError(t, err)
+		require.False(t, gone)
+	})
+
+	// The rules live in the gateway container's writable layer, so cleanup must not wait for an
+	// instance that is not there: a replacement starts empty and is programmed from live CRs.
+	t.Run("a gateway without a running instance holds none", func(t *testing.T) {
 		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 			VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("test-gw")},
 		})
 		require.NoError(t, err)
-		deleted, err := fc.fakeController.natGwDeleted("test-gw")
+		gone, err := fc.fakeController.natGwDataPlaneGone("test-gw")
 		require.NoError(t, err)
-		require.False(t, deleted)
+		require.True(t, gone)
 	})
 
-	t.Run("gateway CRD missing returns true", func(t *testing.T) {
-		fc, err := newFakeControllerWithOptions(t, nil)
-		require.NoError(t, err)
-		deleted, err := fc.fakeController.natGwDeleted("missing-gw")
-		require.NoError(t, err)
-		require.True(t, deleted)
-	})
-
-	t.Run("terminating gateway CRD returns true", func(t *testing.T) {
+	t.Run("a terminating gateway holds none", func(t *testing.T) {
+		gw := fakeGw("test-gw")
 		now := metav1.Now()
-		gw := fakeGw("dying-gw")
 		gw.DeletionTimestamp = &now
 		gw.Finalizers = []string{util.KubeOVNControllerFinalizer}
 		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 			VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+			Pods:           []*corev1.Pod{runningNatGwPod("test-gw")},
 		})
 		require.NoError(t, err)
-		deleted, err := fc.fakeController.natGwDeleted("dying-gw")
+		gone, err := fc.fakeController.natGwDataPlaneGone("test-gw")
 		require.NoError(t, err)
-		require.True(t, deleted)
+		require.True(t, gone)
+	})
+
+	t.Run("a missing gateway holds none", func(t *testing.T) {
+		fc, err := newFakeControllerWithOptions(t, nil)
+		require.NoError(t, err)
+		gone, err := fc.fakeController.natGwDataPlaneGone("missing-gw")
+		require.NoError(t, err)
+		require.True(t, gone)
 	})
 }
 
@@ -91,7 +117,7 @@ func TestDeleteEipInPod_NatGwExistsPodMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = fc.fakeController.deleteEipInPod("test-gw", "10.0.0.1/24", "kube-system")
-	require.Error(t, err, "should return error to retry when pod is temporarily absent")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
 // TestDelEipQoSInPod_NatGwGone verifies cleanup is skipped when gateway is gone.
@@ -112,7 +138,7 @@ func TestDelEipQoSInPod_NatGwExistsPodMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = fc.fakeController.delEipQoSInPod("test-gw", "10.0.0.1", "kube-system", kubeovnv1.QoSDirectionEgress)
-	require.Error(t, err, "should return error to retry when pod is temporarily absent")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
 // TestEnqueueAddIptablesEip verifies that on the add path a terminating EIP is routed to the
@@ -136,7 +162,8 @@ func TestEnqueueAddIptablesEip(t *testing.T) {
 	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
 	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
 	now := metav1.Now()
-	assertEnqueueAddRouting(t, c.addIptablesEipQueue, c.updateIptablesEipQueue, c.enqueueAddIptablesEip,
+	assertEnqueueAddRouting(
+		t, c.addIptablesEipQueue, c.updateIptablesEipQueue, c.enqueueAddIptablesEip,
 		&kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "live-eip"}},
 		&kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "terminating-eip", DeletionTimestamp: &now}},
 	)
