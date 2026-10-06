@@ -58,18 +58,26 @@ networking:
   ENABLE_COMPACT: false
 
 func:
+  # The gateway nftables Service modes are the default data plane of this fork (all three on).
+  # ENABLE_GW_NFTABLE_SVC_CLUSTER_IP replaces the OVN switch load balancers, so ENABLE_LB must
+  # stay false while it is on; set ENABLE_LB: true only together with
+  # ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: false (the chart passes explicit flags, so a conflicting
+  # pair is a hard startup error in the controller rather than a silent override).
   # ENABLE_LB_SVC requires ENABLE_LB (otherwise only a warning is logged and the flow does not work)
   # and is mutually exclusive with ENABLE_GW_NFTABLE_LB_SVC and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP.
-  # ENABLE_GW_NFTABLE_SVC_CLUSTER_IP is mutually exclusive with ENABLE_LB.
   # ENABLE_BGP_LB_VIP and ENABLE_LB_SVC are mutually exclusive.
-  ENABLE_LB: true
+  ENABLE_LB: false
   ENABLE_NP: true
   NP_ENFORCEMENT: standard
   ENABLE_EXTERNAL_VPC: false
   HW_OFFLOAD: false
   ENABLE_LB_SVC: false
-  ENABLE_GW_NFTABLE_LB_SVC: false
-  ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: false
+  ENABLE_GW_NFTABLE_LB_SVC: true
+  ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: true
+  # ENABLE_GW_NFTABLE_LANIP_VIP additionally serves every Service bound to a VPC NAT gateway
+  # through the gateway's lanIP (nftables only; no routes needed). It combines with every
+  # other load balancer mode, and Services sharing a port+protocol on one lanIP merge backends.
+  ENABLE_GW_NFTABLE_LANIP_VIP: true
   ENABLE_BGP_LB_VIP: false
   ENABLE_KEEP_VM_IP: true
   LS_DNAT_MOD_DL_DST: true

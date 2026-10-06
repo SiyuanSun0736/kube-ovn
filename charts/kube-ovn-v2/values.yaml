@@ -183,9 +183,11 @@ networking:
 # -- Features of Kube-OVN we wish to enable/disable.
 # @section -- Opt-in/out Features
 features:
-  # -- Enable Kube-OVN loadbalancers
+  # -- Enable the OVN NB load balancers. Default off because enableGwNftableServiceClusterIp
+  # (default on) replaces them as the ClusterIP data plane; set true only together with
+  # enableGwNftableServiceClusterIp: false, the pair is mutually exclusive in the controller.
   # @section -- Opt-in/out Features
-  enableLoadbalancer: true
+  enableLoadbalancer: false
   # -- Enable Kube-OVN network policies
   # @section -- Opt-in/out Features
   enableNetworkPolicies: true
@@ -198,12 +200,15 @@ features:
   # -- Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise) and is mutually exclusive with enableGwNftableLoadbalancerService and enableGwNftableServiceClusterIp.
   # @section -- Opt-in/out Features
   enableLoadbalancerService: false
-  # -- Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService.
+  # -- Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService. This is the default LB Service datapath of this fork.
   # @section -- Opt-in/out Features
-  enableGwNftableLoadbalancerService: false
-  # -- Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.
+  enableGwNftableLoadbalancerService: true
+  # -- Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancerService and enableLoadbalancer. Replaces the OVN switch load balancers by default.
   # @section -- Opt-in/out Features
-  enableGwNftableServiceClusterIp: false
+  enableGwNftableServiceClusterIp: true
+  # -- Additionally serve every Service bound to a VPC NAT gateway through the gateway's lanIP (nftables only; no routes needed). Combines with every other load balancer mode; Services sharing a port+protocol on one lanIP merge their backends.
+  # @section -- Opt-in/out Features
+  enableGwNftableLanipVip: true
   # -- Enable BGP LB VIP: use a bgp_lb_vip CRD as the IP source for LoadBalancer Services
   # instead of a NAT-gateway EIP. Mutually exclusive with enableLoadbalancerService.
   # @section -- Opt-in/out Features

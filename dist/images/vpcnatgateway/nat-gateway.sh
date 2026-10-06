@@ -88,6 +88,7 @@ function show_help() {
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
     echo "  nft-dnat-map-del         - Delete nft map-based DNAT rule (Share type)"
+    echo "  nft-lanvip-sync          - Reconcile lanIP-as-Service-VIP identities to exactly the given complete set (empty wipes them, including their SNAT)"
     echo "  snat-add                 - Add SNAT rule"
     echo "  snat-del                 - Delete SNAT rule"
     echo "  qos-add                  - Add QoS rule"
@@ -743,6 +744,11 @@ NFT_SERVICES_MAP="service-ips"
 # injected into this chain would be silently wiped. Do NOT reuse NFT_PREROUTING_CHAIN for other
 # components; add a separate chain (or a different priority hook) if new prerouting rules are needed.
 NFT_PREROUTING_CHAIN="prerouting"
+# WARNING: these two chains are owned exclusively by the lanIP-as-Service-VIP feature.
+# sync_nft_lanvip flushes them on every sync and re-adds its single jump rule (base chain) /
+# its complete rule set (snat chain), so any other rule injected here would be silently wiped.
+NFT_POSTROUTING_CHAIN="postrouting"
+NFT_LANVIP_SNAT_CHAIN="lanvip-snat"
 
 # Generate a per-identity chain name from eip:port:protocol.
 # Uses md5 hash prefix for uniqueness (same idea as kube-proxy's hashAndTruncate).
@@ -919,17 +925,26 @@ function add_nft_dnat_map() {
             fi
         done
 
-        # Common infrastructure commands (idempotent): table, base chain, service vmap,
-        # and the base-chain dispatch rule. The base chain is share-dnat-exclusive; flushing
-        # it wipes any other rule in it (see NFT_PREROUTING_CHAIN).
+        # Common infrastructure commands: table + service vmap keep a constant spec and stay
+        # idempotent repeats; chains/sets are only created when missing because `add chain` on
+        # an existing chain fails with EEXIST on stricter nftables builds and rolls back the
+        # whole batch (an existing chain still gets flushed/rebuilt below, so set rebuilds
+        # stay complete). The base chain is share-dnat-exclusive; flushing it wipes any other
+        # rule in it (see NFT_PREROUTING_CHAIN).
         local -a cmds=(
             "add table ip $NFT_TABLE"
-            "add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }"
             "add map ip $NFT_TABLE $NFT_SERVICES_MAP { type ipv4_addr . inet_proto . inet_service : verdict ; }"
+        )
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_PREROUTING_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }")
+        fi
+        cmds+=(
             "flush chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN"
             "add rule ip $NFT_TABLE $NFT_PREROUTING_CHAIN ip daddr . meta l4proto . th dport vmap @$NFT_SERVICES_MAP"
-            "add chain ip $NFT_TABLE $identity_chain"
         )
+        if ! nft list chain ip "$NFT_TABLE" "$identity_chain" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $identity_chain")
+        fi
 
         local keep_bkhashes=""
 
@@ -956,8 +971,14 @@ function add_nft_dnat_map() {
                 bkhashes[$i]="$bkhash"
                 keep_bkhashes="$keep_bkhashes $bkhash"
 
-                cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
-                cmds+=("add chain ip $NFT_TABLE $ep_chain")
+                # create-only-when-missing (same EEXIST reasoning as above); an existing set
+                # keeps its affinity state for surviving clients when the chain is flushed
+                if ! nft list set ip "$NFT_TABLE" "$aff_set" >/dev/null 2>&1; then
+                    cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
+                fi
+                if ! nft list chain ip "$NFT_TABLE" "$ep_chain" >/dev/null 2>&1; then
+                    cmds+=("add chain ip $NFT_TABLE $ep_chain")
+                fi
                 cmds+=("flush chain ip $NFT_TABLE $ep_chain")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain update @$aff_set { ip saddr }")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain meta l4proto $nft_proto dnat to ${ip}:${port}")
@@ -1071,6 +1092,196 @@ function del_nft_dnat_map() {
     done
 }
 
+
+function sync_nft_lanvip() {
+    # Reconcile the lanIP-as-Service-VIP partition of the share-DNAT data plane to exactly the
+    # given complete identity set. Rules use the nft-dnat-map-add format (vip,port,protocol[,
+    # affinity,timeout],backends); the controller derives them from the Services bound to this
+    # gateway, with the gateway's lanIP as the VIP. Zero rules is a valid desired state: it
+    # wipes the partition (feature disabled or no candidate Service). The partition is defined
+    # by the VIP: only data-plane objects keyed by the gateway's own VPC address (or by a vip
+    # named in the desired set) are touched; EIP/ClusterIP identities are never removed here.
+    #
+    # Everything lives in the nft kube-ovn table: the DNAT maps plus a per-identity hairpin
+    # SNAT chain reached from a postrouting base chain, so the feature does not depend on the
+    # iptables HAIRPIN_SNAT chain at all.
+    check_inited
+
+    local local_ip
+    local_ip=$(local_vpc_ipv4) || exit 1
+
+    # Validate and parse every rule up front (defense in depth, same policy as add_nft_dnat_map).
+    local rule nfields eip dport protocol affinity timeout backends bip bport bk i
+    local -a r_vip=() r_port=() r_proto=() r_aff=() r_bk=()
+    for rule in "$@"; do
+        nfields=$(awk -F',' '{print NF}' <<< "$rule")
+        if [ "$nfields" -eq 4 ]; then
+            IFS=',' read -r eip dport protocol backends <<< "$rule"
+            affinity="none"
+            timeout="0"
+        elif [ "$nfields" -eq 6 ]; then
+            IFS=',' read -r eip dport protocol affinity timeout backends <<< "$rule"
+        else
+            echo "Error: invalid nft-lanvip rule (expected 4 or 6 fields): $rule"
+            exit 1
+        fi
+        if [ -z "$eip" ] || [ -z "$dport" ] || [ -z "$protocol" ] || [ -z "$affinity" ] || [ -z "$backends" ]; then
+            echo "Error: invalid nft-lanvip rule: $rule"
+            exit 1
+        fi
+        if ! [[ "$eip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid vip in nft-lanvip rule: $eip"
+            exit 1
+        fi
+        if ! [[ "$dport" =~ ^[0-9]+$ ]] || [ "$dport" -lt 1 ] || [ "$dport" -gt 65535 ]; then
+            echo "Error: invalid external port in nft-lanvip rule: $dport"
+            exit 1
+        fi
+        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+        case "$protocol" in
+            tcp|udp) ;;
+            *)
+                echo "Error: invalid protocol in nft-lanvip rule: $protocol"
+                exit 1
+                ;;
+        esac
+        if [ "$affinity" != "none" ] && [ "$affinity" != "clientip" ]; then
+            echo "Error: invalid affinity in nft-lanvip rule: $affinity"
+            exit 1
+        fi
+        if [ "$affinity" = "clientip" ]; then
+            if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ "$timeout" -lt 1 ] || [ "$timeout" -gt 86400 ]; then
+                echo "Error: invalid affinity timeout in nft-lanvip rule: $timeout"
+                exit 1
+            fi
+        fi
+        IFS='@' read -ra _lanvip_bks <<< "$backends"
+        for bk in "${_lanvip_bks[@]}"; do
+            IFS=':' read -r bip bport <<< "$bk"
+            if ! [[ "$bip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+                echo "Error: invalid backend ip in nft-lanvip rule: $bip"
+                exit 1
+            fi
+            if ! [[ "$bport" =~ ^[0-9]+$ ]] || [ "$bport" -lt 1 ] || [ "$bport" -gt 65535 ]; then
+                echo "Error: invalid backend port in nft-lanvip rule: $bport"
+                exit 1
+            fi
+        done
+        r_vip+=("$eip")
+        r_port+=("$dport")
+        r_proto+=("$protocol")
+        r_aff+=("$affinity")
+        r_bk+=("$backends")
+    done
+    local want_count=${#r_vip[@]}
+
+    if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        if [ "$want_count" -eq 0 ]; then
+            echo "NFT table $NFT_TABLE does not exist, nothing to sync"
+            return 0
+        fi
+    fi
+
+    # Drop stale partition identities: vmap elements whose address is the gateway's own VPC
+    # address (or any vip the desired set names) and whose (vip, proto, port) is not wanted.
+    if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        local map_dump el e_vip e_proto e_port wanted vip_scoped
+        map_dump=$(nft list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" 2>/dev/null || true)
+        while IFS= read -r el; do
+            [ -z "$el" ] && continue
+            e_vip=$(awk '{print $1}' <<< "$el")
+            e_proto=$(awk '{print $3}' <<< "$el")
+            e_port=$(awk '{print $5}' <<< "$el")
+            wanted=false
+            vip_scoped=false
+            for ((i=0; i<want_count; i++)); do
+                if [ "$e_vip" = "${r_vip[$i]}" ] && [ "$e_proto" = "${r_proto[$i]}" ] && [ "$e_port" = "${r_port[$i]}" ]; then
+                    wanted=true
+                fi
+                if [ "$e_vip" = "${r_vip[$i]}" ]; then
+                    vip_scoped=true
+                fi
+            done
+            if [ "$wanted" = true ]; then
+                continue
+            fi
+            # Same single-replica assumption as the hairpin-SNAT TODO above: the partition is
+            # scoped to the instance's own VPC address (spec.lanIp), so teardown also depends
+            # on local_vpc_ipv4 succeeding. Under HA the per-replica partitions must be keyed
+            # by their own VPC addresses, and a replica whose address lookup fails must skip
+            # the wipe rather than strand it.
+            if [ "$e_vip" = "$local_ip" ] || [ "$vip_scoped" = true ]; then
+                del_nft_dnat_map "$e_vip,$e_port,$e_proto"
+            fi
+        done <<< "$(printf '%s\n' "$map_dump" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3} \. (tcp|udp) \. [0-9]+ : goto dnat-[0-9a-f]+' || true)"
+    fi
+
+    # Program the desired identities (per-identity full rewrite, idempotent).
+    if [ "$want_count" -gt 0 ]; then
+        add_nft_dnat_map "$@"
+    fi
+
+    # Drop dnat-* chains no map element references any more (stale or crash-orphaned ones).
+    # Affinity chains/sets of the removed identities go with them.
+    if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        local table_dump referenced cname
+        table_dump=$(nft list table ip "$NFT_TABLE" 2>/dev/null || true)
+        referenced=$(printf '%s\n' "$table_dump" | grep -oE 'goto dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u || true)
+        for cname in $(printf '%s\n' "$table_dump" | grep -oE 'chain dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u); do
+            if ! printf '%s\n' "$referenced" | grep -qxF "$cname"; then
+                nft_transaction_ignore_errors \
+                    "flush chain ip $NFT_TABLE $cname" \
+                    "delete chain ip $NFT_TABLE $cname"
+                cleanup_nft_affinity_objects "${cname#dnat-}" ""
+            fi
+        done
+    fi
+
+    # Rebuild the lanVIP hairpin SNAT chains as a complete set. The SNAT source is this
+    # instance's own VPC address so a backend's reply always returns to the instance that holds
+    # the conntrack entry (same reason as the iptables hairpin for the EIP/ClusterIP VIPs).
+    if [ "$want_count" -gt 0 ]; then
+        local -a cmds=()
+        # `add chain` on an existing chain fails with EEXIST and rolls back this whole batch,
+        # so create the feature-owned chains only when they are missing. Existing chains still
+        # get flushed and re-rule'd below, which is what keeps the set rebuild complete.
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_POSTROUTING_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN { type nat hook postrouting priority 100 ; }")
+        fi
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_LANVIP_SNAT_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN")
+        fi
+        cmds+=(
+            "flush chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN"
+            "add rule ip $NFT_TABLE $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
+            "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
+        )
+        # The 0x1 packet mark comes from the gateway boot-time iptables mangle rule
+        # (VPC_MARK: `$iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK
+        # --set-xmark 0x1/0x1`), which labels connections that entered through the VPC
+        # interface. skb->mark is set on the packet itself, so the nft match sees it no
+        # matter whether the image's iptables binary is the legacy or the nf_tables backend;
+        # what matters is that the boot rule ran. Without the mark the rule would match every
+        # DNAT'd flow out of the VPC interface, not just VIP inbound ones.
+        for ((i=0; i<want_count; i++)); do
+            cmds+=("add rule ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN meta mark and 0x1 == 0x1 oifname \"$VPC_INTERFACE\" meta l4proto ${r_proto[$i]} ct status dnat ct original ip daddr ${r_vip[$i]} ct original proto-dst ${r_port[$i]} snat to $local_ip fully-random comment \"ko-lanvip-snat\"")
+        done
+        if ! nft_transaction "${cmds[@]}"; then
+            echo "Error: failed to rebuild lanvip snat chain"
+            exit 1
+        fi
+    else
+        # Drop the jump reference before deleting the chains it points at: deleting a still-
+        # referenced chain fails with EBUSY and would roll back the whole teardown batch.
+        nft_transaction_ignore_errors \
+            "flush chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN" \
+            "delete chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN" \
+            "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN" \
+            "delete chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
+    fi
+
+    echo "Synced nft lanVIP identities: $want_count (instance vpc address $local_ip)"
+}
 
 # Escape dots for grep regex matching (e.g., "192.168.1.1/32" -> "192\.168\.1\.1/32")
 function escape_for_regex() {
@@ -2073,6 +2284,10 @@ case $opt in
     nft-dnat-map-del)
         echo "nft-dnat-map-del $*"
         del_nft_dnat_map "$@"
+        ;;
+    nft-lanvip-sync)
+        echo "nft-lanvip-sync $*"
+        sync_nft_lanvip "$@"
         ;;
     snat-add)
         echo "snat-add $*"

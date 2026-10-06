@@ -50,6 +50,9 @@ func (c *Controller) enqueueAddEndpointSlice(obj any) {
 	// The gateway nftable LB service feature consumes the EndpointSlice events too, and it works
 	// with --enable-lb=false, so its reconcile is enqueued before the OVN load balancer gate below.
 	c.enqueueGwNftableLbService(key)
+	if namespace, name, err := cache.SplitMetaNamespaceKey(key); err == nil {
+		c.enqueueNatGwLanVipForService(namespace, name)
+	}
 	if !c.config.EnableOvnLB {
 		return
 	}
@@ -74,6 +77,11 @@ func (c *Controller) enqueueUpdateEndpointSlice(oldObj, newObj any) {
 		} else if !reflect.DeepEqual(oldEndpointSlice.Ports, newEndpointSlice.Ports) {
 			c.enqueueGwNftableLbService(newKey)
 		}
+		for _, k := range []string{oldKey, newKey} {
+			if namespace, name, err := cache.SplitMetaNamespaceKey(k); err == nil {
+				c.enqueueNatGwLanVipForService(namespace, name)
+			}
+		}
 		return
 	}
 
@@ -89,6 +97,11 @@ func (c *Controller) enqueueUpdateEndpointSlice(oldObj, newObj any) {
 		c.enqueueGwNftableLbService(oldKey)
 	}
 	c.enqueueGwNftableLbService(newKey)
+	for _, k := range []string{oldKey, newKey} {
+		if namespace, name, err := cache.SplitMetaNamespaceKey(k); err == nil {
+			c.enqueueNatGwLanVipForService(namespace, name)
+		}
+	}
 	if !c.config.EnableOvnLB {
 		return
 	}
@@ -121,6 +134,11 @@ func (c *Controller) enqueueDeleteEndpointSlice(obj any) {
 	}
 	// See enqueueAddEndpointSlice: the feature needs the event even without the OVN load balancer.
 	c.enqueueGwNftableLbService(key)
+	if namespace, name, err := cache.SplitMetaNamespaceKey(key); err == nil {
+		// The Service usually still exists at this point; if it is gone its own delete event
+		// already queued the partition sync (this lookup is a no-op then).
+		c.enqueueNatGwLanVipForService(namespace, name)
+	}
 	if !c.config.EnableOvnLB {
 		return
 	}

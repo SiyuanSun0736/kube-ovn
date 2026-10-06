@@ -101,6 +101,9 @@ type Configuration struct {
 	EnableGwNftableLbSvc bool
 	// EnableGwNftableSvcClusterIP syncs Service ClusterIPs to gateway nftables.
 	EnableGwNftableSvcClusterIP bool
+	// EnableGwNftableLanipVip additionally serves every gateway-bound Service through the
+	// gateway's lanIP (nftables only, no routes and no loopback addresses needed).
+	EnableGwNftableLanipVip     bool
 	EnableBgpLbVip              bool
 	EnableOVNLBPreferLocal      bool
 	EnableMetrics               bool
@@ -204,8 +207,9 @@ func ParseFlags() (*Configuration, error) {
 		argEnableEcmp                  = pflag.Bool("enable-ecmp", false, "Enable ecmp route for centralized subnet")
 		argKeepVMIP                    = pflag.Bool("keep-vm-ip", true, "Whether to keep ip for kubevirt pod when pod is rebuild")
 		argEnablePodLbSvc              = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip")
-		argEnableGwNftableLbSvc        = pflag.Bool("enable-gw-nftable-lb-svc", false, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT: the gateway pod serves the Service's EIP identities (its ingress IP), replacing a load-balancer Pod")
-		argEnableGwNftableSvcClusterIP = pflag.Bool("enable-gw-nftable-svc-cluster-ip", false, "Serve Service ClusterIP identities through VPC NAT Gateway nftables share DNAT instead of the OVN switch load balancers")
+		argEnableGwNftableLbSvc        = pflag.Bool("enable-gw-nftable-lb-svc", true, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT: the gateway pod serves the Service's EIP identities (its ingress IP), replacing a load-balancer Pod")
+		argEnableGwNftableSvcClusterIP = pflag.Bool("enable-gw-nftable-svc-cluster-ip", true, "Serve Service ClusterIP identities through VPC NAT Gateway nftables share DNAT instead of the OVN switch load balancers")
+		argEnableGwNftableLanipVip     = pflag.Bool("enable-gw-nftable-lanip-vip", true, "Additionally serve every Service bound to a VPC NAT Gateway through the gateway's lanIP (nftables): the lanIP becomes a shared frontend where Services with the same port+protocol merge their backends; needs no routes and combines with every other load balancer mode")
 		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Enable BGP LB EIP mode: allocates a LoadBalancer external IP via a VIP CR (type=bgp_lb_vip) on a non-OVN subnet and announces it through the BGP speaker. No lb-svc Pod is created. Mutually exclusive with --enable-lb-svc")
 		argEnableOVNLBPreferLocal      = pflag.Bool("enable-ovn-lb-prefer-local", false, "Whether to support ovn loadbalancer prefer local")
 		argEnableMetrics               = pflag.Bool("enable-metrics", true, "Whether to support metrics query")
@@ -318,6 +322,7 @@ func ParseFlags() (*Configuration, error) {
 		EnablePodLbSvc:                 *argEnablePodLbSvc,
 		EnableGwNftableLbSvc:           *argEnableGwNftableLbSvc,
 		EnableGwNftableSvcClusterIP:    *argEnableGwNftableSvcClusterIP,
+		EnableGwNftableLanipVip:        *argEnableGwNftableLanipVip,
 		EnableBgpLbVip:                 *argEnableBgpLbVip,
 		EnableOVNLBPreferLocal:         *argEnableOVNLBPreferLocal,
 		EnableMetrics:                  *argEnableMetrics,
@@ -341,6 +346,10 @@ func ParseFlags() (*Configuration, error) {
 	if config.OvsDbInactivityTimeout > 0 && config.OvsDbConnectTimeout >= config.OvsDbInactivityTimeout {
 		return nil, errors.New("OVS DB inactivity timeout value should be greater than reconnect timeout value")
 	}
+
+	// The gateway nftables modes default to true (this fork's intended default data plane);
+	// arbitrate them against the historical switches before validating.
+	resolveServiceFeatureGateDefaults(config, pflag.CommandLine.Changed)
 
 	if err := config.validateModeFlags(); err != nil {
 		return nil, err
@@ -413,14 +422,49 @@ func (config *Configuration) validateModeFlags() error {
 	return nil
 }
 
+// resolveServiceFeatureGateDefaults arbitrates between the default-on gateway nftables modes and
+// the historical switches they replace. A switch the operator pinned on the command line always
+// wins over one that merely defaults to true, and when neither side was pinned the gateway
+// nftables mode takes precedence (and the replaced implementation is turned off with a warning).
+// Pinning both conflicting sides stays an error raised by validateServiceFeatureGates.
+func resolveServiceFeatureGateDefaults(config *Configuration, changed func(string) bool) {
+	if config.EnablePodLbSvc && config.EnableGwNftableLbSvc && !changed("enable-gw-nftable-lb-svc") {
+		klog.Warning("--enable-lb-svc is set: turning the default-on --enable-gw-nftable-lb-svc off (both manage the ingress IP of LoadBalancer Services)")
+		config.EnableGwNftableLbSvc = false
+	}
+	if config.EnablePodLbSvc && config.EnableGwNftableSvcClusterIP && !changed("enable-gw-nftable-svc-cluster-ip") {
+		klog.Warning("--enable-lb-svc is set: turning the default-on --enable-gw-nftable-svc-cluster-ip off (an LB Pod per Service makes per-gateway ClusterIP identities moot)")
+		config.EnableGwNftableSvcClusterIP = false
+	}
+	if config.EnableGwNftableSvcClusterIP && config.EnableOvnLB {
+		switch {
+		case changed("enable-lb") && changed("enable-gw-nftable-svc-cluster-ip"):
+			// Both sides pinned on the command line: validateServiceFeatureGates rejects it.
+		case changed("enable-lb"):
+			klog.Warning("--enable-lb is set: turning the default-on --enable-gw-nftable-svc-cluster-ip off (the OVN switch load balancers keep the ClusterIP data plane)")
+			config.EnableGwNftableSvcClusterIP = false
+		default:
+			klog.Warning("--enable-gw-nftable-svc-cluster-ip defaults to true and replaces the OVN switch load balancers: turning --enable-lb off (pass --enable-gw-nftable-svc-cluster-ip=false to restore --enable-lb)")
+			config.EnableOvnLB = false
+		}
+	}
+}
+
 // validateServiceFeatureGates fences the LB implementations of a Service. The ownership partition
 // by flag:
 //
 //	resource                       data plane                             flag
-//	ClusterIP/NodePort VIPs        OVN switch load balancers              --enable-lb (default true)
+//	ClusterIP/NodePort VIPs        OVN switch load balancers              --enable-lb (default true; auto-off when the gateway
+//	                                                                        ClusterIP mode below wins by default)
 //	ingress IP of a LB Service     iptables/ipvs in a per-Service LB Pod  --enable-lb-svc
-//	EIP identities of a LB Service nftables in its VPC NAT gateway pod    --enable-gw-nftable-lb-svc
-//	ClusterIP of any Service       nftables in VPC NAT gateway pods       --enable-gw-nftable-svc-cluster-ip
+//	EIP identities of a LB Service nftables in its VPC NAT gateway pod    --enable-gw-nftable-lb-svc (default true)
+//	ClusterIP of any Service       nftables in VPC NAT gateway pods       --enable-gw-nftable-svc-cluster-ip (default true)
+//	lanIP frontends of all Services of a gateway   nftables in its VPC NAT gateway pod   --enable-gw-nftable-lanip-vip (default true)
+//
+// The lanIP switch is the only pure add-on: it serves extra frontends for the Services that
+// already point at a gateway, needs no other flag, and conflicts with none (its VIPs are pod
+// IPs no other implementation programs). Services that share a port+protocol on one lanIP merge
+// their backends into one identity rather than conflicting.
 //
 // A flag gates programming only: a reconcile never creates state for a disabled implementation,
 // but teardown of already-managed state runs regardless of the flag so finalizers and leftover

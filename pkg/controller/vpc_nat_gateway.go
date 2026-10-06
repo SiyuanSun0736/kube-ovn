@@ -212,6 +212,11 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(gwName) }()
 	stsName := util.GenNatGwName(gwName)
 	klog.Infof("delete vpc nat gw %s in namespace %s", stsName, stsNamespace)
+	// The lanIP-as-Service-VIP per-gateway notes/caches are keyed by gwName and keyed handlers
+	// stop firing once the object is gone (its Services leave the gateway index and nothing
+	// re-enqueues its partition sync), so forget them here to track live gateways only.
+	c.natGwLanVipMergeNotes.Delete(gwName)
+	c.natGwLanVipLastSync.Delete(gwName)
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -700,8 +705,10 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		}
 	}
 	// Service records never redo themselves. Reconcile the Services bound to this gateway so the
-	// only share-DNAT writer restores the new gateway instance.
+	// only share-DNAT writer restores the new gateway instance. The lanIP identity partition is
+	// rebuilt by its own complete-set sync for the same reason.
 	c.enqueueGwNftableLbServicesForNatGw(natGwKey)
+	c.enqueueNatGwLanVipSync(natGwKey)
 	return nil
 }
 

@@ -842,12 +842,13 @@ false
   "SET_VXLAN_TX_OFF": false,
   "enableBgpLbVip": false,
   "enableExternalVpcs": false,
-  "enableGwNftableLoadbalancerService": false,
-  "enableGwNftableServiceClusterIp": false,
+  "enableGwNftableLanipVip": true,
+  "enableGwNftableLoadbalancerService": true,
+  "enableGwNftableServiceClusterIp": true,
   "enableHardwareOffload": false,
   "enableKeepVmIps": true,
   "enableLiveMigrationOptimization": true,
-  "enableLoadbalancer": true,
+  "enableLoadbalancer": false,
   "enableLoadbalancerService": false,
   "enableNatGateways": true,
   "enableNetworkPolicies": true,
@@ -883,19 +884,28 @@ false
 			<td>features.enableGwNftableLoadbalancerService</td>
 			<td>bool</td>
 			<td><pre lang="json">
-false
+true
 </pre>
 </td>
-			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService.</td>
+			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService. This is the default LB Service datapath of this fork.</td>
+		</tr>
+		<tr>
+			<td>features.enableGwNftableLanipVip</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Additionally serve every Service bound to a VPC NAT gateway through the gateway's lanIP (nftables only; no routes needed). Combines with every other load balancer mode; Services sharing a port+protocol on one lanIP merge their backends.</td>
 		</tr>
 		<tr>
 			<td>features.enableGwNftableServiceClusterIp</td>
 			<td>bool</td>
 			<td><pre lang="json">
-false
+true
 </pre>
 </td>
-			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.</td>
+			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancerService and enableLoadbalancer. Replaces the OVN switch load balancers by default.</td>
 		</tr>
 		<tr>
 			<td>features.enableHardwareOffload</td>
@@ -928,10 +938,10 @@ true
 			<td>features.enableLoadbalancer</td>
 			<td>bool</td>
 			<td><pre lang="json">
-true
+false
 </pre>
 </td>
-			<td>Enable Kube-OVN loadbalancers</td>
+			<td>Enable the OVN NB load balancers. Default off because enableGwNftableServiceClusterIp (default on) replaces them as the ClusterIP data plane; set true only together with enableGwNftableServiceClusterIp: false, the pair is mutually exclusive in the controller.</td>
 		</tr>
 		<tr>
 			<td>features.enableLoadbalancerService</td>

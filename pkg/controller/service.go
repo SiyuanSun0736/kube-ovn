@@ -45,6 +45,7 @@ func (c *Controller) enqueueAddService(obj any) {
 	svc := obj.(*v1.Service)
 	key := cache.MetaObjectToName(svc).String()
 	c.enqueueGwNftableLbService(key)
+	c.enqueueNatGwLanVipSync(svc.Annotations[util.VpcNatGatewayAnnotation])
 	klog.V(3).Infof("enqueue add endpoint %s", key)
 	c.addOrUpdateEndpointSliceQueue.Add(key)
 
@@ -86,6 +87,9 @@ func (c *Controller) enqueueDeleteService(obj any) {
 	// VIPs keep belonging to the classic implementation, so its cleanup always runs here.
 	klog.Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
 	c.enqueueGwNftableLbService(svc.Namespace + "/" + svc.Name)
+	// The gateway annotation survives on the tombstone object: its lanIP partition loses this
+	// Service's backends now, and the identity is dropped once nobody else claims the port.
+	c.enqueueNatGwLanVipSync(svc.Annotations[util.VpcNatGatewayAnnotation])
 
 	if svc.Annotations[util.SwitchLBRuleVipsAnnotation] != "" ||
 		(svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") ||
@@ -145,9 +149,13 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 
 	key := cache.MetaObjectToName(newSvc).String()
 	// The gateway mode's reconcile only depends on the Service fields gwNftableLbSvcChanged
-	// compares, so an unrelated status or annotation churn does not wake it.
+	// compares, so an unrelated status or annotation churn does not wake it. The lanIP
+	// partition consumes the same fields (gateway annotation, ports, affinity), so it shares
+	// the filter; both gateways matter because the annotation may have moved the Service.
 	if gwNftableLbSvcChanged(oldSvc, newSvc) {
 		c.enqueueGwNftableLbService(key)
+		c.enqueueNatGwLanVipSync(oldSvc.Annotations[util.VpcNatGatewayAnnotation])
+		c.enqueueNatGwLanVipSync(newSvc.Annotations[util.VpcNatGatewayAnnotation])
 	}
 	klog.V(3).Infof("enqueue update service %s", key)
 	if len(ipsToDel) != 0 {

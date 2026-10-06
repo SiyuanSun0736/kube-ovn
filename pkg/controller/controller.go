@@ -284,9 +284,16 @@ type Controller struct {
 	svcIndexer                     cache.Indexer
 	addServiceQueue                workqueue.TypedRateLimitingInterface[string]
 	addOrUpdateGwNftableLbSvcQueue workqueue.TypedRateLimitingInterface[string]
-	deleteServiceQueue             workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue             workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex                    keymutex.KeyMutex
+	natGwLanVipSyncQueue           workqueue.TypedRateLimitingInterface[string]
+	// natGwLanVipMergeNotes stores the last emitted affinity-merge signature per gateway, so a
+	// steady Service session-affinity disagreement logs/events only on change, not per sync.
+	natGwLanVipMergeNotes sync.Map
+	// natGwLanVipLastSync stores the last successfully programmed partition signature per
+	// gateway (instance pod UIDs + desired rules), so byte-identical re-syncs skip the pod exec.
+	natGwLanVipLastSync sync.Map
+	deleteServiceQueue  workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue  workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex         keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced
@@ -635,6 +642,7 @@ func Run(ctx context.Context, config *Configuration) {
 		svcIndexer:                     serviceInformer.Informer().GetIndexer(),
 		addServiceQueue:                newTypedRateLimitingQueue[string]("AddService", nil),
 		addOrUpdateGwNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateGwNftableLbSvc", nil),
+		natGwLanVipSyncQueue:           newTypedRateLimitingQueue[string]("NatGwLanVipSync", nil),
 		deleteServiceQueue:             newTypedRateLimitingQueue[*vpcService]("DeleteService", nil),
 		updateServiceQueue:             newTypedRateLimitingQueue[*updateSvcObject]("UpdateService", nil),
 		svcKeyMutex:                    keymutex.NewHashed(numKeyLocks),
@@ -1267,6 +1275,7 @@ func (c *Controller) shutdown() {
 	c.deleteServiceQueue.ShutDown()
 	c.updateServiceQueue.ShutDown()
 	c.addOrUpdateGwNftableLbSvcQueue.ShutDown()
+	c.natGwLanVipSyncQueue.ShutDown()
 	c.addOrUpdateEndpointSliceQueue.ShutDown()
 
 	c.addVlanQueue.ShutDown()
@@ -1456,6 +1465,10 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	// the only owner of the controller finalizer the feature put on Services, and startup Adds
 	// replay finalizing Services so their cleanup keeps working.
 	go wait.Until(runWorker("add/update gateway nftable lb service", c.addOrUpdateGwNftableLbSvcQueue, c.handleAddOrUpdateGwNftableLbService), time.Second, ctx.Done())
+	// The lanIP-as-Service-VIP partition sync also runs with its feature flag off: nothing is
+	// programmed then, but the same complete-set sync is the only path that wipes the
+	// identities the feature programmed while it was enabled.
+	go wait.Until(runWorker("sync nat gw lan vip", c.natGwLanVipSyncQueue, c.handleSyncNatGwLanVip), time.Second, ctx.Done())
 
 	if k8sLBWorker {
 		go wait.Until(runWorker("add service", c.addServiceQueue, c.handleAddService), time.Second, ctx.Done())
