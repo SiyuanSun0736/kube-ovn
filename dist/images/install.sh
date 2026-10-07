@@ -233,9 +233,11 @@ if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_LB_SVC" = "true" ]]; then
   echo "ERROR: ENABLE_LB_SVC and ENABLE_GW_NFTABLE_LB_SVC are mutually exclusive (pick one egress-IP datapath)"
   exit 1
 fi
-if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" ]]; then
-  echo "ERROR: ENABLE_LB_SVC and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP are mutually exclusive"
-  exit 1
+# No direct ENABLE_LB_SVC/ENABLE_GW_NFTABLE_SVC_CLUSTER_IP conflict: the lb-svc Pod DNATs the
+# external address to the Service ClusterIP, which either ClusterIP data plane can serve.
+if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" != "true" && "$ENABLE_LB" != "true" ]]; then
+  echo "WARNING: ENABLE_LB_SVC DNATs to the Service ClusterIP, but both ClusterIP data planes are off"
+  echo "         (ENABLE_LB and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP); unless kube-proxy still serves the ClusterIPs the lb-svc datapath will not work"
 fi
 if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" && "$ENABLE_LB" = "true" ]]; then
   echo "ERROR: ENABLE_GW_NFTABLE_SVC_CLUSTER_IP and ENABLE_LB are mutually exclusive"

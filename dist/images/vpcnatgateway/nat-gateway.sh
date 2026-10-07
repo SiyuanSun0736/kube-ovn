@@ -51,17 +51,14 @@ EXTERNAL_INTERFACE=${EXTERNAL_INTERFACE:-"net1"}
 # In production, leave this as "false" to reduce log volume
 QOS_DEBUG=${QOS_DEBUG:-"false"}
 
+# Use the image's default iptables/iptables-save as-is. If you need iptables-legacy, change the
+# system alternatives inside the container image (e.g. update-alternatives --set iptables
+# /usr/sbin/iptables-legacy) rather than modifying this script; when the image has both backends
+# installed, the default must stay, because the nft share-DNAT maps and the hairpin/SNAT rules
+# below live in the same nftables backend -- pointing the iptables rules at the legacy backend
+# would run the gateway as a split data plane.
 iptables_cmd=$(which iptables)
 iptables_save_cmd=$(which iptables-save)
-# Fall back to the legacy flavor only when the default iptables is not the nftables backend and
-# the legacy tools actually work (centos-7-class images). The nft share DNAT maps this script
-# also programs live in the nftables backend, so when plain iptables is nf_tables-flavored the
-# hairpin and SNAT rules must land there too, or the gateway runs a split data plane.
-if ! iptables --version 2>/dev/null | grep -q nf_tables && iptables-legacy -t nat -S INPUT 1 2>/dev/null; then
-    # use iptables-legacy for centos 7
-    iptables_cmd=$(which iptables-legacy)
-    iptables_save_cmd=$(which iptables-legacy-save)
-fi
 
 function show_help() {
     echo "NAT Gateway Configuration Script"

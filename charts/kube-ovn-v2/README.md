@@ -905,7 +905,7 @@ true
 true
 </pre>
 </td>
-			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancerService and enableLoadbalancer. Replaces the OVN switch load balancers by default.</td>
+			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer (both own the ClusterIP data plane). Replaces the OVN switch load balancers by default.</td>
 		</tr>
 		<tr>
 			<td>features.enableHardwareOffload</td>
@@ -950,7 +950,7 @@ false
 false
 </pre>
 </td>
-			<td>Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise) and is mutually exclusive with enableGwNftableLoadbalancerService and enableGwNftableServiceClusterIp.</td>
+			<td>Enable Kube-OVN loadbalancer services: one LB Pod per LoadBalancer Service, DNATing the external address to the Service ClusterIP. Needs a ClusterIP data plane behind it (enableLoadbalancer, the historical pair, or enableGwNftableServiceClusterIp; only a warning is logged when neither is on). Mutually exclusive with enableGwNftableLoadbalancerService (both own the LB ingress IP) and with enableBgpLbVip.</td>
 		</tr>
 		<tr>
 			<td>features.enableNatGateways</td>

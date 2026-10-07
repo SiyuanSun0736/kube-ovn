@@ -229,4 +229,38 @@ delete_calls="$(grep -c ' del ' "$tc_log")"
 delete_htb_filter_and_class "$VPC_INTERFACE" "10.20.0.1/32" "src" "eip"
 [[ "$(grep -c ' del ' "$tc_log")" == "$delete_calls" ]]
 
+# Backward compatibility with filters installed by the previous script version.
+# An old EIP classid at the very top of the EIP range (a collision-bumped 0x7fff) is still
+# recognized as EIP-owned, and an EIP delete (which passes no priority) ignores the stored pref.
+cat > "$tc_filters" <<'EOF'
+filter parent 1: protocol ip pref 10 u32 fh 800::807 order 2055 key ht 800 bkt 0 flowid 1:7fff not_in_hw
+  match ip src 10.0.0.3/32
+EOF
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.0.0.3/32" "src" "eip"
+grep -qF 'tc filter del dev eth0 parent 1: prio 10 handle 800::807 u32' "$tc_log"
+grep -qF 'tc class del dev eth0 classid 1:0x7fff' "$tc_log"
+
+# tc rewrites a requested priority 0 to pref 49152 when storing the filter, so an old NatGw
+# filter carries no pref matching the rule's priority. With a single candidate for the identity
+# the filter is still adopted and deleted.
+cat > "$tc_filters" <<'EOF'
+filter parent 1: protocol ip pref 49152 u32 fh 800::808 order 2056 key ht 800 bkt 0 flowid 1:8005 not_in_hw
+  match ip dst 10.30.0.1/16
+EOF
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.30.0.1/16" "dst" "natgw" "0"
+grep -qF 'tc filter del dev eth0 parent 1: prio 49152 handle 800::808 u32' "$tc_log"
+grep -qF 'tc class del dev eth0 classid 1:0x8005' "$tc_log"
+
+# ... but when two candidates share the identity, the pref-mismatching one must not be guessed:
+# nothing is deleted rather than adopting a foreign filter.
+cat > "$tc_filters" <<'EOF'
+filter parent 1: protocol ip pref 49152 u32 fh 800::809 order 2057 key ht 800 bkt 0 flowid 1:8005 not_in_hw
+  match ip dst 10.30.0.1/16
+filter parent 1: protocol ip pref 49152 u32 fh 800::80a order 2058 key ht 800 bkt 0 flowid 1:8006 not_in_hw
+  match ip dst 10.30.0.1/16
+EOF
+delete_calls="$(grep -c ' del ' "$tc_log")"
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.30.0.1/16" "dst" "natgw" "0"
+[[ "$(grep -c ' del ' "$tc_log")" == "$delete_calls" ]]
+
 echo 'PASS: share-DNAT VIP address, hairpin and QoS class rules' 

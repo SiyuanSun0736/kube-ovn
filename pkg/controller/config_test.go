@@ -106,9 +106,18 @@ func TestConfigurationValidateServiceFeatureGates(t *testing.T) {
 			wantErr: "--enable-lb-svc and --enable-gw-nftable-lb-svc are mutually exclusive",
 		},
 		{
-			name:    "pod load balancer and gateway cluster ip conflict",
+			// no direct conflict: the lb-svc Pod DNATs to the ClusterIP, which the gateway
+			// ClusterIP mode can serve; only a warning is logged when no ClusterIP data
+			// plane is left at all (neither --enable-lb nor the gateway mode)
+			name:   "pod load balancer combines with gateway cluster ip",
+			config: Configuration{EnablePodLbSvc: true, EnableGwNftableSvcClusterIP: true},
+		},
+		{
+			// with --enable-lb pinned on, the remaining conflict is between the two
+			// ClusterIP implementations, not between lb-svc and the gateway mode
+			name:    "pod load balancer and gateway cluster ip conflict only through enable-lb",
 			config:  Configuration{EnableOvnLB: true, EnablePodLbSvc: true, EnableGwNftableSvcClusterIP: true},
-			wantErr: "--enable-lb-svc and --enable-gw-nftable-svc-cluster-ip are mutually exclusive",
+			wantErr: "--enable-gw-nftable-svc-cluster-ip and --enable-lb are mutually exclusive",
 		},
 		{
 			name:    "ovn and gateway cluster ip conflict",

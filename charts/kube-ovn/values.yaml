@@ -63,8 +63,12 @@ func:
   # stay false while it is on; set ENABLE_LB: true only together with
   # ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: false (the chart passes explicit flags, so a conflicting
   # pair is a hard startup error in the controller rather than a silent override).
-  # ENABLE_LB_SVC requires ENABLE_LB (otherwise only a warning is logged and the flow does not work)
-  # and is mutually exclusive with ENABLE_GW_NFTABLE_LB_SVC and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP.
+  # ENABLE_LB_SVC runs one LB Pod per LoadBalancer Service and DNATs the external address to the
+  # Service ClusterIP, so it needs a ClusterIP data plane behind it (ENABLE_LB, the historical
+  # pair, or ENABLE_GW_NFTABLE_SVC_CLUSTER_IP). It is mutually exclusive with
+  # ENABLE_GW_NFTABLE_LB_SVC (both own the LB ingress IP) but not with the ClusterIP modes:
+  # ENABLE_LB + ENABLE_GW_NFTABLE_LB_SVC is the upstream-recommended pair (OVN keeps the
+  # ClusterIPs, the gateway serves the LB ingress IPs).
   # ENABLE_BGP_LB_VIP and ENABLE_LB_SVC are mutually exclusive.
   ENABLE_LB: false
   ENABLE_NP: true

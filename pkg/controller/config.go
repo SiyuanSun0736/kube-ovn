@@ -206,7 +206,7 @@ func ParseFlags() (*Configuration, error) {
 		argEnableExternalVpc           = pflag.Bool("enable-external-vpc", false, "Enable external vpc support")
 		argEnableEcmp                  = pflag.Bool("enable-ecmp", false, "Enable ecmp route for centralized subnet")
 		argKeepVMIP                    = pflag.Bool("keep-vm-ip", true, "Whether to keep ip for kubevirt pod when pod is rebuild")
-		argEnablePodLbSvc              = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip")
+		argEnablePodLbSvc              = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip and --enable-gw-nftable-lb-svc")
 		argEnableGwNftableLbSvc        = pflag.Bool("enable-gw-nftable-lb-svc", true, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT: the gateway pod serves the Service's EIP identities (its ingress IP), replacing a load-balancer Pod")
 		argEnableGwNftableSvcClusterIP = pflag.Bool("enable-gw-nftable-svc-cluster-ip", true, "Serve Service ClusterIP identities through VPC NAT Gateway nftables share DNAT instead of the OVN switch load balancers")
 		argEnableGwNftableLanipVip     = pflag.Bool("enable-gw-nftable-lanip-vip", true, "Additionally serve every Service bound to a VPC NAT Gateway through the gateway's lanIP (nftables): the lanIP becomes a shared frontend where Services with the same port+protocol merge their backends; needs no routes and combines with every other load balancer mode")
@@ -433,7 +433,11 @@ func resolveServiceFeatureGateDefaults(config *Configuration, changed func(strin
 		config.EnableGwNftableLbSvc = false
 	}
 	if config.EnablePodLbSvc && config.EnableGwNftableSvcClusterIP && !changed("enable-gw-nftable-svc-cluster-ip") {
-		klog.Warning("--enable-lb-svc is set: turning the default-on --enable-gw-nftable-svc-cluster-ip off (an LB Pod per Service makes per-gateway ClusterIP identities moot)")
+		// lb-svc pairs with the classic OVN ClusterIP data plane (it DNATs the external
+		// address to the ClusterIP): keep --enable-lb on for it by yielding the gateway
+		// ClusterIP mode. Pinning --enable-gw-nftable-svc-cluster-ip=true instead runs
+		// lb-svc on the gateway ClusterIP data plane (--enable-lb then yields below).
+		klog.Warning("--enable-lb-svc is set: turning the default-on --enable-gw-nftable-svc-cluster-ip off (the lb-svc Pod DNATs to the ClusterIP, which stays on the OVN load balancers)")
 		config.EnableGwNftableSvcClusterIP = false
 	}
 	if config.EnableGwNftableSvcClusterIP && config.EnableOvnLB {
@@ -474,15 +478,24 @@ func resolveServiceFeatureGateDefaults(config *Configuration, changed func(strin
 // annotations for bgp-lb-vip, the gateway+EIP annotations for the nftable gateway modes, the
 // lb-svc deployment annotation for lb-svc). Mixing the annotation sets of two implementations on
 // one Service is unsupported and rejected as a user error rather than reconciled.
+//
+// The direct conflicts, checked here or in validateModeFlags:
+//
+//	--enable-lb-svc ⊥ --enable-gw-nftable-lb-svc (both own the ingress IP of a LoadBalancer
+//	                                            Service: per-Service LB Pod vs gateway DNAT)
+//	--enable-lb-svc ⊥ --enable-bgp-lb-vip        (validateModeFlags; same ingress-IP ownership)
+//	--enable-lb     ⊥ --enable-gw-nftable-svc-cluster-ip (both own the ClusterIP data plane)
+//
+// Everything else combines; --enable-lb + --enable-gw-nftable-lb-svc in particular is the
+// upstream-recommended pair (OVN keeps the ClusterIPs, the gateway serves the LB ingress IPs).
+// lb-svc pairs with --enable-gw-nftable-svc-cluster-ip as well: its Pod DNATs the external
+// address to the ClusterIP, which the gateway mode then serves.
 func (config *Configuration) validateServiceFeatureGates() error {
-	if config.EnablePodLbSvc && !config.EnableOvnLB {
-		klog.Warning("--enable-lb-svc requires --enable-lb, the loadbalancer service feature will not work")
+	if config.EnablePodLbSvc && !config.EnableOvnLB && !config.EnableGwNftableSvcClusterIP {
+		klog.Warning("--enable-lb-svc DNATs the external address to the Service ClusterIP, but both ClusterIP data planes are off (unless kube-proxy still serves them, nothing resolves the ClusterIP)")
 	}
 	if config.EnablePodLbSvc && config.EnableGwNftableLbSvc {
 		return errors.New("--enable-lb-svc and --enable-gw-nftable-lb-svc are mutually exclusive")
-	}
-	if config.EnablePodLbSvc && config.EnableGwNftableSvcClusterIP {
-		return errors.New("--enable-lb-svc and --enable-gw-nftable-svc-cluster-ip are mutually exclusive")
 	}
 	if config.EnableGwNftableSvcClusterIP && config.EnableOvnLB {
 		return errors.New("--enable-gw-nftable-svc-cluster-ip and --enable-lb are mutually exclusive")
