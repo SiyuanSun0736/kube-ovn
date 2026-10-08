@@ -55,6 +55,20 @@ func (v *ValidatingHook) VpcNatGwCreateOrUpdateHook(ctx context.Context, req adm
 				gw.Name, gwOld.Spec.Vpc, gw.Spec.Vpc)
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
 		}
+
+		oldMode := ""
+		if gwOld.Annotations != nil {
+			oldMode = gwOld.Annotations[util.NatGatewayDataplaneModeAnnotation]
+		}
+		newMode := ""
+		if gw.Annotations != nil {
+			newMode = gw.Annotations[util.NatGatewayDataplaneModeAnnotation]
+		}
+		if oldMode != newMode {
+			err := fmt.Errorf("VpcNatGateway %q: annotation %q is immutable once initialized (old: %q, new: %q); delete and recreate gateway to switch dataplane mode",
+				gw.Name, util.NatGatewayDataplaneModeAnnotation, oldMode, newMode)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
 	}
 
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {

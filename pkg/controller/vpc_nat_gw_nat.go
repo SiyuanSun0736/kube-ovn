@@ -1092,7 +1092,8 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		return err
 	}
 
-	if err = c.createSnatInPod(eip.Spec.NatGwDp, eip.Status.IP, v4Cidr); err != nil {
+	memberID := resolveSnatMemberID(eip, snat)
+	if err = c.createSnatInPodWithMember(eip.Spec.NatGwDp, eip.Status.IP, v4Cidr, memberID); err != nil {
 		klog.Errorf("failed to create snat, %v", err)
 		return err
 	}
@@ -1251,7 +1252,8 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			return err
 		}
 		c.enqueueDeletingOldIptablesEip(cachedSnat.Annotations[util.VpcEipAnnotation], cachedSnat.Spec.EIP)
-		if err = c.createSnatInPod(eip.Spec.NatGwDp, newV4ip, newV4Cidr); err != nil {
+		memberID := resolveSnatMemberID(eip, cachedSnat)
+		if err = c.createSnatInPodWithMember(eip.Spec.NatGwDp, newV4ip, newV4Cidr, memberID); err != nil {
 			klog.Errorf("failed to create snat %s, %v", key, err)
 			return err
 		}
@@ -1300,7 +1302,12 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			klog.V(3).Infof("snat %s: pod started before redo mark, rules intact, skip", key)
 			return nil
 		}
-		if err = c.createSnatInPod(cachedSnat.Status.NatGwDp, cachedSnat.Status.V4ip, cachedSnat.Status.InternalCIDR); err != nil {
+		var eip *kubeovnv1.IptablesEIP
+		if cachedSnat.Spec.EIP != "" {
+			eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
+		}
+		memberID := resolveSnatMemberID(eip, cachedSnat)
+		if err = c.createSnatInPodWithMember(cachedSnat.Status.NatGwDp, cachedSnat.Status.V4ip, cachedSnat.Status.InternalCIDR, memberID); err != nil {
 			klog.Errorf("failed to create new snat, %v", err)
 			return err
 		}
@@ -1943,6 +1950,8 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 	snat := oriSnat.DeepCopy()
 	var needUpdateLabel, needUpdateAnno bool
 	var op string
+	eipMember := getMemberIDFromMeta(eip.Labels, eip.Annotations)
+
 	if len(snat.Labels) == 0 {
 		op = "add"
 		snat.Labels = map[string]string{
@@ -1950,14 +1959,21 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 			util.EipV4IpLabel:           eip.Spec.V4ip,
 			util.EipUIDLabel:            string(eip.UID),
 		}
+		if eipMember != "" {
+			snat.Labels[util.NatGatewayMemberLabel] = eipMember
+		}
 		needUpdateLabel = true
 	} else if snat.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
 		snat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
-		snat.Labels[util.EipUIDLabel] != string(eip.UID) {
+		snat.Labels[util.EipUIDLabel] != string(eip.UID) ||
+		(eipMember != "" && snat.Labels[util.NatGatewayMemberLabel] != eipMember) {
 		op = "replace"
 		snat.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		snat.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
 		snat.Labels[util.EipUIDLabel] = string(eip.UID)
+		if eipMember != "" {
+			snat.Labels[util.NatGatewayMemberLabel] = eipMember
+		}
 		needUpdateLabel = true
 	}
 	if needUpdateLabel {
@@ -2068,7 +2084,7 @@ func (c *Controller) redoSnat(key, redo string, eipReady bool) error {
 }
 
 func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
 		klog.Error(err)
 		return err
@@ -2076,11 +2092,23 @@ func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalIP)
 	addRules = append(addRules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSubnetFipAdd, addRules); err != nil {
-		klog.Errorf("failed to create fip, err: %v", err)
-		return err
+
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwSubnetFipAdd
+	if stateless {
+		op = natGwStatelessFipAdd
 	}
-	return nil
+
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if err = c.execNatGwRules(gwPod, op, addRules); err != nil {
+			klog.Errorf("failed to create fip in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // finalDeleteFipInPod resolves (natGwDp, v4ip) from the FIP CR's Status,
@@ -2274,9 +2302,14 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 		klog.Errorf("snat %s has v4ip %s but v4Cidr is empty in both Status and Spec, skip pod cleanup", key, statusV4ip)
 		return nil
 	}
+	var eip *kubeovnv1.IptablesEIP
+	if cachedSnat.Spec.EIP != "" {
+		eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
+	}
+	memberID := resolveSnatMemberID(eip, cachedSnat)
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("snat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
-	} else if err := c.deleteSnatInPod(statusNatGwDp, statusV4ip, statusV4Cidr); err != nil {
+	} else if err := c.deleteSnatInPodWithMember(statusNatGwDp, statusV4ip, statusV4Cidr, memberID); err != nil {
 		klog.Errorf("failed to delete snat %s, %v", key, err)
 		firstErr = err
 	}
@@ -2301,7 +2334,7 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 			return firstErr
 		}
 		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || specV4Cidr != statusV4Cidr {
-			if err = c.deleteSnatInPod(specNatGwDp, specV4ip, specV4Cidr); err != nil {
+			if err = c.deleteSnatInPodWithMember(specNatGwDp, specV4ip, specV4Cidr, memberID); err != nil {
 				klog.Errorf("failed spec-based cleanup for snat %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2324,7 +2357,7 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	if deleted {
 		return nil
 	}
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			klog.V(4).Infof("nat gw pod %s not found, will retry fip pod cleanup", dp)
@@ -2334,28 +2367,52 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 		return err
 	}
 	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP)
-	if err = c.execNatGwRules(gwPod, natGwSubnetFipDel, []string{v4ip}); err != nil {
-		klog.Errorf("failed to delete fip, err: %v", err)
-		return err
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwSubnetFipDel
+	rules := []string{v4ip}
+	if stateless {
+		op = natGwStatelessFipDel
+		// In stateless mode, rule matches "eip,internalIp" or eip
+		rules = []string{fmt.Sprintf("%s,", v4ip)}
 	}
-	return nil
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
+			klog.Errorf("failed to delete fip in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
-		klog.Errorf("failed to get nat gw pod, %v", err)
+		klog.Errorf("failed to get nat gw pods, %v", err)
 		return err
 	}
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
 	addRules = append(addRules, rule)
 
-	if err = c.execNatGwRules(gwPod, natGwDnatAdd, addRules); err != nil {
-		klog.Errorf("failed to create dnat, err: %v", err)
-		return err
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwDnatAdd
+	if stateless {
+		op = natGwStatelessDnatAdd
 	}
-	return nil
+
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if err = c.execNatGwRules(gwPod, op, addRules); err != nil {
+			klog.Errorf("failed to create dnat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) error {
@@ -2370,7 +2427,7 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 	if deleted {
 		return nil
 	}
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			klog.V(4).Infof("nat gw pod %s not found, will retry dnat pod cleanup", dp)
@@ -2380,42 +2437,86 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 		return err
 	}
 
-	// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only
-	rule := fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)
-	if err = c.execNatGwRules(gwPod, natGwDnatDel, []string{rule}); err != nil {
-		klog.Errorf("failed to delete dnat, err: %v", err)
-		return err
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwDnatDel
+	var rules []string
+	if stateless {
+		op = natGwStatelessDnatDel
+		rules = []string{fmt.Sprintf("%s,%s,%s,,", v4ip, externalPort, protocol)}
+	} else {
+		// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only
+		rules = []string{fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)}
 	}
-	return nil
+
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
+			klog.Errorf("failed to delete dnat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	return c.createSnatInPodWithMember(dp, v4ip, internalCIDR, "")
+}
+
+func (c *Controller) createSnatInPodWithMember(dp, v4ip, internalCIDR, memberID string) error {
+	internalCIDR = normalizeSnatInternalCIDR(internalCIDR)
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
-		klog.Errorf("failed to get nat gw pod, %v", err)
+		klog.Errorf("failed to get nat gw pods, %v", err)
 		return err
 	}
-	var rules []string
-	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
-
-	version, err := c.getIptablesVersion(gwPod)
+	gwPods, err = c.filterNatGwPodsByMember(gwPods, memberID)
 	if err != nil {
-		version = "1.0.0"
-		klog.Warningf("failed to checking iptables version, assuming version at least %s: %v", version, err)
-	}
-	if util.CompareVersion(version, "1.6.2") >= 1 {
-		rule = fmt.Sprintf("%s,%s", rule, "--random-fully")
-	}
-
-	rules = append(rules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSnatAdd, rules); err != nil {
-		klog.Errorf("failed to exec nat gateway rule, err: %v", err)
+		klog.Errorf("failed to filter nat gw pods for member %s: %v", memberID, err)
 		return err
 	}
-	return nil
+
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwSnatAdd
+	if stateless {
+		op = natGwStatelessSnatAdd
+	}
+
+	var firstErr error
+	for _, gwPod := range gwPods {
+		var rules []string
+		rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
+
+		if !stateless {
+			version, err := c.getIptablesVersion(gwPod)
+			if err != nil {
+				version = "1.0.0"
+				klog.Warningf("failed to checking iptables version, assuming version at least %s: %v", version, err)
+			}
+			if util.CompareVersion(version, "1.6.2") >= 1 {
+				rule = fmt.Sprintf("%s,%s", rule, "--random-fully")
+			}
+		}
+
+		rules = append(rules, rule)
+		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
+			klog.Errorf("failed to exec nat gateway rule in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
+	return c.deleteSnatInPodWithMember(dp, v4ip, internalCIDR, "")
+}
+
+func (c *Controller) deleteSnatInPodWithMember(dp, v4ip, internalCIDR, memberID string) error {
+	internalCIDR = normalizeSnatInternalCIDR(internalCIDR)
+
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.
@@ -2427,7 +2528,7 @@ func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	if deleted {
 		return nil
 	}
-	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
+	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			klog.V(4).Infof("nat gw pod %s not found, will retry snat pod cleanup", dp)
@@ -2436,15 +2537,32 @@ func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 		}
 		return err
 	}
+	gwPods, err = c.filterNatGwPodsByMember(gwPods, memberID)
+	if err != nil {
+		klog.Errorf("failed to filter nat gw pods for member %s during delete: %v", memberID, err)
+		return err
+	}
+
+	stateless := c.isStatelessDpMode(dp)
+	op := natGwSnatDel
+	if stateless {
+		op = natGwStatelessSnatDel
+	}
+
 	// del nat
 	var delRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
 	delRules = append(delRules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSnatDel, delRules); err != nil {
-		klog.Errorf("failed to delete snat, err: %v", err)
-		return err
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if err = c.execNatGwRules(gwPod, op, delRules); err != nil {
+			klog.Errorf("failed to delete snat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (c *Controller) updateIptableLabels(name, op, natType string, labels map[string]string) error {
@@ -2635,4 +2753,90 @@ func (c *Controller) validateSnatRule(snat *kubeovnv1.IptablesSnatRule) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Controller) isStatelessDpMode(dp string) bool {
+	gw, err := c.vpcNatGatewayLister.Get(dp)
+	if err != nil {
+		return false
+	}
+	if gw.Annotations != nil {
+		if mode := gw.Annotations[util.NatGatewayDataplaneModeAnnotation]; mode == "stateless" || mode == "stateless-nft" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) filterNatGwPodsByMember(pods []*corev1.Pod, memberID string) ([]*corev1.Pod, error) {
+	if memberID == "" {
+		return pods, nil
+	}
+	var matched []*corev1.Pod
+	for _, p := range pods {
+		if p.Labels != nil {
+			if m := p.Labels[util.NatGatewayMemberLabel]; m == memberID {
+				matched = append(matched, p)
+				continue
+			}
+			if m := p.Labels[util.NatGatewayMemberLegacyLabel]; m == memberID {
+				matched = append(matched, p)
+				continue
+			}
+		}
+	}
+	if len(matched) > 0 {
+		return matched, nil
+	}
+	return nil, fmt.Errorf("nat gw member pod %q is not found or not ready", memberID)
+}
+
+// normalizeSnatInternalCIDR converts a bare IPv4 (e.g. "10.0.0.5") — a shape
+// accepted by validateSnatRule — to its canonical "<ip>/32" form so the NAT
+// gateway script can assume every SNAT rule carries an explicit prefix length.
+// This keeps downstream logic (longest-prefix ordering, idempotency checks)
+// free of bare-IP special cases.
+func normalizeSnatInternalCIDR(cidr string) string {
+	if cidr == "" || strings.Contains(cidr, "/") {
+		return cidr
+	}
+	return cidr + "/32"
+}
+
+// getMemberIDFromMeta extracts the gateway member identifier from labels and annotations,
+// honoring both standard and legacy label keys.
+func getMemberIDFromMeta(labels, annotations map[string]string) string {
+	if labels != nil {
+		if m := labels[util.NatGatewayMemberLabel]; m != "" {
+			return m
+		}
+		if m := labels[util.NatGatewayMemberLegacyLabel]; m != "" {
+			return m
+		}
+	}
+	if annotations != nil {
+		if m := annotations[util.NatGatewayMemberLabel]; m != "" {
+			return m
+		}
+		if m := annotations[util.NatGatewayMemberLegacyLabel]; m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// resolveSnatMemberID resolves the assigned NAT gateway member identifier from the associated
+// EIP or SNAT rule metadata. EIP ownership takes precedence, falling back to SNAT rule metadata.
+func resolveSnatMemberID(eip *kubeovnv1.IptablesEIP, snat *kubeovnv1.IptablesSnatRule) string {
+	if eip != nil {
+		if m := getMemberIDFromMeta(eip.Labels, eip.Annotations); m != "" {
+			return m
+		}
+	}
+	if snat != nil {
+		if m := getMemberIDFromMeta(snat.Labels, snat.Annotations); m != "" {
+			return m
+		}
+	}
+	return ""
 }
