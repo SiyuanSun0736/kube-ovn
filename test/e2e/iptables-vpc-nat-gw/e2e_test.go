@@ -3752,6 +3752,11 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 		_ = iptablesEIPClient.CreateSync(eipB)
 		eipB = waitForIptablesEIPReady(iptablesEIPClient, eipBName, 60*time.Second)
 
+		ginkgo.DeferCleanup(func() {
+			iptablesEIPClient.Delete(eipAName)
+			iptablesEIPClient.Delete(eipBName)
+		})
+
 		ginkgo.By("Creating NAT rules for both EIPs")
 		snatAName := "issue7100-snat-a-" + framework.RandomSuffix()
 		snatA := framework.MakeIptablesSnatRule(snatAName, eipAName, "10.0.10.10/32")
@@ -3794,6 +3799,12 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 			2,
 		)
 
+		ginkgo.By("Configuring internal subnet on NAT gateway to trigger policy route generation")
+		gw := vpcNatGwClient.Get(vpcNatGwName)
+		gw.Spec.InternalSubnets = []string{overlaySubnetName}
+		_, err := vpcNatGwClient.VpcNatGatewayInterface.Update(context.Background(), gw, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
 		ginkgo.By("Waiting for 2 HA NAT gateway pods to be running")
 		var gwPods []corev1.Pod
 		gomega.Eventually(func() int {
@@ -3819,22 +3830,29 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 			pod0IP = pod0.Status.PodIPs[0].IP
 		}
 
-		ginkgo.By("Setting dataplane-ready=false on pod0")
+		pod1 := gwPods[1].DeepCopy()
+		pod1IP := pod1.Annotations[util.IPAddressAnnotation]
+		if pod1IP == "" && len(pod1.Status.PodIPs) > 0 {
+			pod1IP = pod1.Status.PodIPs[0].IP
+		}
+
+		ginkgo.By("Setting dataplane-ready=false on pod0 while pod1 remains ready")
 		if pod0.Annotations == nil {
 			pod0.Annotations = make(map[string]string)
 		}
 		pod0.Annotations[util.NatGatewayDataplaneReadyAnnotation] = "false"
-		_, err := f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0, metav1.UpdateOptions{})
+		_, err = f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0, metav1.UpdateOptions{})
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Verifying pod0 is gated and NOT announced as ECMP route next hop")
+		ginkgo.By("Verifying pod0 is gated while pod1 is announced as ECMP route next hop")
 		gomega.Eventually(func() bool {
 			cmd := fmt.Sprintf("ovn-nbctl lr-policy-list %s", vpcName)
 			stdout, _, err := framework.NBExec(cmd)
 			if err != nil {
 				return false
 			}
-			return !strings.Contains(string(stdout), pod0IP)
+			output := string(stdout)
+			return !strings.Contains(output, pod0IP) && strings.Contains(output, pod1IP)
 		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 must not be in policy routes when dataplane-ready is false")
 
 		ginkgo.By("Setting dataplane-ready=true on pod0")
@@ -3843,15 +3861,16 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 		_, err = f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0Updated, metav1.UpdateOptions{})
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Verifying pod0 is announced as ECMP route next hop after readiness is confirmed")
+		ginkgo.By("Verifying both pod0 and pod1 are announced as ECMP route next hops after readiness is confirmed")
 		gomega.Eventually(func() bool {
 			cmd := fmt.Sprintf("ovn-nbctl lr-policy-list %s", vpcName)
 			stdout, _, err := framework.NBExec(cmd)
 			if err != nil {
 				return false
 			}
-			return strings.Contains(string(stdout), pod0IP)
-		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 must be announced as policy route nexthop when dataplane-ready is true")
+			output := string(stdout)
+			return strings.Contains(output, pod0IP) && strings.Contains(output, pod1IP)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "both pods must be announced as policy route nexthops when dataplane-ready is true")
 	})
 
 	framework.ConformanceIt("[container-qos-tc] NAT Gateway pod QoS tc rules dynamically applied and updated", func() {
