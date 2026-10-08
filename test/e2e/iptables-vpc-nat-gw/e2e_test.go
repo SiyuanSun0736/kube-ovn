@@ -3709,6 +3709,20 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod1 should have dnat1 rule")
 		framework.ExpectFalse(snatRuleExists(pod1.Name, eip0.Status.IP, snat0CIDR),
 			"pod1 must not have member0 SNAT rule")
+
+		ginkgo.By("Migrating SNAT rule from member-0 to member-1 and verifying member-0 unloads while member-1 loads")
+		snat0ToMigrate := iptablesSnatRuleClient.Get(snat0Name).DeepCopy()
+		snat0ToMigrate.Labels[util.NatGatewayMemberLabel] = member1
+		_, err = iptablesSnatRuleClient.IptablesSnatRuleInterface.Update(context.Background(), snat0ToMigrate, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
+		gomega.Eventually(func() bool {
+			return !snatRuleExists(pod0.Name, eip0.Status.IP, snat0CIDR)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 must unload snat0 rule after member label update")
+
+		gomega.Eventually(func() bool {
+			return snatRuleExists(pod1.Name, eip0.Status.IP, snat0CIDR)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod1 must load snat0 rule after member label update")
 	})
 
 	framework.ConformanceIt("[issue-7100-ha-lifecycle] HA VPC NAT Gateway with 2 replicas prevents ARP conflict and deletes EIPs without hanging", func() {
@@ -4079,6 +4093,21 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 			}
 			return strings.Contains(string(stdout), "REPLY_FROM_MEMBER_B")
 		}, 15*time.Second, 1*time.Second).Should(gomega.BeTrue(), "client must receive asymmetric reply from member-b")
+
+		ginkgo.By("PMTU and ICMP asymmetric handling: Member-B receives ICMP packet")
+		_, _, err = framework.KubectlExec(framework.KubeOvnNamespace, podB, "iptables -I INPUT 1 -p icmp -j ACCEPT")
+		framework.ExpectNoError(err)
+		podBObj := f.PodClient().GetPod(podB)
+		podBIP := podBObj.Status.PodIP
+		pingCmd := fmt.Sprintf("ping -c 2 -W 1 %s", podBIP)
+		_, _, _ = framework.KubectlExec(f.Namespace.Name, clientPodName, "sh", "-c", pingCmd)
+		gomega.Eventually(func() bool {
+			outBICMP, _, err := framework.KubectlExec(framework.KubeOvnNamespace, podB, "iptables -L INPUT -v -x")
+			if err != nil {
+				return false
+			}
+			return strings.Contains(string(outBICMP), "icmp")
+		}, 10*time.Second, 1*time.Second).Should(gomega.BeTrue(), "member-b should capture asymmetric ICMP packet")
 	})
 })
 
