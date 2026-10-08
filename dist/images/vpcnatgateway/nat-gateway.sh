@@ -887,6 +887,18 @@ function del_nft_dnat_map() {
 
 STATELESS_NFT_TABLE=${STATELESS_NFT_TABLE:-"kube_ovn_stateless_nat"}
 
+# Check if there are other NAT rewrite rules referencing an IP/port beyond the one being deleted.
+# Returns 0 (true) if other references exist, 1 (false) if none.
+function _has_other_nat_refs() {
+    local table=$1 chain=$2 match_pattern=$3 exclude_pattern=$4
+    local count
+    count=$(nft list chain ip "$table" "$chain" 2>/dev/null \
+        | grep -F "$match_pattern" \
+        | grep -Fv "$exclude_pattern" \
+        | grep -c "ip daddr set\|ip saddr set\|dport set\|sport set" || true)
+    [ "${count:-0}" -gt 0 ]
+}
+
 function stateless_init() {
     local table=${1:-$STATELESS_NFT_TABLE}
     echo "Initializing stateless nftables table: $table"
@@ -901,6 +913,7 @@ function stateless_apply() {
     echo "Applying stateless nftables script for table: $table"
     local tmp_batch
     tmp_batch=$(mktemp)
+    trap 'rm -f "$tmp_batch"' EXIT INT TERM HUP
     cat <<EOF > "$tmp_batch"
 table ip $table
 delete table ip $table
@@ -955,11 +968,37 @@ function stateless_fip_del() {
         if [ -n "$internalIp" ]; then
             pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip ip daddr set $internalIp" | grep -oE "handle [0-9]+" | awk '{print $2}')
             post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -F "ip saddr $internalIp ip saddr set $eip" | grep -oE "handle [0-9]+" | awk '{print $2}')
-            notrack_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "(ip daddr $eip notrack|ip saddr $internalIp notrack)" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            # Problem 1 fix: only delete notrack rules when no other NAT rewrite rules reference the IP
+            notrack_handles=""
+            if ! _has_other_nat_refs "$table" prerouting "ip saddr $internalIp" "ip saddr $internalIp ip saddr set $eip"; then
+                local saddr_notrack
+                saddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip saddr $internalIp notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')
+                notrack_handles="$notrack_handles $saddr_notrack"
+            fi
+            if ! _has_other_nat_refs "$table" prerouting "ip daddr $eip" "ip daddr $eip ip daddr set $internalIp"; then
+                local daddr_notrack
+                daddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')
+                notrack_handles="$notrack_handles $daddr_notrack"
+            fi
         else
             pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip " | grep -oE "handle [0-9]+" | awk '{print $2}')
             post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -F "ip saddr set $eip" | grep -oE "handle [0-9]+" | awk '{print $2}')
             notrack_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            # Problem 3 fix: also clean up saddr notrack for all internalIps mapped to this eip
+            local internalIps
+            internalIps=$(nft list chain ip "$table" prerouting 2>/dev/null \
+                | grep -F "ip daddr $eip ip daddr set " \
+                | grep -oE 'ip daddr set [0-9.]+' \
+                | awk '{print $4}' | sort -u)
+            for intIp in $internalIps; do
+                local saddr_notrack
+                saddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                    | grep -F "ip saddr $intIp notrack" \
+                    | grep -oE "handle [0-9]+" | awk '{print $2}')
+                for h in $saddr_notrack; do
+                    nft "delete rule ip $table prerouting handle $h" 2>/dev/null || true
+                done
+            done
         fi
         for h in $pre_handles $notrack_handles; do
             nft "delete rule ip $table prerouting handle $h" 2>/dev/null || true
@@ -1007,7 +1046,11 @@ function stateless_dnat_del() {
         pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip $proto dport $extPort[[:space:]]" | grep -oE "handle [0-9]+" | awk '{print $2}')
         notrack_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip $proto dport $extPort notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')
         if [ -n "$intIp" ] && [ -n "$intPort" ]; then
-            notrack_handles="$notrack_handles $(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip saddr $intIp $proto sport $intPort notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')"
+            local extra_notrack
+            extra_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                | grep -E "ip saddr $intIp $proto sport $intPort notrack" \
+                | grep -oE "handle [0-9]+" | awk '{print $2}')
+            notrack_handles="$notrack_handles $extra_notrack"
         fi
         for h in $pre_handles $notrack_handles; do
             nft "delete rule ip $table prerouting handle $h" 2>/dev/null || true
@@ -1035,6 +1078,10 @@ function stateless_snat_add() {
         if [ -n "$EXTERNAL_INTERFACE" ]; then
             out_match="oifname \"$EXTERNAL_INTERFACE\" "
         fi
+        # Problem 5 fix: add notrack rules for the CIDR so conntrack is bypassed for SNAT traffic
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip saddr $internalCIDR notrack"; then
+            nft "insert rule ip $table prerouting ip saddr $internalCIDR notrack" || return 1
+        fi
         # Idempotency check: append after more specific rules
         if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $internalCIDR ${out_match}ip saddr set $eip"; then
             nft "add rule ip $table postrouting ip saddr $internalCIDR ${out_match}ip saddr set $eip" || return 1
@@ -1053,6 +1100,16 @@ function stateless_snat_del() {
         for h in $post_handles; do
             nft "delete rule ip $table postrouting handle $h" 2>/dev/null || true
         done
+        # Problem 5 fix: clean up CIDR-level notrack if no other SNAT rewrite rules reference this CIDR
+        if ! _has_other_nat_refs "$table" postrouting "ip saddr $internalCIDR" "ip saddr $internalCIDR ip saddr set $eip"; then
+            local cidr_notrack
+            cidr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                | grep -F "ip saddr $internalCIDR notrack" \
+                | grep -oE "handle [0-9]+" | awk '{print $2}')
+            for h in $cidr_notrack; do
+                nft "delete rule ip $table prerouting handle $h" 2>/dev/null || true
+            done
+        fi
     done
 }
 

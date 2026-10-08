@@ -2447,13 +2447,15 @@ func getNatGwNextHops(gw *kubeovnv1.VpcNatGateway, pods []*corev1.Pod) (map[stri
 			continue
 		}
 
-		// Ready-gating: if dataplane readiness annotation is explicitly specified on the pod,
-		// only announce this pod as an OVN ECMP next hop when its dataplane is ready.
+		// Ready-gating: if the dataplane readiness annotation is present on the pod,
+		// the value must be explicitly "true" to be announced as an OVN ECMP next hop.
+		// Absent annotation = no gating (backwards compatible with pods that don't set it).
+		// Any value other than "true" (e.g. "false", "pending", "") is treated as not ready.
 		if pod.Annotations != nil {
-			if dpReady := pod.Annotations[util.NatGatewayDataplaneReadyAnnotation]; dpReady == "false" {
+			if dpReady, exists := pod.Annotations[util.NatGatewayDataplaneReadyAnnotation]; exists && dpReady != "true" {
 				continue
 			}
-			if dpLegacyReady := pod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]; dpLegacyReady == "false" {
+			if dpLegacyReady, exists := pod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]; exists && dpLegacyReady != "true" {
 				continue
 			}
 		}

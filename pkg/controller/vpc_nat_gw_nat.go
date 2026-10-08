@@ -2210,10 +2210,6 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 	return firstErr
 }
 
-func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
-	return c.createSnatInPodWithMember(dp, v4ip, internalCIDR, "")
-}
-
 func (c *Controller) createSnatInPodWithMember(dp, v4ip, internalCIDR, memberID string) error {
 	internalCIDR = normalizeSnatInternalCIDR(internalCIDR)
 	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
