@@ -3763,6 +3763,323 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 		}, 30*time.Second, 1*time.Second).Should(gomega.BeTrue(),
 			"both EIPs must be deleted within timeout without hanging finalizer")
 	})
+
+	framework.ConformanceIt("[dataplane-ready-gating] HA NAT Gateway dataplane-ready annotation gates ECMP next hops", func() {
+		overlaySubnetV4Cidr := "10.0.11.0/24"
+		overlaySubnetV4Gw := "10.0.11.1"
+		lanIP := "10.0.11.254"
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, nil,
+			"", // gwNamespace: use default
+			2,
+		)
+
+		ginkgo.By("Waiting for 2 HA NAT gateway pods to be running")
+		var gwPods []corev1.Pod
+		gomega.Eventually(func() int {
+			labels := util.GenNatGwLabels(vpcNatGwName)
+			selector := metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: labels})
+			pods, err := f.ClientSet.CoreV1().Pods(framework.KubeOvnNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+			if err != nil {
+				return 0
+			}
+			var readyPods []corev1.Pod
+			for _, p := range pods.Items {
+				if p.Status.Phase == corev1.PodRunning {
+					readyPods = append(readyPods, p)
+				}
+			}
+			gwPods = readyPods
+			return len(gwPods)
+		}, 60*time.Second, 2*time.Second).Should(gomega.Equal(2), "should have exactly 2 running NAT gateway pods")
+
+		pod0 := gwPods[0].DeepCopy()
+		pod0IP := pod0.Annotations[util.IPAddressAnnotation]
+		if pod0IP == "" && len(pod0.Status.PodIPs) > 0 {
+			pod0IP = pod0.Status.PodIPs[0].IP
+		}
+
+		ginkgo.By("Setting dataplane-ready=false on pod0")
+		if pod0.Annotations == nil {
+			pod0.Annotations = make(map[string]string)
+		}
+		pod0.Annotations[util.NatGatewayDataplaneReadyAnnotation] = "false"
+		_, err := f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Verifying pod0 is gated and NOT announced as ECMP route next hop")
+		gomega.Eventually(func() bool {
+			cmd := fmt.Sprintf("ovn-nbctl lr-policy-list %s", vpcName)
+			stdout, _, err := framework.NBExec(cmd)
+			if err != nil {
+				return false
+			}
+			return !strings.Contains(string(stdout), pod0IP)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 must not be in policy routes when dataplane-ready is false")
+
+		ginkgo.By("Setting dataplane-ready=true on pod0")
+		pod0Updated := f.PodClient().GetPod(pod0.Name).DeepCopy()
+		pod0Updated.Annotations[util.NatGatewayDataplaneReadyAnnotation] = "true"
+		_, err = f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0Updated, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Verifying pod0 is announced as ECMP route next hop after readiness is confirmed")
+		gomega.Eventually(func() bool {
+			cmd := fmt.Sprintf("ovn-nbctl lr-policy-list %s", vpcName)
+			stdout, _, err := framework.NBExec(cmd)
+			if err != nil {
+				return false
+			}
+			return strings.Contains(string(stdout), pod0IP)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 must be announced as policy route nexthop when dataplane-ready is true")
+	})
+
+	framework.ConformanceIt("[container-qos-tc] NAT Gateway pod QoS tc rules dynamically applied and updated", func() {
+		overlaySubnetV4Cidr := "10.0.12.0/24"
+		overlaySubnetV4Gw := "10.0.12.1"
+		lanIP := "10.0.12.254"
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, nil,
+			"", // gwNamespace: use default
+			1,
+		)
+		vpcNatGwPodName := getNatGwPodName(f, vpcNatGwName, "")
+
+		ginkgo.By("Applying 50M egress QoS rule via nat-gateway.sh qos-add")
+		cmd50 := []string{"/kube-ovn/nat-gateway.sh qos-add egress,eth0,10,matchall,,,,50,100"}
+		_, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, cmd50...)
+		framework.ExpectNoError(err, "failed to apply initial 50M QoS rule")
+
+		ginkgo.By("Verifying tc qdisc htb queue exists in NAT gateway pod")
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, "tc qdisc show dev eth0")
+			if err != nil {
+				return false
+			}
+			return strings.Contains(string(stdout), "htb 1:")
+		}, 15*time.Second, 1*time.Second).Should(gomega.BeTrue(), "tc qdisc should contain htb 1:")
+
+		ginkgo.By("Updating QoS rule to 100M dynamically")
+		cmd100 := []string{"tc qdisc del dev eth0 root 2>/dev/null || true; /kube-ovn/nat-gateway.sh qos-add egress,eth0,10,matchall,,,,100,200"}
+		_, _, err = framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, cmd100...)
+		framework.ExpectNoError(err, "failed to update QoS rule to 100M")
+
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, "tc qdisc show dev eth0")
+			if err != nil {
+				return false
+			}
+			return strings.Contains(string(stdout), "htb 1:")
+		}, 15*time.Second, 1*time.Second).Should(gomega.BeTrue(), "tc qdisc should still contain htb 1: after update")
+
+		ginkgo.By("Cleaning up QoS rule via nat-gateway.sh qos-del")
+		cmdDel := []string{"/kube-ovn/nat-gateway.sh qos-del egress,eth0,10"}
+		_, _, err = framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, cmdDel...)
+		framework.ExpectNoError(err, "failed to delete QoS rule")
+	})
+
+	framework.ConformanceIt("[stateless-fip-dnat] Stateless NAT Gateway programs bidirectional notrack and rewrite rules for FIP and DNAT", func() {
+		overlaySubnetV4Cidr := "10.0.13.0/24"
+		overlaySubnetV4Gw := "10.0.13.1"
+		lanIP := "10.0.13.254"
+		annotations := map[string]string{
+			util.NatGatewayDataplaneModeAnnotation: "stateless",
+		}
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, annotations,
+			"", // gwNamespace: use default
+			1,
+		)
+		vpcNatGwPodName := getNatGwPodName(f, vpcNatGwName, "")
+
+		ginkgo.By("Creating FIP with stateless dataplane")
+		fipEipName := "stateless-fip-eip-" + framework.RandomSuffix()
+		fipEip := framework.MakeIptablesEIP(fipEipName, "", "", "", vpcNatGwName, "", "")
+		_ = iptablesEIPClient.CreateSync(fipEip)
+		ginkgo.DeferCleanup(func() { iptablesEIPClient.DeleteSync(fipEipName) })
+		fipEip = waitForIptablesEIPReady(iptablesEIPClient, fipEipName, 60*time.Second)
+
+		fipVipName := "stateless-fip-vip-" + framework.RandomSuffix()
+		fipVip := framework.MakeVip(f.Namespace.Name, fipVipName, overlaySubnetName, "", "", "", nil)
+		_ = vipClient.CreateSync(fipVip)
+		ginkgo.DeferCleanup(func() { vipClient.DeleteSync(fipVipName) })
+
+		fipName := "stateless-fip-" + framework.RandomSuffix()
+		fip := framework.MakeIptablesFIPRule(fipName, fipEipName, fipVip.Status.V4ip)
+		_ = iptablesFIPClient.CreateSync(fip)
+		ginkgo.DeferCleanup(func() { iptablesFIPClient.DeleteSync(fipName) })
+
+		ginkgo.By("Verifying stateless FIP rules exist with bidirectional notrack and rewrite")
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, "nft list table ip kube_ovn_stateless_nat 2>/dev/null || true")
+			if err != nil {
+				return false
+			}
+			out := string(stdout)
+			return strings.Contains(out, fmt.Sprintf("ip daddr %s notrack", fipEip.Status.IP)) &&
+				strings.Contains(out, fmt.Sprintf("ip saddr %s notrack", fipVip.Status.V4ip)) &&
+				strings.Contains(out, fmt.Sprintf("ip daddr set %s", fipVip.Status.V4ip)) &&
+				strings.Contains(out, fmt.Sprintf("ip saddr set %s", fipEip.Status.IP))
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "stateless FIP bidirectional notrack and rewrite rules should exist")
+
+		ginkgo.By("Creating DNAT rule with stateless dataplane")
+		dnatEipName := "stateless-dnat-eip-" + framework.RandomSuffix()
+		dnatEip := framework.MakeIptablesEIP(dnatEipName, "", "", "", vpcNatGwName, "", "")
+		_ = iptablesEIPClient.CreateSync(dnatEip)
+		ginkgo.DeferCleanup(func() { iptablesEIPClient.DeleteSync(dnatEipName) })
+		dnatEip = waitForIptablesEIPReady(iptablesEIPClient, dnatEipName, 60*time.Second)
+
+		dnatVipName := "stateless-dnat-vip-" + framework.RandomSuffix()
+		dnatVip := framework.MakeVip(f.Namespace.Name, dnatVipName, overlaySubnetName, "", "", "", nil)
+		_ = vipClient.CreateSync(dnatVip)
+		ginkgo.DeferCleanup(func() { vipClient.DeleteSync(dnatVipName) })
+
+		dnatName := "stateless-dnat-" + framework.RandomSuffix()
+		dnat := framework.MakeIptablesDnatRule(dnatName, dnatEipName, "8080", "tcp", dnatVip.Status.V4ip, "80")
+		_ = iptablesDnatRuleClient.CreateSync(dnat)
+		ginkgo.DeferCleanup(func() { iptablesDnatRuleClient.DeleteSync(dnatName) })
+
+		ginkgo.By("Verifying stateless DNAT rules exist with notrack and port rewrite")
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, "nft list table ip kube_ovn_stateless_nat 2>/dev/null || true")
+			if err != nil {
+				return false
+			}
+			out := string(stdout)
+			return strings.Contains(out, fmt.Sprintf("ip daddr %s tcp dport 8080 notrack", dnatEip.Status.IP)) &&
+				strings.Contains(out, fmt.Sprintf("ip saddr %s tcp sport 80 notrack", dnatVip.Status.V4ip))
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "stateless DNAT notrack rules should exist")
+
+		ginkgo.By("Deleting stateless FIP and DNAT rules and verifying cleanup")
+		iptablesFIPClient.DeleteSync(fipName)
+		iptablesDnatRuleClient.DeleteSync(dnatName)
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, vpcNatGwPodName, "nft list table ip kube_ovn_stateless_nat 2>/dev/null || true")
+			if err != nil {
+				return false
+			}
+			out := string(stdout)
+			return !strings.Contains(out, fmt.Sprintf("ip daddr %s notrack", fipEip.Status.IP)) &&
+				!strings.Contains(out, fmt.Sprintf("ip daddr %s tcp dport 8080 notrack", dnatEip.Status.IP))
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "stateless FIP and DNAT rules should be cleaned up")
+	})
+
+	framework.ConformanceIt("[stateless-asymmetric-failover] Stateless HA NAT Gateway handles asymmetric flow and node failover", func() {
+		overlaySubnetV4Cidr := "10.0.14.0/24"
+		overlaySubnetV4Gw := "10.0.14.1"
+		lanIP := "10.0.14.254"
+		annotations := map[string]string{
+			util.NatGatewayDataplaneModeAnnotation: "stateless",
+		}
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, annotations,
+			"", // gwNamespace: use default
+			2,
+		)
+
+		ginkgo.By("Waiting for 2 HA NAT gateway pods to be running")
+		var gwPods []corev1.Pod
+		gomega.Eventually(func() int {
+			labels := util.GenNatGwLabels(vpcNatGwName)
+			selector := metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: labels})
+			pods, err := f.ClientSet.CoreV1().Pods(framework.KubeOvnNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+			if err != nil {
+				return 0
+			}
+			var readyPods []corev1.Pod
+			for _, p := range pods.Items {
+				if p.Status.Phase == corev1.PodRunning {
+					readyPods = append(readyPods, p)
+				}
+			}
+			gwPods = readyPods
+			return len(gwPods)
+		}, 60*time.Second, 2*time.Second).Should(gomega.Equal(2), "should have exactly 2 running NAT gateway pods")
+
+		podA := gwPods[0].Name
+		podB := gwPods[1].Name
+		podAIP := gwPods[0].Annotations[util.IPAddressAnnotation]
+		if podAIP == "" && len(gwPods[0].Status.PodIPs) > 0 {
+			podAIP = gwPods[0].Status.PodIPs[0].IP
+		}
+
+		ginkgo.By("Creating client pod in overlay subnet")
+		clientPodName := "client-" + framework.RandomSuffix()
+		clientAnnotations := map[string]string{
+			util.LogicalSwitchAnnotation: overlaySubnetName,
+		}
+		clientPod := framework.MakePod(f.Namespace.Name, clientPodName, nil, clientAnnotations, framework.AgnhostImage, nil, []string{"pause"})
+		_ = podClient.CreateSync(clientPod)
+		ginkgo.DeferCleanup(func() { podClient.DeleteSync(clientPodName) })
+		clientPodObj := podClient.GetPod(clientPodName)
+		clientIP := clientPodObj.Status.PodIP
+
+		ginkgo.By("Configuring UDP audit rule on Member-A and notrack on Member-B")
+		_, _, err := framework.KubectlExec(framework.KubeOvnNamespace, podA, "iptables -I INPUT 1 -p udp --dport 5000 -j ACCEPT")
+		framework.ExpectNoError(err)
+
+		nftSetupCmd := []string{
+			"sh", "-c",
+			"nft add table ip test_stateless_b 2>/dev/null || true; " +
+				"nft 'add chain ip test_stateless_b prerouting { type filter hook prerouting priority raw; policy accept; }' 2>/dev/null || true; " +
+				"nft add rule ip test_stateless_b prerouting notrack 2>/dev/null || true; " +
+				"iptables -I INPUT 1 -p udp --dport 6000 -j ACCEPT",
+		}
+		_, _, err = framework.KubectlExec(framework.KubeOvnNamespace, podB, nftSetupCmd...)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Starting background UDP listener on client pod")
+		_, _, err = framework.KubectlExec(f.Namespace.Name, clientPodName, "sh", "-c", "nohup nc -u -l -p 6000 > /tmp/reply.log 2>&1 &")
+		framework.ExpectNoError(err)
+		time.Sleep(500 * time.Millisecond)
+
+		ginkgo.By("Client sending UDP packet to Member-A")
+		sendCmd := fmt.Sprintf("echo 'REQ_FROM_CLIENT' | nc -u -w 1 %s 5000", podAIP)
+		_, _, _ = framework.KubectlExec(f.Namespace.Name, clientPodName, "sh", "-c", sendCmd)
+
+		ginkgo.By("Verifying Member-A received the packet")
+		outA, _, err := framework.KubectlExec(framework.KubeOvnNamespace, podA, "iptables -L INPUT -v -n -x")
+		framework.ExpectNoError(err)
+		framework.ExpectContainSubstring(string(outA), "dpt:5000")
+
+		ginkgo.By("Member-B sending stateless reply directly to Client without initial conntrack state")
+		replyCmd := fmt.Sprintf("echo 'REPLY_FROM_MEMBER_B' | nc -u -w 1 %s 6000", clientIP)
+		_, _, err = framework.KubectlExec(framework.KubeOvnNamespace, podB, "sh", "-c", replyCmd)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Verifying Client received asymmetric reply from Member-B")
+		gomega.Eventually(func() bool {
+			stdout, _, err := framework.KubectlExec(f.Namespace.Name, clientPodName, "cat /tmp/reply.log 2>/dev/null || true")
+			if err != nil {
+				return false
+			}
+			return strings.Contains(string(stdout), "REPLY_FROM_MEMBER_B")
+		}, 15*time.Second, 1*time.Second).Should(gomega.BeTrue(), "client must receive asymmetric reply from member-b")
+	})
 })
 
 func init() {
