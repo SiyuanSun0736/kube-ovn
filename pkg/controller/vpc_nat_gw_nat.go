@@ -925,22 +925,7 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		klog.Errorf("failed to patch label for snat %s before creating rule, %v", key, err)
 		return err
 	}
-	memberID := ""
-	if eip.Labels != nil {
-		memberID = eip.Labels[util.NatGatewayMemberLabel]
-		if memberID == "" {
-			memberID = eip.Labels[util.NatGatewayMemberLegacyLabel]
-		}
-	}
-	if memberID == "" && eip.Annotations != nil {
-		memberID = eip.Annotations[util.NatGatewayMemberLabel]
-		if memberID == "" {
-			memberID = eip.Annotations[util.NatGatewayMemberLegacyLabel]
-		}
-	}
-	if memberID == "" && snat.Labels != nil {
-		memberID = snat.Labels[util.NatGatewayMemberLabel]
-	}
+	memberID := resolveSnatMemberID(eip, snat)
 	if err = c.createSnatInPodWithMember(eip.Spec.NatGwDp, eip.Status.IP, v4Cidr, memberID); err != nil {
 		klog.Errorf("failed to create snat, %v", err)
 		return err
@@ -1087,22 +1072,7 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			klog.Errorf("failed to patch label for snat %s before creating rule, %v", key, err)
 			return err
 		}
-		memberID := ""
-		if eip.Labels != nil {
-			memberID = eip.Labels[util.NatGatewayMemberLabel]
-			if memberID == "" {
-				memberID = eip.Labels[util.NatGatewayMemberLegacyLabel]
-			}
-		}
-		if memberID == "" && eip.Annotations != nil {
-			memberID = eip.Annotations[util.NatGatewayMemberLabel]
-			if memberID == "" {
-				memberID = eip.Annotations[util.NatGatewayMemberLegacyLabel]
-			}
-		}
-		if memberID == "" && cachedSnat.Labels != nil {
-			memberID = cachedSnat.Labels[util.NatGatewayMemberLabel]
-		}
+		memberID := resolveSnatMemberID(eip, cachedSnat)
 		if err = c.createSnatInPodWithMember(eip.Spec.NatGwDp, newV4ip, newV4Cidr, memberID); err != nil {
 			klog.Errorf("failed to create snat %s, %v", key, err)
 			return err
@@ -1134,29 +1104,11 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		cachedSnat.Status.Redo != "" &&
 		cachedSnat.Status.V4ip != "" &&
 		cachedSnat.DeletionTimestamp.IsZero() {
-		memberID := ""
-		if cachedSnat.Labels != nil {
-			memberID = cachedSnat.Labels[util.NatGatewayMemberLabel]
-			if memberID == "" {
-				memberID = cachedSnat.Labels[util.NatGatewayMemberLegacyLabel]
-			}
+		var eip *kubeovnv1.IptablesEIP
+		if cachedSnat.Spec.EIP != "" {
+			eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
 		}
-		if memberID == "" && cachedSnat.Spec.EIP != "" {
-			if eip, err := c.iptablesEipsLister.Get(cachedSnat.Spec.EIP); err == nil {
-				if eip.Labels != nil {
-					memberID = eip.Labels[util.NatGatewayMemberLabel]
-					if memberID == "" {
-						memberID = eip.Labels[util.NatGatewayMemberLegacyLabel]
-					}
-				}
-				if memberID == "" && eip.Annotations != nil {
-					memberID = eip.Annotations[util.NatGatewayMemberLabel]
-					if memberID == "" {
-						memberID = eip.Annotations[util.NatGatewayMemberLegacyLabel]
-					}
-				}
-			}
-		}
+		memberID := resolveSnatMemberID(eip, cachedSnat)
 		if err = c.createSnatInPodWithMember(cachedSnat.Status.NatGwDp, cachedSnat.Status.V4ip, cachedSnat.Status.InternalCIDR, memberID); err != nil {
 			klog.Errorf("failed to create new snat, %v", err)
 			return err
@@ -1698,19 +1650,7 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 	snat := oriSnat.DeepCopy()
 	var needUpdateLabel, needUpdateAnno bool
 	var op string
-	eipMember := ""
-	if eip.Labels != nil {
-		eipMember = eip.Labels[util.NatGatewayMemberLabel]
-		if eipMember == "" {
-			eipMember = eip.Labels[util.NatGatewayMemberLegacyLabel]
-		}
-	}
-	if eipMember == "" && eip.Annotations != nil {
-		eipMember = eip.Annotations[util.NatGatewayMemberLabel]
-		if eipMember == "" {
-			eipMember = eip.Annotations[util.NatGatewayMemberLegacyLabel]
-		}
-	}
+	eipMember := getMemberIDFromMeta(eip.Labels, eip.Annotations)
 
 	if len(snat.Labels) == 0 {
 		op = "add"
@@ -2105,29 +2045,11 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 		klog.Errorf("snat %s has v4ip %s but v4Cidr is empty in both Status and Spec, skip pod cleanup", key, statusV4ip)
 		return nil
 	}
-	memberID := ""
-	if cachedSnat.Labels != nil {
-		memberID = cachedSnat.Labels[util.NatGatewayMemberLabel]
-		if memberID == "" {
-			memberID = cachedSnat.Labels[util.NatGatewayMemberLegacyLabel]
-		}
+	var eip *kubeovnv1.IptablesEIP
+	if cachedSnat.Spec.EIP != "" {
+		eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
 	}
-	if memberID == "" && cachedSnat.Spec.EIP != "" {
-		if eip, err := c.iptablesEipsLister.Get(cachedSnat.Spec.EIP); err == nil {
-			if eip.Labels != nil {
-				memberID = eip.Labels[util.NatGatewayMemberLabel]
-				if memberID == "" {
-					memberID = eip.Labels[util.NatGatewayMemberLegacyLabel]
-				}
-			}
-			if memberID == "" && eip.Annotations != nil {
-				memberID = eip.Annotations[util.NatGatewayMemberLabel]
-				if memberID == "" {
-					memberID = eip.Annotations[util.NatGatewayMemberLegacyLabel]
-				}
-			}
-		}
-	}
+	memberID := resolveSnatMemberID(eip, cachedSnat)
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("snat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if err := c.deleteSnatInPodWithMember(statusNatGwDp, statusV4ip, statusV4Cidr, memberID); err != nil {
@@ -2573,4 +2495,42 @@ func normalizeSnatInternalCIDR(cidr string) string {
 		return cidr
 	}
 	return cidr + "/32"
+}
+
+// getMemberIDFromMeta extracts the gateway member identifier from labels and annotations,
+// honoring both standard and legacy label keys.
+func getMemberIDFromMeta(labels, annotations map[string]string) string {
+	if labels != nil {
+		if m := labels[util.NatGatewayMemberLabel]; m != "" {
+			return m
+		}
+		if m := labels[util.NatGatewayMemberLegacyLabel]; m != "" {
+			return m
+		}
+	}
+	if annotations != nil {
+		if m := annotations[util.NatGatewayMemberLabel]; m != "" {
+			return m
+		}
+		if m := annotations[util.NatGatewayMemberLegacyLabel]; m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// resolveSnatMemberID resolves the assigned NAT gateway member identifier from the associated
+// EIP or SNAT rule metadata. EIP ownership takes precedence, falling back to SNAT rule metadata.
+func resolveSnatMemberID(eip *kubeovnv1.IptablesEIP, snat *kubeovnv1.IptablesSnatRule) string {
+	if eip != nil {
+		if m := getMemberIDFromMeta(eip.Labels, eip.Annotations); m != "" {
+			return m
+		}
+	}
+	if snat != nil {
+		if m := getMemberIDFromMeta(snat.Labels, snat.Annotations); m != "" {
+			return m
+		}
+	}
+	return ""
 }
