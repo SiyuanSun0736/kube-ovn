@@ -58,6 +58,11 @@ const (
 	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
 	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
 	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
+	NatGatewayMemberLabel                   = "ovn.kubernetes.io/nat-gateway-member"
+	NatGatewayMemberLegacyLabel             = "las.qiniu.io/nat-gateway-member"
+	NatGatewayDataplaneModeAnnotation       = "ovn.kubernetes.io/nat-dataplane-mode"
+	NatGatewayDataplaneReadyAnnotation      = "ovn.kubernetes.io/dataplane-ready"
+	NatGatewayLegacyDataplaneReadyAnno      = "las.qiniu.io/dataplane-ready"
 	EipV6IpLabel                            = "ovn.kubernetes.io/eip_v6_ip"
 
 	RouterLBRuleVipsAnnotation = "ovn.kubernetes.io/router_lb_vip"

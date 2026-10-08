@@ -59,6 +59,15 @@ const (
 	natGwSubnetRouteAdd   = "subnet-route-add"
 	natGwSubnetRouteDel   = "subnet-route-del"
 
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessApply   = "stateless-apply"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
+
 	getIptablesVersion = "get-iptables-version"
 )
 
@@ -2436,6 +2445,17 @@ func getNatGwNextHops(gw *kubeovnv1.VpcNatGateway, pods []*corev1.Pod) (map[stri
 		}
 		if !ready {
 			continue
+		}
+
+		// Ready-gating: if dataplane readiness annotation is explicitly specified on the pod,
+		// only announce this pod as an OVN ECMP next hop when its dataplane is ready.
+		if pod.Annotations != nil {
+			if dpReady := pod.Annotations[util.NatGatewayDataplaneReadyAnnotation]; dpReady == "false" {
+				continue
+			}
+			if dpLegacyReady := pod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]; dpLegacyReady == "false" {
+				continue
+			}
 		}
 
 		if len(pod.Status.PodIPs) == 0 || pod.Spec.NodeName == "" {

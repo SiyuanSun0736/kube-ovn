@@ -317,6 +317,15 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	// update would scan EndpointSlices for container/phase churn that cannot affect rules.
 	if !maps.Equal(oldPod.Annotations, newPod.Annotations) {
 		c.enqueueNftableLbServicesForPod(newPod)
+		if isGw, gwName := c.checkIsPodVpcNatGw(newPod); isGw {
+			oldReady := oldPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+			newReady := newPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+			oldLegacyReady := oldPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+			newLegacyReady := newPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+			if oldReady != newReady || oldLegacyReady != newLegacyReady {
+				c.enqueueAddOrUpdateVpcNatGwByName(gwName, "dataplane-ready annotation changed")
+			}
+		}
 	}
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
