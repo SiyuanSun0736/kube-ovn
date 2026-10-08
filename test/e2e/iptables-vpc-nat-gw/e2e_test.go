@@ -466,6 +466,28 @@ func snatRulePosition(natGwPodName, eip, internalCIDR string) int {
 	return 0
 }
 
+// nftStatelessTableExists checks if the kube_ovn_stateless_nat nftables table exists in the NAT gateway pod.
+func nftStatelessTableExists(natGwPodName string) bool {
+	cmd := []string{"nft list table ip kube_ovn_stateless_nat 2>/dev/null || true"}
+	stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, natGwPodName, cmd...)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(stdout), "table ip kube_ovn_stateless_nat")
+}
+
+// nftStatelessSnatRuleExists checks if the stateless SNAT rule exists in the NAT gateway pod.
+func nftStatelessSnatRuleExists(natGwPodName, eip, internalCIDR string) bool {
+	cmd := []string{"nft list table ip kube_ovn_stateless_nat 2>/dev/null || true"}
+	stdout, _, err := framework.KubectlExec(framework.KubeOvnNamespace, natGwPodName, cmd...)
+	if err != nil {
+		return false
+	}
+	out := string(stdout)
+	return strings.Contains(out, fmt.Sprintf("ip saddr %s notrack", internalCIDR)) &&
+		strings.Contains(out, fmt.Sprintf("ip saddr set %s", eip))
+}
+
 var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 	f := framework.NewDefaultFramework("iptables-vpc-nat-gw")
 
@@ -3536,6 +3558,210 @@ var _ = framework.OrderedDescribe("[group:iptables-vpc-nat-gw]", func() {
 			return pHost > 0 && p24 > 0 && p16 > 0 && pHost < p24 && p24 < p16
 		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(),
 			"bare-IP SNAT rule must be treated as /32 and sort before less-specific rules")
+	})
+
+	framework.ConformanceIt("[stateless-dataplane] VPC NAT Gateway with stateless dataplane mode and webhook immutability", func() {
+		overlaySubnetV4Cidr := "10.0.8.0/24"
+		overlaySubnetV4Gw := "10.0.8.1"
+		lanIP := "10.0.8.254"
+		annotations := map[string]string{
+			util.NatGatewayDataplaneModeAnnotation: "stateless",
+		}
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, annotations,
+			"", // gwNamespace: use default
+			1,
+		)
+		vpcNatGwPodName := getNatGwPodName(f, vpcNatGwName, "")
+
+		ginkgo.By("Verifying Webhook denies mutating dataplane-mode annotation on initialized VpcNatGateway")
+		gw := vpcNatGwClient.Get(vpcNatGwName)
+		gw.Annotations[util.NatGatewayDataplaneModeAnnotation] = "stateful"
+		_, err := vpcNatGwClient.VpcNatGatewayInterface.Update(context.Background(), gw, metav1.UpdateOptions{})
+		framework.ExpectError(err, "mutating dataplane mode annotation should be rejected by webhook")
+		framework.ExpectContainSubstring(err.Error(), "immutable once initialized")
+
+		ginkgo.By("Creating EIP and SNAT rule with stateless dataplane")
+		eipName := "stateless-eip-" + framework.RandomSuffix()
+		eip := framework.MakeIptablesEIP(eipName, "", "", "", vpcNatGwName, "", "")
+		_ = iptablesEIPClient.CreateSync(eip)
+		ginkgo.DeferCleanup(func() { iptablesEIPClient.DeleteSync(eipName) })
+		eip = waitForIptablesEIPReady(iptablesEIPClient, eipName, 60*time.Second)
+
+		snatName := "stateless-snat-" + framework.RandomSuffix()
+		snatCIDR := "10.0.8.0/24"
+		snat := framework.MakeIptablesSnatRule(snatName, eipName, snatCIDR)
+		_ = iptablesSnatRuleClient.CreateSync(snat)
+		ginkgo.DeferCleanup(func() { iptablesSnatRuleClient.DeleteSync(snatName) })
+
+		ginkgo.By("Verifying stateless nftables table and SNAT notrack rule exist in NAT gateway pod")
+		gomega.Eventually(func() bool {
+			return nftStatelessSnatRuleExists(vpcNatGwPodName, eip.Status.IP, snatCIDR)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(),
+			"stateless SNAT rule should be programmed in nftables table")
+
+		ginkgo.By("Deleting stateless SNAT rule and verifying cleanup")
+		iptablesSnatRuleClient.DeleteSync(snatName)
+		gomega.Eventually(func() bool {
+			return !nftStatelessSnatRuleExists(vpcNatGwPodName, eip.Status.IP, snatCIDR)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(),
+			"stateless SNAT rule should be cleaned up")
+	})
+
+	framework.ConformanceIt("[member-sharding] HA VPC NAT Gateway distributes NAT rules to specific members", func() {
+		overlaySubnetV4Cidr := "10.0.9.0/24"
+		overlaySubnetV4Gw := "10.0.9.1"
+		lanIP := "10.0.9.254"
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, nil,
+			"", // gwNamespace: use default
+			2,
+		)
+
+		ginkgo.By("Waiting for 2 HA NAT gateway pods to be ready")
+		var gwPods []corev1.Pod
+		gomega.Eventually(func() int {
+			labels := util.GenNatGwLabels(vpcNatGwName)
+			selector := metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: labels})
+			pods, err := f.ClientSet.CoreV1().Pods(framework.KubeOvnNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+			if err != nil {
+				return 0
+			}
+			var readyPods []corev1.Pod
+			for _, p := range pods.Items {
+				if p.Status.Phase == corev1.PodRunning {
+					readyPods = append(readyPods, p)
+				}
+			}
+			gwPods = readyPods
+			return len(gwPods)
+		}, 60*time.Second, 2*time.Second).Should(gomega.Equal(2), "should have exactly 2 running NAT gateway pods")
+
+		member0 := "member-0"
+		member1 := "member-1"
+		pod0 := gwPods[0].DeepCopy()
+		if pod0.Labels == nil {
+			pod0.Labels = make(map[string]string)
+		}
+		pod0.Labels[util.NatGatewayMemberLabel] = member0
+		_, err := f.ClientSet.CoreV1().Pods(pod0.Namespace).Update(context.Background(), pod0, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
+		pod1 := gwPods[1].DeepCopy()
+		if pod1.Labels == nil {
+			pod1.Labels = make(map[string]string)
+		}
+		pod1.Labels[util.NatGatewayMemberLabel] = member1
+		_, err = f.ClientSet.CoreV1().Pods(pod1.Namespace).Update(context.Background(), pod1, metav1.UpdateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating member-0 EIP and SNAT rule")
+		eip0Name := "member0-eip-" + framework.RandomSuffix()
+		eip0 := framework.MakeIptablesEIP(eip0Name, "", "", "", vpcNatGwName, "", "")
+		eip0.Labels = map[string]string{util.NatGatewayMemberLabel: member0}
+		_ = iptablesEIPClient.CreateSync(eip0)
+		ginkgo.DeferCleanup(func() { iptablesEIPClient.DeleteSync(eip0Name) })
+		eip0 = waitForIptablesEIPReady(iptablesEIPClient, eip0Name, 60*time.Second)
+
+		snat0Name := "member0-snat-" + framework.RandomSuffix()
+		snat0CIDR := "10.0.9.10/32"
+		snat0 := framework.MakeIptablesSnatRule(snat0Name, eip0Name, snat0CIDR)
+		snat0.Labels = map[string]string{util.NatGatewayMemberLabel: member0}
+		_ = iptablesSnatRuleClient.CreateSync(snat0)
+		ginkgo.DeferCleanup(func() { iptablesSnatRuleClient.DeleteSync(snat0Name) })
+
+		ginkgo.By("Creating member-1 EIP and DNAT rule")
+		eip1Name := "member1-eip-" + framework.RandomSuffix()
+		eip1 := framework.MakeIptablesEIP(eip1Name, "", "", "", vpcNatGwName, "", "")
+		eip1.Labels = map[string]string{util.NatGatewayMemberLabel: member1}
+		_ = iptablesEIPClient.CreateSync(eip1)
+		ginkgo.DeferCleanup(func() { iptablesEIPClient.DeleteSync(eip1Name) })
+		eip1 = waitForIptablesEIPReady(iptablesEIPClient, eip1Name, 60*time.Second)
+
+		dnat1Name := "member1-dnat-" + framework.RandomSuffix()
+		dnat1 := framework.MakeIptablesDnatRule(dnat1Name, eip1Name, "8080", "tcp", "10.0.9.20", "80")
+		dnat1.Labels = map[string]string{util.NatGatewayMemberLabel: member1}
+		_ = iptablesDnatRuleClient.CreateSync(dnat1)
+		ginkgo.DeferCleanup(func() { iptablesDnatRuleClient.DeleteSync(dnat1Name) })
+
+		ginkgo.By("Verifying member-0 pod receives SNAT rule but NOT DNAT rule")
+		gomega.Eventually(func() bool {
+			return snatRuleExists(pod0.Name, eip0.Status.IP, snat0CIDR)
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod0 should have snat0 rule")
+		framework.ExpectFalse(dnatRuleExists(pod0.Name, eip1.Status.IP, "8080", "tcp", "10.0.9.20", "80"),
+			"pod0 must not have member1 DNAT rule")
+
+		ginkgo.By("Verifying member-1 pod receives DNAT rule but NOT SNAT rule")
+		gomega.Eventually(func() bool {
+			return dnatRuleExists(pod1.Name, eip1.Status.IP, "8080", "tcp", "10.0.9.20", "80")
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(), "pod1 should have dnat1 rule")
+		framework.ExpectFalse(snatRuleExists(pod1.Name, eip0.Status.IP, snat0CIDR),
+			"pod1 must not have member0 SNAT rule")
+	})
+
+	framework.ConformanceIt("[issue-7100-ha-lifecycle] HA VPC NAT Gateway with 2 replicas prevents ARP conflict and deletes EIPs without hanging", func() {
+		overlaySubnetV4Cidr := "10.0.10.0/24"
+		overlaySubnetV4Gw := "10.0.10.1"
+		lanIP := "10.0.10.254"
+		setupVpcNatGwTestEnvironment(
+			f, dockerExtNet1Network, attachNetClient,
+			subnetClient, vpcClient, vpcNatGwClient,
+			vpcName, overlaySubnetName, vpcNatGwName, "",
+			overlaySubnetV4Cidr, overlaySubnetV4Gw, lanIP,
+			dockerExtNet1Name, networkAttachDefName, net1NicName,
+			externalSubnetProvider,
+			true, nil,
+			"", // gwNamespace: use default
+			2,
+		)
+
+		ginkgo.By("Creating 2 EIPs in 2-replica HA gateway")
+		eipAName := "issue7100-eip-a-" + framework.RandomSuffix()
+		eipA := framework.MakeIptablesEIP(eipAName, "", "", "", vpcNatGwName, "", "")
+		_ = iptablesEIPClient.CreateSync(eipA)
+		eipA = waitForIptablesEIPReady(iptablesEIPClient, eipAName, 60*time.Second)
+
+		eipBName := "issue7100-eip-b-" + framework.RandomSuffix()
+		eipB := framework.MakeIptablesEIP(eipBName, "", "", "", vpcNatGwName, "", "")
+		_ = iptablesEIPClient.CreateSync(eipB)
+		eipB = waitForIptablesEIPReady(iptablesEIPClient, eipBName, 60*time.Second)
+
+		ginkgo.By("Creating NAT rules for both EIPs")
+		snatAName := "issue7100-snat-a-" + framework.RandomSuffix()
+		snatA := framework.MakeIptablesSnatRule(snatAName, eipAName, "10.0.10.10/32")
+		_ = iptablesSnatRuleClient.CreateSync(snatA)
+
+		dnatBName := "issue7100-dnat-b-" + framework.RandomSuffix()
+		dnatB := framework.MakeIptablesDnatRule(dnatBName, eipBName, "9090", "tcp", "10.0.10.20", "90")
+		_ = iptablesDnatRuleClient.CreateSync(dnatB)
+
+		ginkgo.By("Cascading deletion: deleting NAT rules first")
+		iptablesSnatRuleClient.DeleteSync(snatAName)
+		iptablesDnatRuleClient.DeleteSync(dnatBName)
+
+		ginkgo.By("Concurrently deleting both EIPs in 2-replica HA gateway")
+		iptablesEIPClient.Delete(eipAName)
+		iptablesEIPClient.Delete(eipBName)
+
+		ginkgo.By("Verifying both EIPs are deleted cleanly without hanging finalizers (resolving Issue 7100)")
+		gomega.Eventually(func() bool {
+			_, errA := iptablesEIPClient.IptablesEIPInterface.Get(context.Background(), eipAName, metav1.GetOptions{})
+			_, errB := iptablesEIPClient.IptablesEIPInterface.Get(context.Background(), eipBName, metav1.GetOptions{})
+			return k8serrors.IsNotFound(errA) && k8serrors.IsNotFound(errB)
+		}, 30*time.Second, 1*time.Second).Should(gomega.BeTrue(),
+			"both EIPs must be deleted within timeout without hanging finalizer")
 	})
 })
 
