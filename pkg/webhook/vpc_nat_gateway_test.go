@@ -229,3 +229,36 @@ func TestIptablesDnatUpdateServiceRecord(t *testing.T) {
 		require.Contains(t, resp.Result.Message, "immutable")
 	})
 }
+
+func TestVpcNatGatewayDataplaneModeImmutable(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	require.NoError(t, ovnv1.AddToScheme(scheme))
+
+	hook := &ValidatingHook{
+		decoder: admission.NewDecoder(scheme),
+	}
+
+	oldGw := &ovnv1.VpcNatGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gw-test",
+			Annotations: map[string]string{
+				util.NatGatewayDataplaneModeAnnotation: "stateless",
+			},
+		},
+		Spec: ovnv1.VpcNatGatewaySpec{
+			Vpc:       "test-vpc",
+			Subnet:    "test-subnet",
+			LanIP:     "10.0.0.1",
+			Namespace: "test-ns",
+		},
+	}
+
+	newGw := oldGw.DeepCopy()
+	newGw.Annotations[util.NatGatewayDataplaneModeAnnotation] = "stateful"
+
+	req := updateRequest(t, oldGw, newGw)
+	resp := hook.VpcNatGwCreateOrUpdateHook(context.Background(), req)
+	require.False(t, resp.Allowed)
+	require.Contains(t, resp.Result.Message, "is immutable once initialized")
+}

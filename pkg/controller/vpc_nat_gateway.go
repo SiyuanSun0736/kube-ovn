@@ -60,6 +60,15 @@ const (
 	natGwVipHairpinAdd = "vip-hairpin-add"
 	natGwVipHairpinDel = "vip-hairpin-del"
 
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessApply   = "stateless-apply"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
+
 	getIptablesVersion = "get-iptables-version"
 )
 
