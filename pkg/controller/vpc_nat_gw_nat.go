@@ -2833,17 +2833,14 @@ func getMemberIDFromMeta(labels, annotations map[string]string) string {
 }
 
 // resolveSnatMemberID resolves the assigned NAT gateway member identifier from the associated
-// EIP or SNAT rule metadata. EIP ownership takes precedence, falling back to SNAT rule metadata.
+// EIP or SNAT rule metadata. EIP ownership takes precedence, falling back to SNAT rule metadata
+// only when no EIP is associated.
 func resolveSnatMemberID(eip *kubeovnv1.IptablesEIP, snat *kubeovnv1.IptablesSnatRule) string {
 	if eip != nil {
-		if m := getMemberIDFromMeta(eip.Labels, eip.Annotations); m != "" {
-			return m
-		}
+		return getMemberIDFromMeta(eip.Labels, eip.Annotations)
 	}
 	if snat != nil {
-		if m := getMemberIDFromMeta(snat.Labels, snat.Annotations); m != "" {
-			return m
-		}
+		return getMemberIDFromMeta(snat.Labels, snat.Annotations)
 	}
 	return ""
 }

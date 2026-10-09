@@ -724,6 +724,9 @@ func TestResolveSnatMemberID(t *testing.T) {
 	assert.Equal(t, "member-a", resolveSnatMemberID(eip, snat))
 	// Fallback to snat
 	assert.Equal(t, "member-b", resolveSnatMemberID(nil, snat))
+	// Unsharded EIP takes precedence over snat
+	unshardedEip := &kubeovnv1.IptablesEIP{}
+	assert.Equal(t, "", resolveSnatMemberID(unshardedEip, snat))
 	// Legacy label
 	legacySnat := &kubeovnv1.IptablesSnatRule{
 		ObjectMeta: metav1.ObjectMeta{
