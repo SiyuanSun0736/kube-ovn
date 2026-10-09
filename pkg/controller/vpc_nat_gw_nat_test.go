@@ -766,3 +766,23 @@ func TestFilterNatGwPodsByMember(t *testing.T) {
 	_, err = c.filterNatGwPodsByMember(pods, "non-existent")
 	assert.Error(t, err)
 }
+
+func TestResolveRecordedSnatMemberID(t *testing.T) {
+	t.Parallel()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-new"},
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-old"},
+		},
+	}
+	// For recorded state cleanup, SNAT recorded member takes precedence over current EIP member
+	assert.Equal(t, "member-old", resolveRecordedSnatMemberID(snat, eip))
+	// Fallback to EIP if SNAT has no member metadata
+	assert.Equal(t, "member-new", resolveRecordedSnatMemberID(nil, eip))
+	// Unsharded returns empty
+	assert.Equal(t, "", resolveRecordedSnatMemberID(nil, nil))
+}

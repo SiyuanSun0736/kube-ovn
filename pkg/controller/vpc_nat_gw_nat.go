@@ -1228,8 +1228,11 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		return nil
 	}
 
+	desiredMember := resolveSnatMemberID(eip, cachedSnat)
+	currentMember := cachedSnat.Labels[util.NatGatewayMemberLabel]
+
 	if oldV4ip != newV4ip || cachedSnat.Status.NatGwDp != eip.Spec.NatGwDp || oldV4Cidr != newV4Cidr ||
-		cachedSnat.Labels[util.EipUIDLabel] != string(eip.UID) {
+		cachedSnat.Labels[util.EipUIDLabel] != string(eip.UID) || currentMember != desiredMember {
 		// Mark SNAT as not ready before starting the update.
 		// This ensures that if the controller crashes or the update fails midway,
 		// the resource will be left in a non-ready state, indicating a potential inconsistency.
@@ -1306,7 +1309,7 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		if cachedSnat.Spec.EIP != "" {
 			eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
 		}
-		memberID := resolveSnatMemberID(eip, cachedSnat)
+		memberID := resolveRecordedSnatMemberID(cachedSnat, eip)
 		if err = c.createSnatInPodWithMember(cachedSnat.Status.NatGwDp, cachedSnat.Status.V4ip, cachedSnat.Status.InternalCIDR, memberID); err != nil {
 			klog.Errorf("failed to create new snat, %v", err)
 			return err
@@ -1951,6 +1954,7 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 	var needUpdateLabel, needUpdateAnno bool
 	var op string
 	eipMember := getMemberIDFromMeta(eip.Labels, eip.Annotations)
+	currentMember := snat.Labels[util.NatGatewayMemberLabel]
 
 	if len(snat.Labels) == 0 {
 		op = "add"
@@ -1966,13 +1970,15 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 	} else if snat.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
 		snat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
 		snat.Labels[util.EipUIDLabel] != string(eip.UID) ||
-		(eipMember != "" && snat.Labels[util.NatGatewayMemberLabel] != eipMember) {
+		currentMember != eipMember {
 		op = "replace"
 		snat.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		snat.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
 		snat.Labels[util.EipUIDLabel] = string(eip.UID)
 		if eipMember != "" {
 			snat.Labels[util.NatGatewayMemberLabel] = eipMember
+		} else {
+			delete(snat.Labels, util.NatGatewayMemberLabel)
 		}
 		needUpdateLabel = true
 	}
@@ -2306,7 +2312,7 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 	if cachedSnat.Spec.EIP != "" {
 		eip, _ = c.iptablesEipsLister.Get(cachedSnat.Spec.EIP)
 	}
-	memberID := resolveSnatMemberID(eip, cachedSnat)
+	memberID := resolveRecordedSnatMemberID(cachedSnat, eip)
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("snat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if err := c.deleteSnatInPodWithMember(statusNatGwDp, statusV4ip, statusV4Cidr, memberID); err != nil {
@@ -2334,7 +2340,8 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 			return firstErr
 		}
 		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || specV4Cidr != statusV4Cidr {
-			if err = c.deleteSnatInPodWithMember(specNatGwDp, specV4ip, specV4Cidr, memberID); err != nil {
+			specMemberID := resolveSnatMemberID(eip, cachedSnat)
+			if err = c.deleteSnatInPodWithMember(specNatGwDp, specV4ip, specV4Cidr, specMemberID); err != nil {
 				klog.Errorf("failed spec-based cleanup for snat %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2835,6 +2842,23 @@ func resolveSnatMemberID(eip *kubeovnv1.IptablesEIP, snat *kubeovnv1.IptablesSna
 	}
 	if snat != nil {
 		if m := getMemberIDFromMeta(snat.Labels, snat.Annotations); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// resolveRecordedSnatMemberID resolves the member recorded on the SNAT rule itself.
+// When deleting or cleaning up an existing recorded rule, this ensures that the pod member
+// where the rule was actually deployed is targeted, even if the EIP has since been reassigned or unassigned.
+func resolveRecordedSnatMemberID(snat *kubeovnv1.IptablesSnatRule, eip *kubeovnv1.IptablesEIP) string {
+	if snat != nil {
+		if m := getMemberIDFromMeta(snat.Labels, snat.Annotations); m != "" {
+			return m
+		}
+	}
+	if eip != nil {
+		if m := getMemberIDFromMeta(eip.Labels, eip.Annotations); m != "" {
 			return m
 		}
 	}
