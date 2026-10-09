@@ -1261,6 +1261,20 @@ function stateless_dnat_del() {
                 | grep -E "ip saddr $intIp $proto sport $intPort notrack" \
                 | grep -oE "handle [0-9]+" | awk '{print $2}')
             notrack_handles="$notrack_handles $extra_notrack"
+        else
+            local rewrite_line
+            rewrite_line=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip $proto dport $extPort .*ip daddr set" | head -n 1)
+            if [ -n "$rewrite_line" ]; then
+                local inferred_ip inferred_port extra_notrack
+                inferred_ip=$(echo "$rewrite_line" | sed -n 's/.*ip daddr set \([0-9.]*\).*/\1/p')
+                inferred_port=$(echo "$rewrite_line" | sed -n 's/.*dport set \([0-9]*\).*/\1/p')
+                if [ -n "$inferred_ip" ] && [ -n "$inferred_port" ]; then
+                    extra_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                        | grep -E "ip saddr $inferred_ip $proto sport $inferred_port notrack" \
+                        | grep -oE "handle [0-9]+" | awk '{print $2}')
+                    notrack_handles="$notrack_handles $extra_notrack"
+                fi
+            fi
         fi
         for h in $pre_handles $notrack_handles; do
             nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
