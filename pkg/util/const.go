@@ -43,6 +43,8 @@ const (
 	VpcNatGatewayActivatedAnnotation        = "ovn.kubernetes.io/vpc_nat_gw_activated"
 	VpcEipsAnnotation                       = "ovn.kubernetes.io/vpc_eips"
 	VpcFloatingIPMd5Annotation              = "ovn.kubernetes.io/vpc_floating_ips"
+	CiliumDisableSourceIPVerification       = "config.cilium.io/disable-source-ip-verification"
+	CiliumDelegateSourceIPVerification      = "config.cilium.io/delegate-source-ip-verification"
 	VpcDnatMd5Annotation                    = "ovn.kubernetes.io/vpc_dnat_md5"
 	VpcSnatMd5Annotation                    = "ovn.kubernetes.io/vpc_snat_md5"
 	VpcCIDRsAnnotation                      = "ovn.kubernetes.io/vpc_cidrs"

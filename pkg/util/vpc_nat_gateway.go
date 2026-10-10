@@ -154,6 +154,8 @@ func GenNatGwPodAnnotations(userAnnotations map[string]string, gw *kubeovnv1.Vpc
 	result[VpcNatGatewayAnnotation] = gw.Name
 	result[fmt.Sprintf(LogicalSwitchAnnotationTemplate, p)] = gw.Spec.Subnet
 	result[fmt.Sprintf(IPAddressAnnotationTemplate, p)] = gw.Spec.LanIP
+	result[fmt.Sprintf(Layer2ForwardAnnotationTemplate, p)] = "true"
+	result[CiliumDisableSourceIPVerification] = "true"
 
 	// We're using a custom provider, we need to override the default network of the pod so that the
 	// default VPC/Subnet of the cluster isn't accidentally injected.
