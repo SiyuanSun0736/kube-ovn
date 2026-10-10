@@ -190,6 +190,11 @@ function init() {
     $iptables_cmd -t mangle -A PREROUTING -j VPC_MARK
     $iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK --set-xmark 0x1/0x1
 
+    # TCP MSS Clamping to prevent MTU blackholes over encapsulated overlay networks
+    if ! $iptables_save_cmd -t mangle 2>/dev/null | grep -q "TCPMSS --clamp-mss-to-pmtu"; then
+        $iptables_cmd -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    fi
+
     # Load IFB kernel module for ingress QoS traffic shaping
     # IFB (Intermediate Functional Block) is required for ingress rate limiting using HTB
     # Load it early in init to detect any issues before QoS rules are applied
@@ -1119,6 +1124,10 @@ function stateless_init() {
     if ! nft list chain ip "$table" postrouting >/dev/null 2>&1; then
         nft add chain ip "$table" postrouting '{ type filter hook postrouting priority 100; policy accept; }' || return 1
     fi
+    # TCP MSS clamping to prevent MTU blackholes over encapsulated overlay networks
+    if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "maxseg size set rt mtu"; then
+        nft add rule ip "$table" postrouting tcp flags \& \(syn \| rst\) == syn tcp option maxseg size set rt mtu 2>/dev/null || true
+    fi
 }
 
 function stateless_apply() {
@@ -1137,6 +1146,7 @@ table ip $table {
     }
     chain postrouting {
         type filter hook postrouting priority 100; policy accept;
+        tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
     }
 }
 EOF

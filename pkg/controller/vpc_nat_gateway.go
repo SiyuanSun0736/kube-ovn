@@ -1479,7 +1479,6 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 	}
 
 	if len(activePods) == 0 {
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("no active pod now")
 	}
 
