@@ -958,6 +958,11 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		if pod.DeletionTimestamp.IsZero() {
 			klog.Infof("init vpc nat gateway pod %s/%s with name %s", namespace, name, vpcGwName)
 			c.initVpcNatGatewayQueue.Add(vpcGwName)
+			podName := c.getNameByPod(pod)
+			portName := ovs.PodNameToPortName(podName, namespace, util.OvnProvider)
+			if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
+				klog.Errorf("failed to enable layer2 forward for nat gw port %s: %v", portName, err)
+			}
 		}
 	}
 

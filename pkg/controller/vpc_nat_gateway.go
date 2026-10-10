@@ -91,6 +91,26 @@ func (c *Controller) natGwNamespaceByName(gwName string) string {
 	return c.natGwNamespace(gw)
 }
 
+func (c *Controller) ensureNatGwNamespaceDelegation(nsName string) {
+	if nsName == "" {
+		return
+	}
+	ns, err := c.namespacesLister.Get(nsName)
+	if err != nil {
+		klog.Warningf("failed to get namespace %s from lister: %v", nsName, err)
+		return
+	}
+	if ns.Annotations != nil && ns.Annotations[util.CiliumDelegateSourceIPVerification] == "true" {
+		return
+	}
+	patch := map[string]interface{}{
+		util.CiliumDelegateSourceIPVerification: "true",
+	}
+	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Namespaces(), nsName, patch); err != nil {
+		klog.Errorf("failed to patch namespace %s with cilium delegation annotation: %v", nsName, err)
+	}
+}
+
 func (c *Controller) resyncVpcNatGwConfig() {
 	cm, err := c.configMapsLister.ConfigMaps(c.config.PodNamespace).Get(util.VpcNatGatewayConfig)
 	if err != nil && !k8serrors.IsNotFound(err) {
@@ -341,6 +361,8 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 	gwChanged := isVpcNatGwChanged(gw)
 	needPatchStatus := gwChanged
+
+	c.ensureNatGwNamespaceDelegation(c.natGwNamespace(gw))
 
 	newSts, err := c.genNatGwStatefulSet(gw, oldSts, natGwPodContainerRestartCount)
 	if err != nil {
