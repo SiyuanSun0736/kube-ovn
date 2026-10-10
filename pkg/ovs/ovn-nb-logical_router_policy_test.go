@@ -98,6 +98,33 @@ func (suite *OvnClientTestSuite) testAddLogicalRouterPolicy() {
 		require.Len(t, updatedPolicyList, 1)
 		require.Equal(t, newExternalIDs, updatedPolicyList[0].ExternalIDs)
 	})
+
+	t.Run("update policy with different bfdSessions", func(t *testing.T) {
+		bfd1, err := nbClient.CreateBFD("lrp-test-1", "10.0.0.1", 100, 100, 3, nil)
+		require.NoError(t, err)
+		bfd2, err := nbClient.CreateBFD("lrp-test-2", "10.0.0.2", 100, 100, 3, nil)
+		require.NoError(t, err)
+
+		initialBFD := []string{bfd1.UUID}
+
+		err = nbClient.AddLogicalRouterPolicy(lrName, priority, match, action, nextHops, initialBFD, nil)
+		require.NoError(t, err)
+
+		policyList, err := nbClient.GetLogicalRouterPolicy(lrName, priority, match, false)
+		require.NoError(t, err)
+		require.Len(t, policyList, 1)
+		require.Equal(t, initialBFD, policyList[0].BFDSessions)
+
+		newBFD := []string{bfd1.UUID, bfd2.UUID}
+
+		err = nbClient.AddLogicalRouterPolicy(lrName, priority, match, action, nextHops, newBFD, nil)
+		require.NoError(t, err)
+
+		updatedPolicyList, err := nbClient.GetLogicalRouterPolicy(lrName, priority, match, false)
+		require.NoError(t, err)
+		require.Len(t, updatedPolicyList, 1)
+		require.ElementsMatch(t, newBFD, updatedPolicyList[0].BFDSessions)
+	})
 }
 
 func (suite *OvnClientTestSuite) testCreateLogicalRouterPolicies() {
@@ -797,6 +824,35 @@ func (suite *OvnClientTestSuite) testBatchAddLogicalRouterPolicy() {
 		require.NoError(t, err)
 		require.Len(t, updatedPolicyList, 1)
 		require.Equal(t, newExternalIDs, updatedPolicyList[0].ExternalIDs)
+	})
+
+	t.Run("update policy with different bfdSessions", func(t *testing.T) {
+		bfd1, err := nbClient.CreateBFD("lrp-batch-test-1", "10.0.1.1", 100, 100, 3, nil)
+		require.NoError(t, err)
+		bfd2, err := nbClient.CreateBFD("lrp-batch-test-2", "10.0.1.2", 100, 100, 3, nil)
+		require.NoError(t, err)
+
+		initialBFD := []string{bfd1.UUID}
+		lrp.BFDSessions = initialBFD
+
+		err = nbClient.BatchAddLogicalRouterPolicy(lrName, lrp)
+		require.NoError(t, err)
+
+		policyList, err := nbClient.GetLogicalRouterPolicy(lrName, priority, match, false)
+		require.NoError(t, err)
+		require.Len(t, policyList, 1)
+		require.Equal(t, initialBFD, policyList[0].BFDSessions)
+
+		newBFD := []string{bfd1.UUID, bfd2.UUID}
+		lrp.BFDSessions = newBFD
+
+		err = nbClient.BatchAddLogicalRouterPolicy(lrName, lrp)
+		require.NoError(t, err)
+
+		updatedPolicyList, err := nbClient.GetLogicalRouterPolicy(lrName, priority, match, false)
+		require.NoError(t, err)
+		require.Len(t, updatedPolicyList, 1)
+		require.ElementsMatch(t, newBFD, updatedPolicyList[0].BFDSessions)
 	})
 }
 

@@ -99,6 +99,8 @@ type PolicyRoute struct {
 	// NextHopIP is an optional parameter. It needs to be provided only when 'action' is 'reroute'.
 	// +optional
 	NextHopIP string `json:"nextHopIP,omitempty"`
+	// +optional
+	BfdID string `json:"bfdId,omitempty"`
 }
 
 type BFDPortStatus struct {

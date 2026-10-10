@@ -2472,6 +2472,8 @@ spec:
                         type: string
                       nextHopIP:
                         type: string
+                      bfdId:
+                        type: string
                     type: object
                   type: array
                 vpcPeerings:

@@ -59,20 +59,32 @@ func (c *OVNNbClient) AddLogicalRouterPolicy(lrName string, priority int, match,
 			klog.Error(err)
 			return fmt.Errorf("add policy to logical router %s: %w", lrName, err)
 		}
-	} else if !maps.Equal(policyFound.ExternalIDs, externalIDs) {
-		policy := ptr.To(*policyFound)
-		policy.ExternalIDs = externalIDs
-		ops, err := c.Where(policy).Update(policy, &policy.ExternalIDs)
-		if err != nil {
-			err := fmt.Errorf("failed to generate operations for updating logical router policy: %w", err)
-			klog.Error(err)
-			return err
-		}
+	} else {
+		needUpdateExtIDs := !maps.Equal(policyFound.ExternalIDs, externalIDs)
+		needUpdateBFD := !strset.New(policyFound.BFDSessions...).IsEqual(strset.New(bfdSessions...))
+		if needUpdateExtIDs || needUpdateBFD {
+			policy := ptr.To(*policyFound)
+			var fields []any
+			if needUpdateExtIDs {
+				policy.ExternalIDs = externalIDs
+				fields = append(fields, &policy.ExternalIDs)
+			}
+			if needUpdateBFD {
+				policy.BFDSessions = bfdSessions
+				fields = append(fields, &policy.BFDSessions)
+			}
+			ops, err := c.Where(policy).Update(policy, fields...)
+			if err != nil {
+				err := fmt.Errorf("failed to generate operations for updating logical router policy: %w", err)
+				klog.Error(err)
+				return err
+			}
 
-		if err = c.Transact("lr-policy-update", ops); err != nil {
-			err := fmt.Errorf("failed to update logical router policy: %w", err)
-			klog.Error(err)
-			return err
+			if err = c.Transact("lr-policy-update", ops); err != nil {
+				err := fmt.Errorf("failed to update logical router policy: %w", err)
+				klog.Error(err)
+				return err
+			}
 		}
 	}
 
@@ -104,7 +116,7 @@ func (c *OVNNbClient) BatchAddLogicalRouterPolicy(lrName string, policies ...*ov
 		duplicate, policyFound := c.matchLogicalRouterPolicies(policy, policyList)
 		if policyFound == nil {
 			needCreatePolicy = append(needCreatePolicy, policy)
-		} else if !maps.Equal(policyFound.ExternalIDs, policy.ExternalIDs) {
+		} else if !maps.Equal(policyFound.ExternalIDs, policy.ExternalIDs) || !strset.New(policyFound.BFDSessions...).IsEqual(strset.New(policy.BFDSessions...)) {
 			needUpdatePolicy[policy] = policyFound
 		}
 		if len(duplicate) > 0 {
@@ -580,8 +592,19 @@ func (c *OVNNbClient) batchUpdatetLogicalRouterPolicies(updateMap map[*ovnnb.Log
 	updateOps := make([]ovsdb.Operation, 0, len(updateMap))
 	for policyNew, policyFound := range updateMap {
 		policy := ptr.To(*policyFound)
-		policy.ExternalIDs = policyNew.ExternalIDs
-		ops, err := c.Where(policy).Update(policy, &policy.ExternalIDs)
+		var fields []any
+		if !maps.Equal(policyFound.ExternalIDs, policyNew.ExternalIDs) {
+			policy.ExternalIDs = policyNew.ExternalIDs
+			fields = append(fields, &policy.ExternalIDs)
+		}
+		if !strset.New(policyFound.BFDSessions...).IsEqual(strset.New(policyNew.BFDSessions...)) {
+			policy.BFDSessions = policyNew.BFDSessions
+			fields = append(fields, &policy.BFDSessions)
+		}
+		if len(fields) == 0 {
+			continue
+		}
+		ops, err := c.Where(policy).Update(policy, fields...)
 		if err != nil {
 			return fmt.Errorf("failed to generate operations for updating logical router policy: %w", err)
 		}

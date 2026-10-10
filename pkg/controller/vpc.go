@@ -528,11 +528,27 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		policyRouteLogical                                         []*ovnnb.LogicalRouterPolicy
 	)
 
+	targetPolicyRoutes := make([]*kubeovnv1.PolicyRoute, len(vpc.Spec.PolicyRoutes))
+	for i, pr := range vpc.Spec.PolicyRoutes {
+		prCopy := *pr
+		if prCopy.BfdID == "" {
+			var nextHops []string
+			if prCopy.NextHopIP != "" {
+				nextHops = strings.Split(prCopy.NextHopIP, ",")
+			}
+			bfdSessions := c.getVpcBfdSessions(vpc.Name, nextHops, "")
+			if len(bfdSessions) > 0 {
+				prCopy.BfdID = strings.Join(bfdSessions, ",")
+			}
+		}
+		targetPolicyRoutes[i] = &prCopy
+	}
+
 	if vpc.Name == c.config.ClusterRouter {
 		lastPolicies, _ := c.vpcLastPoliciesMap.Load(vpc.Name)
 		policyRouteExisted = reversePolicies(lastPolicies)
 		// diff list
-		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithExisted(policyRouteExisted, vpc.Spec.PolicyRoutes)
+		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithExisted(policyRouteExisted, targetPolicyRoutes)
 	} else {
 		policyRouteLogical, err = c.OVNNbClient.ListLogicalRouterPolicies(vpc.Name, -1, nil, true)
 		if err != nil {
@@ -540,7 +556,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 			return err
 		}
 		// diff vpc policy route
-		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithLogical(policyRouteLogical, vpc.Spec.PolicyRoutes)
+		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithLogical(policyRouteLogical, targetPolicyRoutes)
 	}
 	// delete policies non-exist
 	for _, item := range policyRouteNeedDel {
@@ -552,7 +568,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 	// add new policies
 	for _, item := range policyRouteNeedAdd {
-		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, externalID %v", vpc.Name, item.Match, string(item.Action), item.NextHopIP, externalIDs)
+		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, bfdId %s, externalID %v", vpc.Name, item.Match, string(item.Action), item.NextHopIP, item.BfdID, externalIDs)
 		if err = c.addPolicyRouteToVpc(vpc.Name, item, externalIDs); err != nil {
 			return err
 		}
@@ -853,12 +869,64 @@ func (c *Controller) addPolicyRouteToVpc(vpcName string, policy *kubeovnv1.Polic
 	if policy.NextHopIP != "" {
 		nextHops = strings.Split(policy.NextHopIP, ",")
 	}
+	bfdSessions := c.getVpcBfdSessions(vpcName, nextHops, policy.BfdID)
 
-	if err = c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, nil, externalIDs); err != nil {
+	if err = c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, bfdSessions, externalIDs); err != nil {
 		klog.Errorf("add policy route to vpc %s failed, %v", vpcName, err)
 		return err
 	}
 	return nil
+}
+
+func (c *Controller) getVpcBfdSessions(vpcName string, nextHops []string, explicitBfdID string) []string {
+	if explicitBfdID != "" {
+		var sessions []string
+		for _, id := range strings.Split(explicitBfdID, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				sessions = append(sessions, trimmed)
+			}
+		}
+		if len(sessions) > 0 {
+			return sessions
+		}
+	}
+
+	if len(nextHops) == 0 {
+		return nil
+	}
+
+	if c.vpcsLister != nil {
+		vpc, err := c.vpcsLister.Get(vpcName)
+		if err == nil && vpc != nil {
+			if !vpc.Spec.EnableBfd && !vpc.Spec.BFDPort.IsEnabled() {
+				return nil
+			}
+		}
+	}
+
+	lrpNames := []string{
+		"bfd@" + vpcName,
+		fmt.Sprintf("%s-%s", vpcName, c.config.ExternalGatewaySwitch),
+	}
+
+	var bfdSessions []string
+	seen := make(map[string]bool)
+	for _, lrpName := range lrpNames {
+		for _, nextHop := range nextHops {
+			bfds, err := c.OVNNbClient.ListBFDs(lrpName, nextHop)
+			if err != nil {
+				klog.V(5).Infof("failed to list BFD for %s and %s: %v", lrpName, nextHop, err)
+				continue
+			}
+			for _, bfd := range bfds {
+				if bfd.UUID != "" && !seen[bfd.UUID] {
+					seen[bfd.UUID] = true
+					bfdSessions = append(bfdSessions, bfd.UUID)
+				}
+			}
+		}
+	}
+	return bfdSessions
 }
 
 func buildExternalIDsMapKey(match, action string, priority int) string {
@@ -876,11 +944,13 @@ func (c *Controller) batchAddPolicyRouteToVpc(name string, policies []*kubeovnv1
 		if policy.NextHopIP != "" {
 			nextHops = strings.Split(policy.NextHopIP, ",")
 		}
+		bfdSessions := c.getVpcBfdSessions(name, nextHops, policy.BfdID)
 		routerPolicies = append(routerPolicies, &ovnnb.LogicalRouterPolicy{
 			Priority:    policy.Priority,
 			Nexthops:    nextHops,
 			Action:      string(policy.Action),
 			Match:       policy.Match,
+			BFDSessions: bfdSessions,
 			ExternalIDs: externalIDs[buildExternalIDsMapKey(policy.Match, string(policy.Action), policy.Priority)],
 		})
 	}
@@ -1028,6 +1098,9 @@ func diffPolicyRouteWithLogical(exists []*ovnnb.LogicalRouterPolicy, target []*k
 			Action:    kubeovnv1.PolicyRouteAction(item.Action),
 			NextHopIP: getLogicalPolicyNextHopKey(item),
 		}
+		if len(item.BFDSessions) > 0 {
+			policy.BfdID = normalizeBfdIDs(strings.Join(item.BFDSessions, ","))
+		}
 		existsMap[getPolicyRouteItemKey(policy)] = policy
 	}
 	klog.Infof("diffPolicyRouteWithLogical existsMap: %v", existsMap)
@@ -1052,7 +1125,22 @@ func diffPolicyRouteWithLogical(exists []*ovnnb.LogicalRouterPolicy, target []*k
 }
 
 func getPolicyRouteItemKey(item *kubeovnv1.PolicyRoute) (key string) {
-	return fmt.Sprintf("%d:%s:%s:%s", item.Priority, item.Match, item.Action, normalizePolicyRouteNextHops(item.NextHopIP))
+	return fmt.Sprintf("%d:%s:%s:%s:%s", item.Priority, item.Match, item.Action, normalizePolicyRouteNextHops(item.NextHopIP), normalizeBfdIDs(item.BfdID))
+}
+
+func normalizeBfdIDs(bfdID string) string {
+	if bfdID == "" {
+		return ""
+	}
+	ids := strings.Split(bfdID, ",")
+	var result []string
+	for _, id := range ids {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	slices.Sort(result)
+	return strings.Join(result, ",")
 }
 
 func getLogicalPolicyNextHopKey(item *ovnnb.LogicalRouterPolicy) string {
@@ -1158,6 +1246,10 @@ func (c *Controller) formatVpc(vpc *kubeovnv1.Vpc) (*kubeovnv1.Vpc, error) {
 		if route.Action != kubeovnv1.PolicyRouteActionReroute {
 			if route.NextHopIP != "" {
 				route.NextHopIP = ""
+				changed = true
+			}
+			if route.BfdID != "" {
+				route.BfdID = ""
 				changed = true
 			}
 		} else {
