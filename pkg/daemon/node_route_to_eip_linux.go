@@ -309,6 +309,26 @@ func cleanHostLocalTableRouteForEIP(eip string) error {
 	return nil
 }
 
+// cleanHostStaleLinkRoutesForEIP deletes any stale scope-link routes for EIP (e.g., from macbond1).
+func cleanHostStaleLinkRoutesForEIP(eip string) {
+	dst, err := parseEIPDestination(eip)
+	if err != nil {
+		return
+	}
+	filter := &netlink.Route{
+		Dst:   dst,
+		Scope: netlink.SCOPE_LINK,
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_SCOPE)
+	if err == nil {
+		for _, r := range routes {
+			if delErr := netlink.RouteDel(&r); delErr == nil {
+				klog.Infof("successfully deleted stale scope-link route for EIP %s (linkIdx=%d)", eip, r.LinkIndex)
+			}
+		}
+	}
+}
+
 // ensureHostForwarding ensures host IPv4 forwarding is enabled.
 func ensureHostForwarding() {
 	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
@@ -519,26 +539,51 @@ func (c *Controller) resyncLocalIptablesEipRoutes() {
 	}
 }
 
-// hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
-// NAT GW pod name is generated from NatGwDp field using the pattern: vpc-nat-gw-{natGwDp}-0
-// Note: This only checks NodeName, not pod phase. The caller should check EIP Ready status
-// to ensure the NAT GW pod has successfully configured iptables rules.
-func (c *Controller) hasNatGwPodOnLocalNode(natGwDp string) bool {
+// findLocalNatGwPod finds the NAT GW pod for the given NatGwDp on the local node.
+// Supports both single-instance gateways and dual-member HA gateways (e.g. phase2-gw with phase2-gw-m1/m2).
+func (c *Controller) findLocalNatGwPod(natGwDp string) *corev1.Pod {
 	if natGwDp == "" {
-		return false
+		return nil
 	}
 
-	// In the current vpc-nat-gw CRD implementation, the StatefulSet has replicas=1,
-	// so there is only one NAT GW pod running at any time. The pod name is deterministic
-	// with suffix "-0" (e.g., vpc-nat-gw-mygateway-0).
+	// 1. Direct match with deterministic single-instance name
 	podName := util.GenNatGwPodName(natGwDp)
-	pod, err := c.podsLister.Pods(c.config.PodNamespace).Get(podName)
-	if err != nil {
-		klog.V(3).Infof("failed to get NAT GW pod %s: %v", podName, err)
-		return false
+	if pod, err := c.podsLister.Pods(c.config.PodNamespace).Get(podName); err == nil {
+		if pod.Spec.NodeName == c.config.NodeName {
+			return pod
+		}
 	}
 
-	return pod.Spec.NodeName == c.config.NodeName
+	// 2. Dual-member / HA match: find any local pod belonging to this logical gateway
+	pods, err := c.podsLister.Pods(c.config.PodNamespace).List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	prefix := "vpc-nat-gw-" + natGwDp
+	for _, pod := range pods {
+		if pod.Spec.NodeName != c.config.NodeName {
+			continue
+		}
+		// Match by pod name prefix (e.g. vpc-nat-gw-phase2-gw-m1-0 matches phase2-gw)
+		if strings.HasPrefix(pod.Name, prefix) {
+			return pod
+		}
+		// Match by labels
+		if pod.Labels != nil {
+			if gw := pod.Labels[util.VpcNatGatewayNameLabel]; gw == natGwDp || strings.HasPrefix(gw, natGwDp) {
+				return pod
+			}
+			if app := pod.Labels["app"]; app == prefix || strings.HasPrefix(app, prefix) {
+				return pod
+			}
+		}
+	}
+	return nil
+}
+
+// hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
+func (c *Controller) hasNatGwPodOnLocalNode(natGwDp string) bool {
+	return c.findLocalNatGwPod(natGwDp) != nil
 }
 
 // shouldEnqueueIptablesEip checks if an EIP should be enqueued for route processing.
@@ -793,17 +838,18 @@ func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
 	if info.mode == "veth" {
 		// Clean any hijacked routes in table 255 (local)
 		_ = cleanHostLocalTableRouteForEIP(info.v4ip)
+		// Clean any stale scope-link routes (e.g. dev macbond1 scope link)
+		cleanHostStaleLinkRoutesForEIP(info.v4ip)
 		// Ensure host IPv4 forwarding is active
 		ensureHostForwarding()
 
 		// Dynamically obtain pod's real ptp IP from network-status
-		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-		pod, err := c.podsLister.Pods(c.config.PodNamespace).Get(podName)
-		if err != nil {
-			klog.Errorf("failed to get NAT GW pod %s: %v", podName, err)
-			return err
+		localPod := c.findLocalNatGwPod(eip.Spec.NatGwDp)
+		if localPod == nil {
+			klog.Errorf("failed to get local NAT GW pod for gateway %s", eip.Spec.NatGwDp)
+			return fmt.Errorf("local NAT GW pod for %s not found", eip.Spec.NatGwDp)
 		}
-		ptpIP := getPodPtpIP(pod)
+		ptpIP := getPodPtpIP(localPod)
 
 		// Install penetration route via point-to-point interface
 		if err := addVethEIPRoute(info.v4ip, ptpIP); err != nil {

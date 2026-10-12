@@ -123,7 +123,7 @@ func (c *Controller) enqueueNatGwPodEvent(obj any) {
 		return
 	}
 	for _, eip := range eips {
-		if eip.Spec.NatGwDp == gwName && eip.Annotations[util.BgpAnnotation] == "true" {
+		if (eip.Spec.NatGwDp == gwName || strings.HasPrefix(gwName, eip.Spec.NatGwDp)) && eip.Annotations[util.BgpAnnotation] == "true" {
 			klog.V(3).Infof("enqueue iptables-eip %s due to local NAT GW pod %s event (phase=%s, deleting=%v)",
 				eip.Name, pod.Name, pod.Status.Phase, !pod.DeletionTimestamp.IsZero())
 			c.eipQueue.Add(eip.Name)
@@ -317,8 +317,47 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 	return errors.Join(errs...)
 }
 
+// findLocalNatGwPod finds the NAT GW pod for the given NatGwDp on the local node.
+// Supports both single-instance gateways and dual-member HA gateways.
+func (c *Controller) findLocalNatGwPod(natGwDp string) *corev1.Pod {
+	if natGwDp == "" {
+		return nil
+	}
+
+	// 1. Direct match with deterministic name
+	podName := util.GenNatGwPodName(natGwDp)
+	if pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName); err == nil {
+		if pod.Spec.NodeName == c.config.NodeName {
+			return pod
+		}
+	}
+
+	// 2. Dual-member / HA match
+	pods, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	prefix := "vpc-nat-gw-" + natGwDp
+	for _, pod := range pods {
+		if pod.Spec.NodeName != c.config.NodeName {
+			continue
+		}
+		if strings.HasPrefix(pod.Name, prefix) {
+			return pod
+		}
+		if pod.Labels != nil {
+			if gw := pod.Labels[util.VpcNatGatewayNameLabel]; gw == natGwDp || strings.HasPrefix(gw, natGwDp) {
+				return pod
+			}
+			if app := pod.Labels["app"]; app == prefix || strings.HasPrefix(app, prefix) {
+				return pod
+			}
+		}
+	}
+	return nil
+}
+
 // hasNatGwPodOnLocalNode checks if the NAT gateway pod for this EIP is running and healthy on the local node.
-// NAT gateway pod name follows the pattern: vpc-nat-gw-{natGwDp}-0
 // Returns true only if the pod exists, is Running, is Ready, not Terminating, and dataplane-ready!=false.
 func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	if eip.Spec.NatGwDp == "" {
@@ -326,38 +365,31 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 		return false
 	}
 
-	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-	// Use gwPodsLister which watches pods in VpcNatGwNamespace
-	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
-	if err != nil {
-		klog.V(3).Infof("failed to get NAT GW pod %s/%s: %v", c.config.VpcNatGwNamespace, podName, err)
+	pod := c.findLocalNatGwPod(eip.Spec.NatGwDp)
+	if pod == nil {
+		klog.V(3).Infof("no local NAT GW pod found for %s on node %s", eip.Spec.NatGwDp, c.config.NodeName)
 		return false
 	}
 
-	// 1. Must be scheduled on the local node
-	if pod.Spec.NodeName != c.config.NodeName {
-		return false
-	}
-
-	// 2. Must not be terminating (trigger fast BGP route withdraw on failover/shutdown)
+	// 1. Must not be terminating (trigger fast BGP route withdraw on failover/shutdown)
 	if !pod.DeletionTimestamp.IsZero() {
-		klog.Infof("NAT GW pod %s is terminating, withdrawing BGP routes on node %s", podName, c.config.NodeName)
+		klog.Infof("NAT GW pod %s is terminating, withdrawing BGP routes on node %s", pod.Name, c.config.NodeName)
 		return false
 	}
 
-	// 3. Must be in Running phase
+	// 2. Must be in Running phase
 	if pod.Status.Phase != corev1.PodRunning {
-		klog.V(3).Infof("NAT GW pod %s is in phase %s, withdrawing BGP routes", podName, pod.Status.Phase)
+		klog.V(3).Infof("NAT GW pod %s is in phase %s, withdrawing BGP routes", pod.Name, pod.Status.Phase)
 		return false
 	}
 
-	// 4. Must not be fenced by dataplane-ready=false annotation
+	// 3. Must not be fenced by dataplane-ready=false annotation
 	if pod.Annotations != nil && pod.Annotations["ovn.kubernetes.io/dataplane-ready"] == "false" {
-		klog.Infof("NAT GW pod %s has dataplane-ready=false annotation, withdrawing BGP routes", podName)
+		klog.Infof("NAT GW pod %s has dataplane-ready=false annotation, withdrawing BGP routes", pod.Name)
 		return false
 	}
 
-	// 5. Must satisfy PodReady condition
+	// 4. Must satisfy PodReady condition
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodReady {
 			return cond.Status == corev1.ConditionTrue
