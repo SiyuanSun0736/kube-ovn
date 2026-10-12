@@ -2392,6 +2392,10 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	}
 	var firstErr error
 	for _, gwPod := range gwPods {
+		if !gwPod.DeletionTimestamp.IsZero() || gwPod.Status.Phase != corev1.PodRunning {
+			klog.V(4).Infof("nat gw pod %s/%s not running or terminating during delete, skip pod-level cleanup", gwPod.Namespace, gwPod.Name)
+			continue
+		}
 		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
 			klog.Errorf("failed to delete fip in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
 			if firstErr == nil {
@@ -2469,6 +2473,10 @@ func (c *Controller) deleteDnatInPodWithInternal(dp, protocol, v4ip, externalPor
 
 	var firstErr error
 	for _, gwPod := range gwPods {
+		if !gwPod.DeletionTimestamp.IsZero() || gwPod.Status.Phase != corev1.PodRunning {
+			klog.V(4).Infof("nat gw pod %s/%s not running or terminating during delete, skip pod-level cleanup", gwPod.Namespace, gwPod.Name)
+			continue
+		}
 		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
 			klog.Errorf("failed to delete dnat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
 			if firstErr == nil {
@@ -2558,8 +2566,8 @@ func (c *Controller) deleteSnatInPodWithMember(dp, v4ip, internalCIDR, memberID 
 	}
 	gwPods, err = c.filterNatGwPodsByMember(gwPods, memberID)
 	if err != nil {
-		klog.Errorf("failed to filter nat gw pods for member %s during delete: %v", memberID, err)
-		return err
+		klog.V(4).Infof("nat gw member pod %s not running during delete, skip pod-level cleanup: %v", memberID, err)
+		return nil
 	}
 
 	stateless := c.isStatelessDpMode(dp)

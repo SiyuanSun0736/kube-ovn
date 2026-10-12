@@ -437,7 +437,7 @@ func TestDiffPolicyRouteWithLogical_NormalizesNextHopIPs(t *testing.T) {
 		Priority:  32000,
 		Match:     "ip4.src == 172.16.8.149/32",
 		Action:    kubeovnv1.PolicyRouteActionReroute,
-		NextHopIP: "172.31.255.253,172.31.255.254",
+		NextHopIP: " 172.31.255.253 , 172.31.255.254 ",
 	}}
 
 	existing := []*ovnnb.LogicalRouterPolicy{{
@@ -450,6 +450,14 @@ func TestDiffPolicyRouteWithLogical_NormalizesNextHopIPs(t *testing.T) {
 	dels, adds := diffPolicyRouteWithLogical(existing, target)
 	require.Empty(t, dels)
 	require.Empty(t, adds)
+}
+
+func TestSplitNextHops(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, splitNextHops(""))
+	require.Equal(t, []string{"172.31.255.253", "172.31.255.254"}, splitNextHops("172.31.255.253, 172.31.255.254"))
+	require.Equal(t, []string{"172.31.255.253", "172.31.255.254"}, splitNextHops("  172.31.255.253 ,  172.31.255.254  "))
 }
 
 func TestDiffPolicyRouteWithLogical_HandlesLegacyNextHopField(t *testing.T) {

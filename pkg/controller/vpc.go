@@ -532,10 +532,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	for i, pr := range vpc.Spec.PolicyRoutes {
 		prCopy := *pr
 		if prCopy.BfdID == "" {
-			var nextHops []string
-			if prCopy.NextHopIP != "" {
-				nextHops = strings.Split(prCopy.NextHopIP, ",")
-			}
+			nextHops := splitNextHops(prCopy.NextHopIP)
 			bfdSessions := c.getVpcBfdSessions(vpc.Name, nextHops, "")
 			if len(bfdSessions) > 0 {
 				prCopy.BfdID = strings.Join(bfdSessions, ",")
@@ -861,17 +858,10 @@ func (c *Controller) reconcileVpcBfdLRP(vpc *kubeovnv1.Vpc) (string, []string, e
 }
 
 func (c *Controller) addPolicyRouteToVpc(vpcName string, policy *kubeovnv1.PolicyRoute, externalIDs map[string]string) error {
-	var (
-		nextHops []string
-		err      error
-	)
-
-	if policy.NextHopIP != "" {
-		nextHops = strings.Split(policy.NextHopIP, ",")
-	}
+	nextHops := splitNextHops(policy.NextHopIP)
 	bfdSessions := c.getVpcBfdSessions(vpcName, nextHops, policy.BfdID)
 
-	if err = c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, bfdSessions, externalIDs); err != nil {
+	if err := c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, bfdSessions, externalIDs); err != nil {
 		klog.Errorf("add policy route to vpc %s failed, %v", vpcName, err)
 		return err
 	}
@@ -913,9 +903,13 @@ func (c *Controller) getVpcBfdSessions(vpcName string, nextHops []string, explic
 	seen := make(map[string]bool)
 	for _, lrpName := range lrpNames {
 		for _, nextHop := range nextHops {
-			bfds, err := c.OVNNbClient.ListBFDs(lrpName, nextHop)
+			trimmedHop := strings.TrimSpace(nextHop)
+			if trimmedHop == "" {
+				continue
+			}
+			bfds, err := c.OVNNbClient.ListBFDs(lrpName, trimmedHop)
 			if err != nil {
-				klog.V(5).Infof("failed to list BFD for %s and %s: %v", lrpName, nextHop, err)
+				klog.V(5).Infof("failed to list BFD for %s and %s: %v", lrpName, trimmedHop, err)
 				continue
 			}
 			for _, bfd := range bfds {
@@ -940,10 +934,7 @@ func (c *Controller) batchAddPolicyRouteToVpc(name string, policies []*kubeovnv1
 	start := time.Now()
 	routerPolicies := make([]*ovnnb.LogicalRouterPolicy, 0, len(policies))
 	for _, policy := range policies {
-		var nextHops []string
-		if policy.NextHopIP != "" {
-			nextHops = strings.Split(policy.NextHopIP, ",")
-		}
+		nextHops := splitNextHops(policy.NextHopIP)
 		bfdSessions := c.getVpcBfdSessions(name, nextHops, policy.BfdID)
 		routerPolicies = append(routerPolicies, &ovnnb.LogicalRouterPolicy{
 			Priority:    policy.Priority,
@@ -1153,18 +1144,23 @@ func getLogicalPolicyNextHopKey(item *ovnnb.LogicalRouterPolicy) string {
 	return ""
 }
 
-func normalizePolicyRouteNextHops(nextHopIP string) string {
+func splitNextHops(nextHopIP string) []string {
 	if nextHopIP == "" {
-		return ""
+		return nil
 	}
 
-	nextHops := make([]string, 0)
+	var nextHops []string
 	for nextHop := range strings.SplitSeq(nextHopIP, ",") {
 		nextHop = strings.TrimSpace(nextHop)
 		if nextHop != "" {
 			nextHops = append(nextHops, nextHop)
 		}
 	}
+	return nextHops
+}
+
+func normalizePolicyRouteNextHops(nextHopIP string) string {
+	nextHops := splitNextHops(nextHopIP)
 	if len(nextHops) == 0 {
 		return ""
 	}
@@ -1255,7 +1251,7 @@ func (c *Controller) formatVpc(vpc *kubeovnv1.Vpc) (*kubeovnv1.Vpc, error) {
 		} else {
 			// ecmp policy route may reroute to multiple next hop ips
 			for ipStr := range strings.SplitSeq(route.NextHopIP, ",") {
-				if ip := net.ParseIP(ipStr); ip == nil {
+				if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip == nil {
 					err := fmt.Errorf("invalid next hop ips: %s", route.NextHopIP)
 					klog.Error(err)
 					return nil, err

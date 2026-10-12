@@ -1046,7 +1046,7 @@ function _has_other_nat_refs() {
     count=$(nft list chain ip "$table" "$chain" 2>/dev/null \
         | grep -F "$match_pattern" \
         | grep -Fv "$exclude_pattern" \
-        | grep -c "ip daddr set\|ip saddr set\|dport set\|sport set" || true)
+        | grep -E -c "ip daddr set|ip saddr set|dport set|sport set" || true)
     [ "${count:-0}" -gt 0 ]
 }
 
@@ -1313,7 +1313,7 @@ function stateless_snat_del() {
             done
         fi
 
-        if ! _has_other_nat_refs "$table" prerouting "ip daddr $eip" "ip daddr set"; then
+        if ! _has_other_nat_refs "$table" prerouting "ip daddr $eip" "ip daddr set $internalIp"; then
             local daddr_notrack
             daddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
                 | grep -F "ip daddr $eip notrack" \
