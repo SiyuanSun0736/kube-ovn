@@ -170,7 +170,7 @@ func NewController(config *Configuration) *Controller {
 		gwPodsInformer := gwPodsInformerFactory.Core().V1().Pods()
 		controller.gwPodsLister = gwPodsInformer.Lister()
 		controller.gwPodsSynced = gwPodsInformer.Informer().HasSynced
-		controller.initNodeRouteEIPMode()
+		controller.initNodeRouteEIPMode(gwPodsInformer.Informer())
 	}
 
 	if config.EnableMetrics {

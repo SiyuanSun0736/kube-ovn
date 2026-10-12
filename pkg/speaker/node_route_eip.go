@@ -38,6 +38,7 @@ package speaker
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,9 +52,9 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-// initNodeRouteEIPMode initializes the EIP informer handlers for node route mode.
+// initNodeRouteEIPMode initializes the EIP and Pod informer handlers for node route mode.
 // This should be called during controller initialization when NodeRouteEIPMode is enabled.
-func (c *Controller) initNodeRouteEIPMode() {
+func (c *Controller) initNodeRouteEIPMode(gwPodsInformer cache.SharedIndexInformer) {
 	if c.eipQueue == nil {
 		c.eipQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
@@ -68,6 +69,66 @@ func (c *Controller) initNodeRouteEIPMode() {
 		UpdateFunc: c.enqueueUpdateNodeRouteEIP,
 		DeleteFunc: c.enqueueDeleteNodeRouteEIP,
 	})
+
+	// Register NAT Gateway Pod event handlers for autonomous BGP route announce/withdraw
+	if gwPodsInformer != nil {
+		_, _ = gwPodsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    c.enqueueNatGwPodEvent,
+			UpdateFunc: func(oldObj, newObj any) { c.enqueueNatGwPodEvent(newObj) },
+			DeleteFunc: c.enqueueNatGwPodEvent,
+		})
+	}
+}
+
+// enqueueNatGwPodEvent handles pod events for NAT Gateways, re-evaluating BGP announcements
+// immediately when a local gateway pod changes phase, ready status, or begins terminating.
+func (c *Controller) enqueueNatGwPodEvent(obj any) {
+	var pod *corev1.Pod
+	switch t := obj.(type) {
+	case *corev1.Pod:
+		pod = t
+	case cache.DeletedFinalStateUnknown:
+		p, ok := t.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+		pod = p
+	default:
+		return
+	}
+
+	if pod == nil {
+		return
+	}
+
+	// Only process gateway pods on the local node (or pods that were on the local node)
+	if pod.Spec.NodeName != "" && pod.Spec.NodeName != c.config.NodeName {
+		return
+	}
+
+	// Resolve the NAT gateway dp name from pod name or labels
+	gwName := ""
+	if strings.HasPrefix(pod.Name, "vpc-nat-gw-") && strings.HasSuffix(pod.Name, "-0") {
+		gwName = strings.TrimSuffix(strings.TrimPrefix(pod.Name, "vpc-nat-gw-"), "-0")
+	}
+	if gwName == "" && pod.Labels != nil {
+		gwName = pod.Labels[util.VpcNatGatewayNameLabel]
+	}
+	if gwName == "" {
+		return
+	}
+
+	eips, err := c.eipLister.List(labels.Everything())
+	if err != nil {
+		return
+	}
+	for _, eip := range eips {
+		if eip.Spec.NatGwDp == gwName && eip.Annotations[util.BgpAnnotation] == "true" {
+			klog.V(3).Infof("enqueue iptables-eip %s due to local NAT GW pod %s event (phase=%s, deleting=%v)",
+				eip.Name, pod.Name, pod.Status.Phase, !pod.DeletionTimestamp.IsZero())
+			c.eipQueue.Add(eip.Name)
+		}
+	}
 }
 
 // enqueueAddNodeRouteEIP handles add events for IptablesEIP in node route mode.
@@ -256,9 +317,9 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 	return errors.Join(errs...)
 }
 
-// hasNatGwPodOnLocalNode checks if the NAT gateway pod for this EIP is running on the local node.
+// hasNatGwPodOnLocalNode checks if the NAT gateway pod for this EIP is running and healthy on the local node.
 // NAT gateway pod name follows the pattern: vpc-nat-gw-{natGwDp}-0
-// Returns true only if the pod exists, is Running, and is scheduled on the local node.
+// Returns true only if the pod exists, is Running, is Ready, not Terminating, and dataplane-ready!=false.
 func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	if eip.Spec.NatGwDp == "" {
 		klog.Errorf("iptables-eip %s has empty NatGwDp field", eip.Name)
@@ -273,8 +334,37 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 		return false
 	}
 
-	// Only announce routes for Running pods on local node
-	return pod.Spec.NodeName == c.config.NodeName && pod.Status.Phase == corev1.PodRunning
+	// 1. Must be scheduled on the local node
+	if pod.Spec.NodeName != c.config.NodeName {
+		return false
+	}
+
+	// 2. Must not be terminating (trigger fast BGP route withdraw on failover/shutdown)
+	if !pod.DeletionTimestamp.IsZero() {
+		klog.Infof("NAT GW pod %s is terminating, withdrawing BGP routes on node %s", podName, c.config.NodeName)
+		return false
+	}
+
+	// 3. Must be in Running phase
+	if pod.Status.Phase != corev1.PodRunning {
+		klog.V(3).Infof("NAT GW pod %s is in phase %s, withdrawing BGP routes", podName, pod.Status.Phase)
+		return false
+	}
+
+	// 4. Must not be fenced by dataplane-ready=false annotation
+	if pod.Annotations != nil && pod.Annotations["ovn.kubernetes.io/dataplane-ready"] == "false" {
+		klog.Infof("NAT GW pod %s has dataplane-ready=false annotation, withdrawing BGP routes", podName)
+		return false
+	}
+
+	// 5. Must satisfy PodReady condition
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+
+	return true
 }
 
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.

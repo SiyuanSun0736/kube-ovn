@@ -189,6 +189,73 @@ func TestHasNatGwPodOnLocalNode(t *testing.T) {
 			wantResult: false,
 		},
 		{
+			name: "local pod terminating",
+			eip: &kubeovnv1.IptablesEIP{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-eip"},
+				Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "test-gw"},
+			},
+			nodeName:  "node1",
+			namespace: "kube-system",
+			pods: map[string]*corev1.Pod{
+				"kube-system/" + util.GenNatGwPodName("test-gw"): {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              util.GenNatGwPodName("test-gw"),
+						Namespace:         "kube-system",
+						DeletionTimestamp: &metav1.Time{},
+					},
+					Spec:   corev1.PodSpec{NodeName: "node1"},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			wantResult: false,
+		},
+		{
+			name: "local pod dataplane-ready false",
+			eip: &kubeovnv1.IptablesEIP{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-eip"},
+				Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "test-gw"},
+			},
+			nodeName:  "node1",
+			namespace: "kube-system",
+			pods: map[string]*corev1.Pod{
+				"kube-system/" + util.GenNatGwPodName("test-gw"): {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        util.GenNatGwPodName("test-gw"),
+						Namespace:   "kube-system",
+						Annotations: map[string]string{"ovn.kubernetes.io/dataplane-ready": "false"},
+					},
+					Spec:   corev1.PodSpec{NodeName: "node1"},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			wantResult: false,
+		},
+		{
+			name: "local pod not ready condition",
+			eip: &kubeovnv1.IptablesEIP{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-eip"},
+				Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "test-gw"},
+			},
+			nodeName:  "node1",
+			namespace: "kube-system",
+			pods: map[string]*corev1.Pod{
+				"kube-system/" + util.GenNatGwPodName("test-gw"): {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      util.GenNatGwPodName("test-gw"),
+						Namespace: "kube-system",
+					},
+					Spec: corev1.PodSpec{NodeName: "node1"},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+						},
+					},
+				},
+			},
+			wantResult: false,
+		},
+		{
 			name: "missing pod",
 			eip: &kubeovnv1.IptablesEIP{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-eip"},
