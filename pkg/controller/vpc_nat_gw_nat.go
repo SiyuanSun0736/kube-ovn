@@ -2105,16 +2105,7 @@ func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 		op = natGwStatelessFipAdd
 	}
 
-	var firstErr error
-	for _, gwPod := range gwPods {
-		if err = c.execNatGwRules(gwPod, op, addRules); err != nil {
-			klog.Errorf("failed to create fip in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.execNatGwRulesOnPods(gwPods, op, addRules, "create fip")
 }
 
 // finalDeleteFipInPod resolves (natGwDp, v4ip) from the FIP CR's Status,
@@ -2390,20 +2381,7 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 		// In stateless mode, rule matches "eip,internalIp" or eip
 		rules = []string{fmt.Sprintf("%s,", v4ip)}
 	}
-	var firstErr error
-	for _, gwPod := range gwPods {
-		if !gwPod.DeletionTimestamp.IsZero() || gwPod.Status.Phase != corev1.PodRunning {
-			klog.V(4).Infof("nat gw pod %s/%s not running or terminating during delete, skip pod-level cleanup", gwPod.Namespace, gwPod.Name)
-			continue
-		}
-		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
-			klog.Errorf("failed to delete fip in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.execNatGwRulesOnPods(gwPods, op, rules, "delete fip")
 }
 
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
@@ -2422,16 +2400,7 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 		op = natGwStatelessDnatAdd
 	}
 
-	var firstErr error
-	for _, gwPod := range gwPods {
-		if err = c.execNatGwRules(gwPod, op, addRules); err != nil {
-			klog.Errorf("failed to create dnat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.execNatGwRulesOnPods(gwPods, op, addRules, "create dnat")
 }
 
 func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) error {
@@ -2471,20 +2440,7 @@ func (c *Controller) deleteDnatInPodWithInternal(dp, protocol, v4ip, externalPor
 		rules = []string{fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)}
 	}
 
-	var firstErr error
-	for _, gwPod := range gwPods {
-		if !gwPod.DeletionTimestamp.IsZero() || gwPod.Status.Phase != corev1.PodRunning {
-			klog.V(4).Infof("nat gw pod %s/%s not running or terminating during delete, skip pod-level cleanup", gwPod.Namespace, gwPod.Name)
-			continue
-		}
-		if err = c.execNatGwRules(gwPod, op, rules); err != nil {
-			klog.Errorf("failed to delete dnat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.execNatGwRulesOnPods(gwPods, op, rules, "delete dnat")
 }
 
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
@@ -2580,16 +2536,7 @@ func (c *Controller) deleteSnatInPodWithMember(dp, v4ip, internalCIDR, memberID 
 	var delRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
 	delRules = append(delRules, rule)
-	var firstErr error
-	for _, gwPod := range gwPods {
-		if err = c.execNatGwRules(gwPod, op, delRules); err != nil {
-			klog.Errorf("failed to delete snat in pod %s/%s, err: %v", gwPod.Namespace, gwPod.Name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.execNatGwRulesOnPods(gwPods, op, delRules, "delete snat")
 }
 
 func (c *Controller) updateIptableLabels(name, op, natType string, labels map[string]string) error {
@@ -2880,4 +2827,27 @@ func resolveRecordedSnatMemberID(snat *kubeovnv1.IptablesSnatRule, eip *kubeovnv
 		}
 	}
 	return ""
+}
+
+// execNatGwRulesOnPods runs NAT gateway commands across a set of pods, skipping pods that are
+// terminating or not running to avoid blocking and timing out during deletions or rollouts.
+func (c *Controller) execNatGwRulesOnPods(gwPods []*corev1.Pod, op string, rules []string, actionName string) error {
+	var firstErr error
+	for _, gwPod := range gwPods {
+		if gwPod == nil {
+			continue
+		}
+		if !gwPod.DeletionTimestamp.IsZero() || gwPod.Status.Phase != corev1.PodRunning {
+			klog.V(4).Infof("nat gw pod %s/%s not running or terminating, skip %s pod-level execution",
+				gwPod.Namespace, gwPod.Name, actionName)
+			continue
+		}
+		if err := c.execNatGwRules(gwPod, op, rules); err != nil {
+			klog.Errorf("failed to %s in pod %s/%s, err: %v", actionName, gwPod.Namespace, gwPod.Name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
