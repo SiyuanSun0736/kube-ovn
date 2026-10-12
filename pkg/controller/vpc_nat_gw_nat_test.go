@@ -532,6 +532,24 @@ func TestDeleteDnatInPod_NatGwExistsPodMissing(t *testing.T) {
 	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
+func TestDeleteDnatInPodWithMember_NatGwGone(t *testing.T) {
+	t.Parallel()
+	fc, err := newFakeControllerWithOptions(t, nil)
+	require.NoError(t, err)
+	err = fc.fakeController.deleteDnatInPodWithInternalAndMember("missing-gw", "tcp", "10.0.0.1", "80", "192.168.1.10", "8080", "member-1")
+	require.NoError(t, err, "should skip cleanup when gateway CRD is gone")
+}
+
+func TestDeleteDnatInPodWithMember_NatGwExistsPodMissing(t *testing.T) {
+	t.Parallel()
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("test-gw")},
+	})
+	require.NoError(t, err)
+	err = fc.fakeController.deleteDnatInPodWithInternalAndMember("test-gw", "tcp", "10.0.0.1", "80", "192.168.1.10", "8080", "member-1")
+	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
+}
+
 // TestDeleteSnatInPod_NatGwGone verifies that deleteSnatInPod returns nil when
 // the VpcNatGateway CRD no longer exists.
 func TestDeleteSnatInPod_NatGwGone(t *testing.T) {

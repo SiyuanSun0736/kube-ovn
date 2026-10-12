@@ -601,3 +601,31 @@ func TestGetExternalSubnetNad(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleUpdateVpcEip_CascadesExternalSubnet(t *testing.T) {
+	vpcNatEnabled = "true"
+	gw := fakeGw("test-gw")
+	gw.Spec.ExternalSubnets = []string{"new-subnet"}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-eip",
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			NatGwDp:        "test-gw",
+			ExternalSubnet: "old-subnet",
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+		Pods:           []*corev1.Pod{runningNatGwPod("test-gw")},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleUpdateVpcEip("test-gw")
+	require.NoError(t, err)
+
+	updatedEip, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "test-eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "new-subnet", updatedEip.Spec.ExternalSubnet)
+}

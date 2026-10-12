@@ -702,9 +702,15 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 	}
 
 	// Only exclusive DNAT reaches this worker. Share objects are Service accounting records.
-	if err = c.createDnatInPod(gwName, dnat.Spec.Protocol,
+	memberID := getMemberIDFromMeta(dnat.Labels, dnat.Annotations)
+	if memberID == "" && dnat.Spec.EIP != "" {
+		if eip, err := c.iptablesEipsLister.Get(dnat.Spec.EIP); err == nil && eip != nil {
+			memberID = getMemberIDFromMeta(eip.Labels, eip.Annotations)
+		}
+	}
+	if err = c.createDnatInPodWithMember(gwName, dnat.Spec.Protocol,
 		v4ip, dnat.Spec.InternalIP,
-		dnat.Spec.ExternalPort, dnat.Spec.InternalPort); err != nil {
+		dnat.Spec.ExternalPort, dnat.Spec.InternalPort, memberID); err != nil {
 		klog.Errorf("failed to create dnat, %v", err)
 		return err
 	}
@@ -935,9 +941,15 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		c.enqueueDeletingOldIptablesEip(cachedDnat.Annotations[util.VpcEipAnnotation], cachedDnat.Spec.EIP)
 
 		// Only exclusive DNAT reaches this worker.
-		if err = c.createDnatInPod(eip.Spec.NatGwDp, newProtocol,
+		memberID := getMemberIDFromMeta(cachedDnat.Labels, cachedDnat.Annotations)
+		if memberID == "" && cachedDnat.Spec.EIP != "" {
+			if eip, err := c.iptablesEipsLister.Get(cachedDnat.Spec.EIP); err == nil && eip != nil {
+				memberID = getMemberIDFromMeta(eip.Labels, eip.Annotations)
+			}
+		}
+		if err = c.createDnatInPodWithMember(eip.Spec.NatGwDp, newProtocol,
 			newV4ip, newInternalIP,
-			newExternalPort, newInternalPort); err != nil {
+			newExternalPort, newInternalPort, memberID); err != nil {
 			klog.Errorf("failed to create dnat %s, %v", key, err)
 			return err
 		}
@@ -988,9 +1000,15 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			return nil
 		}
 
-		if err = c.createDnatInPod(cachedDnat.Status.NatGwDp, cachedDnat.Status.Protocol,
+		memberID := getMemberIDFromMeta(cachedDnat.Labels, cachedDnat.Annotations)
+		if memberID == "" && cachedDnat.Spec.EIP != "" {
+			if eip, err := c.iptablesEipsLister.Get(cachedDnat.Spec.EIP); err == nil && eip != nil {
+				memberID = getMemberIDFromMeta(eip.Labels, eip.Annotations)
+			}
+		}
+		if err = c.createDnatInPodWithMember(cachedDnat.Status.NatGwDp, cachedDnat.Status.Protocol,
 			cachedDnat.Status.V4ip, cachedDnat.Status.InternalIP,
-			cachedDnat.Status.ExternalPort, cachedDnat.Status.InternalPort); err != nil {
+			cachedDnat.Status.ExternalPort, cachedDnat.Status.InternalPort, memberID); err != nil {
 			klog.Errorf("failed to create dnat %s, %v", key, err)
 			return err
 		}
@@ -1808,6 +1826,9 @@ func (c *Controller) patchDnatLabel(key string, rule *kubeovnv1.IptablesDnatRule
 	if err != nil {
 		return fmt.Errorf("failed to get eip %s of dnat %s: %w", rule.Spec.EIP, key, err)
 	}
+	eipMember := getMemberIDFromMeta(eip.Labels, eip.Annotations)
+	currentMember := dnat.Labels[util.NatGatewayMemberLabel]
+
 	if len(dnat.Labels) == 0 {
 		op = "add"
 		dnat.Labels = map[string]string{
@@ -1816,16 +1837,25 @@ func (c *Controller) patchDnatLabel(key string, rule *kubeovnv1.IptablesDnatRule
 			util.EipV4IpLabel:           eip.Spec.V4ip,
 			util.EipUIDLabel:            string(eip.UID),
 		}
+		if eipMember != "" {
+			dnat.Labels[util.NatGatewayMemberLabel] = eipMember
+		}
 		needUpdateLabel = true
 	} else if dnat.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
 		dnat.Labels[util.VpcDnatEPortLabel] != dnat.Spec.ExternalPort ||
 		dnat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
-		dnat.Labels[util.EipUIDLabel] != string(eip.UID) {
+		dnat.Labels[util.EipUIDLabel] != string(eip.UID) ||
+		currentMember != eipMember {
 		op = "replace"
 		dnat.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		dnat.Labels[util.VpcDnatEPortLabel] = dnat.Spec.ExternalPort
 		dnat.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
 		dnat.Labels[util.EipUIDLabel] = string(eip.UID)
+		if eipMember != "" {
+			dnat.Labels[util.NatGatewayMemberLabel] = eipMember
+		} else {
+			delete(dnat.Labels, util.NatGatewayMemberLabel)
+		}
 		needUpdateLabel = true
 	}
 	if needUpdateLabel {
@@ -2228,10 +2258,11 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 	if statusInternalPort == "" {
 		statusInternalPort = cachedDnat.Spec.InternalPort
 	}
+	memberID := getMemberIDFromMeta(cachedDnat.Labels, cachedDnat.Annotations)
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("dnat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
-	} else if err := c.deleteDnatInPodWithInternal(statusNatGwDp, statusProtocol,
-		statusV4ip, statusExternalPort, statusInternalIP, statusInternalPort); err != nil {
+	} else if err := c.deleteDnatInPodWithInternalAndMember(statusNatGwDp, statusProtocol,
+		statusV4ip, statusExternalPort, statusInternalIP, statusInternalPort, memberID); err != nil {
 		klog.Errorf("failed to delete dnat %s, %v", key, err)
 		firstErr = err
 	}
@@ -2257,7 +2288,7 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 			return firstErr
 		}
 		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || specProtocol != statusProtocol || specExternalPort != statusExternalPort {
-			if err = c.deleteDnatInPodWithInternal(specNatGwDp, specProtocol, specV4ip, specExternalPort, cachedDnat.Spec.InternalIP, cachedDnat.Spec.InternalPort); err != nil {
+			if err = c.deleteDnatInPodWithInternalAndMember(specNatGwDp, specProtocol, specV4ip, specExternalPort, cachedDnat.Spec.InternalIP, cachedDnat.Spec.InternalPort, memberID); err != nil {
 				klog.Errorf("failed spec-based cleanup for dnat %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2385,10 +2416,21 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 }
 
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
+	return c.createDnatInPodWithMember(dp, protocol, v4ip, internalIP, externalPort, internalPort, "")
+}
+
+func (c *Controller) createDnatInPodWithMember(dp, protocol, v4ip, internalIP, externalPort, internalPort, memberID string) error {
 	gwPods, err := c.getNatGwPods(dp, c.natGwNamespaceByName(dp), false)
 	if err != nil {
 		klog.Errorf("failed to get nat gw pods, %v", err)
 		return err
+	}
+	if memberID != "" {
+		gwPods, err = c.filterNatGwPodsByMember(gwPods, memberID)
+		if err != nil {
+			klog.Errorf("failed to filter nat gw pods for member %s: %v", memberID, err)
+			return err
+		}
 	}
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
@@ -2408,6 +2450,10 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 }
 
 func (c *Controller) deleteDnatInPodWithInternal(dp, protocol, v4ip, externalPort, internalIP, internalPort string) error {
+	return c.deleteDnatInPodWithInternalAndMember(dp, protocol, v4ip, externalPort, internalIP, internalPort, "")
+}
+
+func (c *Controller) deleteDnatInPodWithInternalAndMember(dp, protocol, v4ip, externalPort, internalIP, internalPort, memberID string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.
@@ -2427,6 +2473,13 @@ func (c *Controller) deleteDnatInPodWithInternal(dp, protocol, v4ip, externalPor
 			klog.Error(err)
 		}
 		return err
+	}
+	if memberID != "" {
+		gwPods, err = c.filterNatGwPodsByMember(gwPods, memberID)
+		if err != nil {
+			klog.Errorf("failed to filter nat gw pods for member %s: %v", memberID, err)
+			return err
+		}
 	}
 
 	stateless := c.isStatelessDpMode(dp)

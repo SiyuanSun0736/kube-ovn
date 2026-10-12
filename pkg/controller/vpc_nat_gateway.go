@@ -415,6 +415,9 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 			return err
 		}
 	}
+	if !slices.Equal(gw.Spec.ExternalSubnets, gw.Status.ExternalSubnets) {
+		c.updateVpcEipQueue.Add(key)
+	}
 
 	// Share-DNAT VIP state is written by Service reconcile only. Instance replacement is replayed
 	// through handleUpdateVpcDnat, which enqueues the Services after the gateway is ready.
@@ -667,6 +670,19 @@ func (c *Controller) handleUpdateVpcEip(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	gw, err := c.vpcNatGatewayLister.Get(natGwKey)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Error(err)
+		return err
+	}
+	targetExternalSubnet := ""
+	if len(gw.Spec.ExternalSubnets) > 0 && gw.Spec.ExternalSubnets[0] != "" {
+		targetExternalSubnet = gw.Spec.ExternalSubnets[0]
+	}
+
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
 		err = fmt.Errorf("failed to get eip list, %w", err)
@@ -675,7 +691,19 @@ func (c *Controller) handleUpdateVpcEip(natGwKey string) error {
 	}
 	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, eip := range eips {
-		if eip.Spec.NatGwDp == natGwKey && eip.Status.Redo != natGwCreatedAT {
+		if eip.Spec.NatGwDp != natGwKey {
+			continue
+		}
+		if targetExternalSubnet != "" && eip.Spec.ExternalSubnet != targetExternalSubnet {
+			klog.Infof("cascading externalSubnet %s to eip %s for nat gw %s", targetExternalSubnet, eip.Name, natGwKey)
+			eipCopy := eip.DeepCopy()
+			eipCopy.Spec.ExternalSubnet = targetExternalSubnet
+			if _, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Update(context.Background(), eipCopy, metav1.UpdateOptions{}); err != nil {
+				klog.Errorf("failed to cascade externalSubnet for eip %s, %v", eip.Name, err)
+				return err
+			}
+		}
+		if eip.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo eip %s", eip.Name)
 			if err = c.patchEipStatus(eip.Name, "", natGwCreatedAT, "", false); err != nil {
 				klog.Errorf("failed to update eip '%s' to re-apply, %v", eip.Name, err)
