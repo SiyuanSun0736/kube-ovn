@@ -77,15 +77,13 @@ function show_help() {
     echo "  eip-add                  - Add external IP"
     echo "  eip-del                  - Delete external IP"
     echo "  vip-addr-sync            - Hold exactly the given share-DNAT VIPs (Service ClusterIPs) on lo"
-    echo "  vip-hairpin-add          - Add a per-identity hairpin SNAT rule for a VIP"
-    echo "  vip-hairpin-del          - Delete a per-identity hairpin SNAT rule for a VIP"
     echo "  floating-ip-add          - Add floating IP mapping"
     echo "  floating-ip-del          - Delete floating IP mapping"
     echo "  dnat-add                 - Add DNAT rule"
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
     echo "  nft-dnat-map-del         - Delete nft map-based DNAT rule (Share type)"
-    echo "  nft-lanvip-sync          - Reconcile lanIP-as-Service-VIP identities to exactly the given complete set (empty wipes them, including their SNAT)"
+    echo "  nft-lanvip-sync          - Reconcile lanIP-as-Service-VIP identities to exactly the given complete set (empty wipes them)"
     echo "  snat-add                 - Add SNAT rule"
     echo "  snat-del                 - Delete SNAT rule"
     echo "  qos-add                  - Add QoS rule"
@@ -163,6 +161,11 @@ function init() {
     echo "VPC_INTERFACE=$VPC_INTERFACE" > "$NAT_GW_ENV_FILE"
     echo "EXTERNAL_INTERFACE=$EXTERNAL_INTERFACE" >> "$NAT_GW_ENV_FILE"
 
+    # The hairpin SNAT chain is a single rule, rebuilt on every init so that a gateway
+    # initialized by an older version converges onto it. This runs before the init-once guard.
+    ensure_hairpin_snat
+    ensure_exclusive_snat_oif
+
     # run once is enough
     $iptables_save_cmd | grep DNAT_FILTER && exit 0
     # add static chain
@@ -175,7 +178,6 @@ function init() {
     $iptables_cmd -t nat -N EXCLUSIVE_SNAT # floatingIp SNAT
     $iptables_cmd -t nat -N SHARED_DNAT
     $iptables_cmd -t nat -N SHARED_SNAT
-    $iptables_cmd -t nat -N HAIRPIN_SNAT
     $iptables_cmd -t mangle -N VPC_MARK
 
     $iptables_cmd -t nat -A PREROUTING -j DNAT_FILTER
@@ -279,15 +281,6 @@ function add_eip() {
         eip_without_prefix=(${eip//\// })
         exec_cmd "ip addr replace $eip dev $EXTERNAL_INTERFACE"
         exec_cmd "arping -I $EXTERNAL_INTERFACE -c 3 -U $eip_without_prefix"
-
-        # Add hairpin SNAT rule for this EIP
-        # This rule SNATs traffic originating from the VPC and targeting an EIP back to the same EIP
-        # when it is DNAT'd and routed back to the VPC. This avoids asymmetric routing issues.
-        local hairpin_rule="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT --ctorigdst $eip_without_prefix -j SNAT --to-source $eip_without_prefix"
-        # Check if the rule already exists to maintain idempotency
-        if ! $iptables_cmd -t nat -C HAIRPIN_SNAT $hairpin_rule --random-fully >/dev/null 2>&1; then
-            exec_cmd "$iptables_cmd -t nat -A HAIRPIN_SNAT $hairpin_rule --random-fully"
-        fi
     done
 
     # Use "onlink" to skip the kernel's "gateway must be directly reachable" check.
@@ -316,49 +309,92 @@ function del_eip() {
         if [ -n "$ipCidr" ]; then
             exec_cmd "ip addr del $ipCidr dev $EXTERNAL_INTERFACE"
         fi
-
-        # Remove hairpin SNAT rule for this EIP
-        local hairpin_rule="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT --ctorigdst $eip_without_prefix -j SNAT --to-source $eip_without_prefix"
-        # Check if the rule exists before attempting to delete it
-        if $iptables_cmd -t nat -C HAIRPIN_SNAT $hairpin_rule --random-fully >/dev/null 2>&1; then
-            exec_cmd "$iptables_cmd -t nat -D HAIRPIN_SNAT $hairpin_rule --random-fully"
-        fi
     done
+}
+
+# ===== hairpin SNAT =====
+#
+# One rule covers VPC-originated DNAT traffic forwarded back out the VPC interface.
+# DNAT to a gateway-local service takes INPUT instead and preserves the client address:
+#
+#   -A HAIRPIN_SNAT -m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT \
+#      -j MASQUERADE --random-fully
+#
+# The three match conditions together describe exactly one thing: traffic that entered from the
+# VPC (the 0x1 mark is set by the mangle VPC_MARK rule on $VPC_INTERFACE), was DNAT'd by this
+# gateway, and leaves towards the VPC again. That is a VPC client reaching a VIP this gateway
+# holds - an EIP/FIP, a Service ClusterIP, or the gateway's own lanIP as a Service VIP. Without
+# the SNAT the backend would answer the client directly, bypassing the gateway that holds the
+# conntrack entry, and the client would drop the reply because it comes from the backend address
+# instead of the VIP.
+#
+# MASQUERADE is the source address the kernel picks for the output interface, i.e. the gateway's
+# own VPC-side address (its lanIP, each replica its own). It is the only correct source here:
+#   - the reply must come back to the instance that holds the conntrack entry, so the source has
+#     to be instance-local; a VIP can be routed to another replica that knows nothing about the
+#     connection;
+#   - it needs no VPC default route to pull the reply back, the lanIP is directly connected;
+#   - it follows the interface, so an address change or a pod rescheduling needs no rule update
+#     (the kernel also drops the conntrack entries of an address that goes away).
+# This is the same rule the kernel's own masquerading does for any hairpinned NAT, which is why
+# one wildcard rule is enough and no per-EIP or per-identity bookkeeping is needed.
+#
+# Egress is the mirror case and is deliberately untouched: packets leaving through
+# $EXTERNAL_INTERFACE are matched by EXCLUSIVE_SNAT / SHARED_SNAT and must be SNAT'd to the EIP,
+# that is what external networks accept. Source address follows output interface: VPC side the
+# lanIP for forwarded DNAT traffic, external side the EIP. FIP clients forwarded out the
+# VPC interface without DNAT now retain their original source instead of being SNAT'd to EIP.
+
+# Both ensure_* functions below are the install path of this rule and, at the same time, the
+# only way an already programmed gateway converges onto it. A Pod only ever runs init once
+# (the controller gates it on the pod annotation ovn.kubernetes.io/vpc_nat_gw_init and patches
+# it after a successful run), and a Pod that has no such annotation is a new Pod with an empty
+# network namespace - so on an image upgrade there is nothing to migrate. The state they do
+# find is the one of a gateway whose script was hot-replaced through natGwScriptHostPath and
+# whose init was then run by hand: that deployment keeps its Pod, and with it the rules an
+# older script installed. Rule updates affect new connections; existing conntrack mappings
+# remain until they expire or are explicitly removed.
+
+function ensure_hairpin_snat() {
+    # Rebuilt from scratch: a gateway programmed by an older script carries per-EIP and
+    # per-identity hairpin rules (and nft hairpin chains for the lanVIP feature), which this
+    # single rule replaces.
+    $iptables_cmd -t nat -N HAIRPIN_SNAT >/dev/null 2>&1 || true
+    exec_cmd "$iptables_cmd -t nat -F HAIRPIN_SNAT"
+    exec_cmd "$iptables_cmd -t nat -A HAIRPIN_SNAT -m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j MASQUERADE --random-fully"
+    nft_transaction_ignore_errors \
+        "flush chain ip $NFT_TABLE $NFT_LEGACY_POSTROUTING_CHAIN" \
+        "delete chain ip $NFT_TABLE $NFT_LEGACY_POSTROUTING_CHAIN" \
+        "flush chain ip $NFT_TABLE $NFT_LEGACY_LANVIP_SNAT_CHAIN" \
+        "delete chain ip $NFT_TABLE $NFT_LEGACY_LANVIP_SNAT_CHAIN"
+}
+
+function ensure_exclusive_snat_oif() {
+    # FIP egress SNAT must be scoped to the external interface. Rules written by an older script
+    # carry no -o and therefore also match the VPC-bound hairpin traffic of their own client,
+    # SNATing it to that client's EIP before HAIRPIN_SNAT is reached. add_floating_ip returns
+    # early once the FIP's DNAT rule exists, so it never repairs them: rewrite them here.
+    # FIP rules are 1:1 and non-overlapping, so moving one to the end of the chain changes
+    # nothing.
+    local saved_rule
+    while IFS= read -r saved_rule
+    do
+        [ -z "$saved_rule" ] && continue
+        saved_rule=${saved_rule#-A }
+        exec_cmd "$iptables_cmd -t nat -D $saved_rule"
+        exec_cmd "$iptables_cmd -t nat -A EXCLUSIVE_SNAT -o $EXTERNAL_INTERFACE ${saved_rule#EXCLUSIVE_SNAT }"
+    done <<< "$($iptables_save_cmd -t nat | grep -- '-A EXCLUSIVE_SNAT ' | grep -v -- ' -o ' || true)"
 }
 
 # ===== share-DNAT VIPs (nftable LoadBalancer services) =====
 #
 # A Service handled by the nft share-DNAT feature is reachable from the VPC both through its EIP
-# and through its ClusterIP. Both are programmed as nft share-DNAT identities by the controller
-# and both need the same local support here:
-#   - the ClusterIP is held on lo (/32) so the gateway owns the VIP locally;
-#   - VPC-originated traffic that was DNAT'd back into the VPC is SNAT'd to this gateway's own VPC
-#     address, so the backend's reply returns to the exact instance that holds the conntrack.
-#
-# The SNAT source is deliberately the gateway's own address and not the VIP: with more than one
-# gateway replica, a reply addressed to the VIP can be load balanced to another replica, which has
-# no conntrack entry for the connection. The gateway's own address is instance-local, so the reply
-# always lands on the replica that performed the DNAT. (add_eip keeps its VIP-wide rule that SNATs
-# to the EIP for hand-managed EIP/FIP rules; the per-identity rules added here are more specific
-# and are inserted before it, see vip_hairpin_add.)
-#
-# TODO: unify the hairpin SNAT source on the gateway's own VPC-side address. The HAIRPIN_SNAT chain
-# currently carries two policies: add_eip/del_eip install one VIP-wide rule per EIP that SNATs to
-# the EIP itself (pre-existing, and the only one a hand-managed EIP rule has), while vip_hairpin_add
-# installs a per-identity rule that SNATs to the instance's own address (this feature). Only the
-# second is correct when the gateway has more than one replica, because an EIP-sourced reply is
-# delivered to whichever replica the VIP is routed to, which has no conntrack for the connection;
-# a single-replica gateway happens to be correct either way (its VPC address is spec.lanIp).
-# Unifying therefore means: build every hairpin rule with the gateway instance's VPC address as the
-# source (that is what "the gateway's lanIp" is in the single-replica case, and each replica's own
-# address under HA), and let that one rule shape cover the VIPs of this feature as well (including
-# the ClusterIPs, which have no EIP and so get no add_eip rule today, and which is why the
-# per-identity rules exist). The egress SNAT rules are not affected: EXCLUSIVE_SNAT and SHARED_SNAT
-# must keep SNATing to the EIP, that is what egress NAT means.
+# and through its ClusterIP. The ClusterIP is held on lo (/32) so the gateway owns the VIP
+# locally; the hairpin SNAT above needs no per-VIP support.
 
 function local_vpc_ipv4() {
-    # The address the gateway uses to talk to the VPC. Each replica has its own, which is what
-    # makes the hairpin SNAT instance-local.
+    # The address the gateway uses to talk to the VPC, used to scope the lanVIP identities this
+    # instance owns.
     local ip
     ip=$(ip -4 addr show dev "$VPC_INTERFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
     if [ -z "$ip" ]; then
@@ -401,100 +437,6 @@ function vip_addr_sync() {
     done
 }
 
-function vip_hairpin_add() {
-    check_inited
-    local local_ip
-    local_ip=$(local_vpc_ipv4) || exit 1
-    for rule in "$@"
-    do
-        IFS=',' read -r vip port protocol <<< "$rule"
-        # The controller may pass the protocol in either case (like add_nft_dnat_map accepts);
-        # the kernel only knows the lower case names.
-        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
-        if [ -z "$vip" ] || [ -z "$port" ] || [ -z "$protocol" ]; then
-            echo "Error: invalid vip-hairpin-add rule: $rule" >&2
-            exit 1
-        fi
-        if ! [[ "$vip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-            echo "Error: invalid vip in vip-hairpin-add rule: $vip" >&2
-            exit 1
-        fi
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            echo "Error: invalid port in vip-hairpin-add rule: $port" >&2
-            exit 1
-        fi
-        case "$protocol" in
-            tcp|udp) ;;
-            *)
-                echo "Error: invalid protocol in vip-hairpin-add rule: $protocol" >&2
-                exit 1
-                ;;
-        esac
-
-        # --ctorigdstport matches the destination port before DNAT rewrote it, so the rule stays
-        # scoped to one service identity even though the packet's port is already the backend's.
-        # The stable comment lets deletion recover the complete installed rule (including its old
-        # --to-source) after the interface address changes or disappears.
-        local marker="kube-ovn-vip-hairpin-$protocol-$vip-$port"
-        local hairpin_rule="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -p $protocol -m conntrack --ctstate DNAT --ctorigdst $vip --ctorigdstport $port -m comment --comment $marker -j SNAT --to-source $local_ip"
-        if ! $iptables_cmd -t nat -C HAIRPIN_SNAT $hairpin_rule --random-fully >/dev/null 2>&1; then
-            # Insert at the head: add_eip installs a VIP-wide hairpin rule (SNAT to the EIP) that
-            # would otherwise match this traffic first and SNAT it to the VIP instead.
-            exec_cmd "$iptables_cmd -t nat -I HAIRPIN_SNAT 1 $hairpin_rule --random-fully"
-        fi
-    done
-}
-
-function vip_hairpin_del() {
-    # Deletion is idempotent and does not read the current interface address. The source address
-    # may have changed or disappeared since add; recover the exact installed rule by its stable
-    # identity comment so stale SNAT rules cannot survive either case.
-    for rule in "$@"
-    do
-        IFS=',' read -r vip port protocol <<< "$rule"
-        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
-        if [ -z "$vip" ] || [ -z "$port" ] || [ -z "$protocol" ]; then
-            echo "Error: invalid vip-hairpin-del rule: $rule" >&2
-            exit 1
-        fi
-        if ! [[ "$vip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-            echo "Error: invalid vip in vip-hairpin-del rule: $vip" >&2
-            exit 1
-        fi
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            echo "Error: invalid port in vip-hairpin-del rule: $port" >&2
-            exit 1
-        fi
-        case "$protocol" in
-            tcp|udp) ;;
-            *)
-                echo "Error: invalid protocol in vip-hairpin-del rule: $protocol" >&2
-                exit 1
-                ;;
-        esac
-
-        local marker="kube-ovn-vip-hairpin-$protocol-$vip-$port"
-        local saved_rules saved_rule
-        # Match the complete quoted comment: a bare substring search would also hit identities
-        # whose port only shares a decimal prefix (80 matches 8080).
-        saved_rules=$($iptables_save_cmd -t nat | grep HAIRPIN_SNAT | grep -F -- "\"$marker\"" || true)
-        while IFS= read -r saved_rule
-        do
-            [ -z "$saved_rule" ] && continue
-            saved_rule=$(echo "$saved_rule" | sed 's/^-A //')
-            saved_rule=${saved_rule//\"/}
-            if ! $iptables_cmd -t nat -D $saved_rule; then
-                # Another reconcile may have deleted the same rule after iptables-save.
-                # Only suppress the error when the desired absent state was reached.
-                if $iptables_cmd -t nat -C $saved_rule >/dev/null 2>&1; then
-                    >&2 echo "failed to delete hairpin rule \"$saved_rule\""
-                    exit 1
-                fi
-            fi
-        done <<< "$saved_rules"
-    done
-}
-
 function add_floating_ip() {
     # Strict validation before adding (FIP is 1:1, identity = EIP):
     # 1. If EIP rule does not exist -> create DNAT + SNAT rules
@@ -503,7 +445,7 @@ function add_floating_ip() {
     #
     # iptables-save output format:
     #   -A EXCLUSIVE_DNAT -d <eip>/32 -j DNAT --to-destination <internalIp>
-    #   -A EXCLUSIVE_SNAT -s <internalIp>/32 -j SNAT --to-source <eip>
+    #   -A EXCLUSIVE_SNAT -s <internalIp>/32 -o <ext_iface> -j SNAT --to-source <eip>
     # NOTE: Current FIP CRD/controller path sends one rule per invocation.
     # The for-loop is currently of limited practical value.
     # TODO: Consider removing the for-loop and avoid cache optimizations driven only by loop batching.
@@ -524,7 +466,9 @@ function add_floating_ip() {
             exit 1
         fi
         exec_cmd "$iptables_cmd -t nat -A EXCLUSIVE_DNAT -d $eip -j DNAT --to-destination $internalIp"
-        exec_cmd "$iptables_cmd -t nat -A EXCLUSIVE_SNAT -s $internalIp -j SNAT --to-source $eip"
+        # -o scopes the SNAT to egress: without it the rule also rewrites the VPC-bound hairpin
+        # traffic of this FIP's client, which must be masqueraded to the gateway's lanIP instead.
+        exec_cmd "$iptables_cmd -t nat -A EXCLUSIVE_SNAT -o $EXTERNAL_INTERFACE -s $internalIp -j SNAT --to-source $eip"
     done
 }
 
@@ -535,7 +479,7 @@ function del_floating_ip() {
     #
     # iptables-save output format:
     #   -A EXCLUSIVE_DNAT -d <eip>/32 -j DNAT --to-destination <internalIp>
-    #   -A EXCLUSIVE_SNAT -s <internalIp>/32 -j SNAT --to-source <eip>
+    #   -A EXCLUSIVE_SNAT -s <internalIp>/32 -o <ext_iface> -j SNAT --to-source <eip>
     # NOTE: Current FIP CRD/controller path sends one rule per invocation.
     # The for-loop is currently of limited practical value.
     # TODO: Consider removing the for-loop and avoid cache optimizations driven only by loop batching.
@@ -642,14 +586,8 @@ function del_snat() {
     done
 }
 
-# Hairpin SNAT: Enables internal VM to access another internal VM's EIP/FIP
-# Packet flow when VM A (internal) accesses VM B's EIP (external IP):
-# 1. VM A (10.0.1.6) -> EIP (10.1.69.216) arrives at NAT GW via VPC_INTERFACE
-# 2. DNAT translates destination to VM B's internal IP (10.0.1.11)
-# 3. Packet is now (src: 10.0.1.6, dst: 10.0.1.11) and routed back out VPC_INTERFACE
-# 4. Without hairpin SNAT, reply from VM B goes directly to VM A (same subnet or VPC),
-#    bypassing NAT GW. VM A expects reply from EIP, causing connection failure.
-# 5. Hairpin SNAT translates source to EIP, ensuring symmetric return path via NAT GW.
+# Hairpin: VM A reaching VM B's EIP/FIP from inside the VPC is handled by the single
+# HAIRPIN_SNAT rule, see ensure_hairpin_snat.
 function add_dnat() {
     # Strict validation before adding (DNAT identity = (EIP, ExternalPort, Protocol)):
     # 1. If identity does not exist -> create rule
@@ -741,11 +679,11 @@ NFT_SERVICES_MAP="service-ips"
 # injected into this chain would be silently wiped. Do NOT reuse NFT_PREROUTING_CHAIN for other
 # components; add a separate chain (or a different priority hook) if new prerouting rules are needed.
 NFT_PREROUTING_CHAIN="prerouting"
-# WARNING: these two chains are owned exclusively by the lanIP-as-Service-VIP feature.
-# sync_nft_lanvip flushes them on every sync and re-adds its single jump rule (base chain) /
-# its complete rule set (snat chain), so any other rule injected here would be silently wiped.
-NFT_POSTROUTING_CHAIN="postrouting"
-NFT_LANVIP_SNAT_CHAIN="lanvip-snat"
+# Legacy chains of the per-identity lanVIP hairpin SNAT, which the single HAIRPIN_SNAT rule
+# replaced. Nothing creates them any more; the names survive only so ensure_hairpin_snat can
+# remove the ones an older version left behind.
+NFT_LEGACY_POSTROUTING_CHAIN="postrouting"
+NFT_LEGACY_LANVIP_SNAT_CHAIN="lanvip-snat"
 
 # Generate a per-identity chain name from eip:port:protocol.
 # Uses md5 hash prefix for uniqueness (same idea as kube-proxy's hashAndTruncate).
@@ -1099,9 +1037,8 @@ function sync_nft_lanvip() {
     # by the VIP: only data-plane objects keyed by the gateway's own VPC address (or by a vip
     # named in the desired set) are touched; EIP/ClusterIP identities are never removed here.
     #
-    # Everything lives in the nft kube-ovn table: the DNAT maps plus a per-identity hairpin
-    # SNAT chain reached from a postrouting base chain, so the feature does not depend on the
-    # iptables HAIRPIN_SNAT chain at all.
+    # The DNAT maps live in the nft kube-ovn table; the hairpin SNAT for these identities is
+    # the single iptables HAIRPIN_SNAT rule (see ensure_hairpin_snat).
     check_inited
 
     local local_ip
@@ -1202,11 +1139,10 @@ function sync_nft_lanvip() {
             if [ "$wanted" = true ]; then
                 continue
             fi
-            # Same single-replica assumption as the hairpin-SNAT TODO above: the partition is
-            # scoped to the instance's own VPC address (spec.lanIp), so teardown also depends
-            # on local_vpc_ipv4 succeeding. Under HA the per-replica partitions must be keyed
-            # by their own VPC addresses, and a replica whose address lookup fails must skip
-            # the wipe rather than strand it.
+            # The partition is scoped to the instance's own VPC address (spec.lanIp), so
+            # teardown also depends on local_vpc_ipv4 succeeding. Under HA the per-replica
+            # partitions must be keyed by their own VPC addresses, and a replica whose address
+            # lookup fails must skip the wipe rather than strand it.
             if [ "$e_vip" = "$local_ip" ] || [ "$vip_scoped" = true ]; then
                 del_nft_dnat_map "$e_vip,$e_port,$e_proto"
             fi
@@ -1234,48 +1170,9 @@ function sync_nft_lanvip() {
         done
     fi
 
-    # Rebuild the lanVIP hairpin SNAT chains as a complete set. The SNAT source is this
-    # instance's own VPC address so a backend's reply always returns to the instance that holds
-    # the conntrack entry (same reason as the iptables hairpin for the EIP/ClusterIP VIPs).
-    if [ "$want_count" -gt 0 ]; then
-        local -a cmds=()
-        # `add chain` on an existing chain fails with EEXIST and rolls back this whole batch,
-        # so create the feature-owned chains only when they are missing. Existing chains still
-        # get flushed and re-rule'd below, which is what keeps the set rebuild complete.
-        if ! nft list chain ip "$NFT_TABLE" "$NFT_POSTROUTING_CHAIN" >/dev/null 2>&1; then
-            cmds+=("add chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN { type nat hook postrouting priority 100 ; }")
-        fi
-        if ! nft list chain ip "$NFT_TABLE" "$NFT_LANVIP_SNAT_CHAIN" >/dev/null 2>&1; then
-            cmds+=("add chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN")
-        fi
-        cmds+=(
-            "flush chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN"
-            "add rule ip $NFT_TABLE $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
-            "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
-        )
-        # The 0x1 packet mark comes from the gateway boot-time iptables mangle rule
-        # (VPC_MARK: `$iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK
-        # --set-xmark 0x1/0x1`), which labels connections that entered through the VPC
-        # interface. skb->mark is set on the packet itself, so the nft match sees it no
-        # matter whether the image's iptables binary is the legacy or the nf_tables backend;
-        # what matters is that the boot rule ran. Without the mark the rule would match every
-        # DNAT'd flow out of the VPC interface, not just VIP inbound ones.
-        for ((i=0; i<want_count; i++)); do
-            cmds+=("add rule ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN meta mark and 0x1 == 0x1 oifname \"$VPC_INTERFACE\" meta l4proto ${r_proto[$i]} ct status dnat ct original ip daddr ${r_vip[$i]} ct original proto-dst ${r_port[$i]} snat to $local_ip fully-random comment \"ko-lanvip-snat\"")
-        done
-        if ! nft_transaction "${cmds[@]}"; then
-            echo "Error: failed to rebuild lanvip snat chain"
-            exit 1
-        fi
-    else
-        # Drop the jump reference before deleting the chains it points at: deleting a still-
-        # referenced chain fails with EBUSY and would roll back the whole teardown batch.
-        nft_transaction_ignore_errors \
-            "flush chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN" \
-            "delete chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN" \
-            "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN" \
-            "delete chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
-    fi
+    # The hairpin SNAT for these identities is the single iptables HAIRPIN_SNAT rule (see
+    # ensure_hairpin_snat): it matches any DNAT'd flow going back to the VPC, so this feature
+    # needs no SNAT rules of its own.
 
     echo "Synced nft lanVIP identities: $want_count (instance vpc address $local_ip)"
 }
@@ -2257,14 +2154,6 @@ case $opt in
     vip-addr-sync)
         echo "vip-addr-sync $*"
         vip_addr_sync "$@"
-        ;;
-    vip-hairpin-add)
-        echo "vip-hairpin-add $*"
-        vip_hairpin_add "$@"
-        ;;
-    vip-hairpin-del)
-        echo "vip-hairpin-del $*"
-        vip_hairpin_del "$@"
         ;;
     dnat-add)
         echo "dnat-add $*"

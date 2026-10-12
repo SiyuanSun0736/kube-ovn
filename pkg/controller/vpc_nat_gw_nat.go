@@ -130,7 +130,7 @@ func (c *Controller) enqueueUpdateIptablesDnatRule(oldObj, newObj any) {
 	// The rule's identity is its address, and a rule that serves a ClusterIP carries no EIP: only a
 	// rule with neither address has nothing to reconcile. This enqueue is the redo's only entry
 	// point (redoDnat patches the status and nothing else), so rejecting an EIP-less rule here would
-	// leave the ClusterIP identity, its hairpin rule and its lo address unprogrammed on a gateway
+	// leave the ClusterIP identity and its lo address unprogrammed on a gateway
 	// instance that replaces the one they were programmed on.
 	if (newDnat.Spec.EIP == "" && newDnat.Spec.ClusterIP == "") || newDnat.Spec.ExternalPort == "" ||
 		newDnat.Spec.InternalIP == "" || newDnat.Spec.InternalPort == "" {

@@ -370,3 +370,10 @@ kube-ovn-tunnel-id-e2e:
 	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
 	ginkgo $(GINKGO_OUTPUT_OPT) $(GINKGO_PARALLEL_OPT) --randomize-all -v \
 		--focus="group:tunnel-id" ./test/e2e/tunnel-id/tunnel-id.test -- $(TEST_BIN_ARGS)
+
+# Data-plane test of the vpc-nat-gw hairpin SNAT against real resources (VpcNatGateway Pod,
+# IptablesEIP/IptablesFIPRule, workload Pods). Needs a cluster with vpc-nat-gw enabled and an
+# external subnet; see the script header for the preconditions.
+.PHONY: e2e-vpc-nat-gw-hairpin
+e2e-vpc-nat-gw-hairpin:
+	bash test/e2e/iptables-vpc-nat-gw/hairpin_snat_test.sh

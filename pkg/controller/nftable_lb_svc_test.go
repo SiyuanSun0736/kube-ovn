@@ -1384,7 +1384,6 @@ func Test_handleAddOrUpdateGwNftableLbService_gatesOffStillCleansUp(t *testing.T
 	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
 
 	require.Contains(t, execs, natGwNftDnatMapDel, "the leftover identities are removed from the gateway")
-	require.Contains(t, execs, natGwVipHairpinDel)
 	require.Contains(t, execs, natGwVipAddrSync, "the lo VIPs are released")
 	_, err = c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
 	require.True(t, k8serrors.IsNotFound(err), "the leftover accounting record is retired")
@@ -1871,7 +1870,6 @@ func Test_handleAddOrUpdateGwNftableLbService_claimBeforeRule(t *testing.T) {
 	rejectRecords = false
 	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(key))
 	require.Contains(t, execs, natGwNftDnatMapAdd)
-	require.Contains(t, execs, natGwVipHairpinAdd)
 	require.Contains(t, execs, natGwVipAddrSync)
 
 	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(),
@@ -2040,7 +2038,6 @@ func Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity(t *testin
 
 	for _, call := range execs {
 		require.NotEqual(t, natGwNftDnatMapDel, call.op, "the loser must not delete the winner's nft map")
-		require.NotEqual(t, natGwVipHairpinDel, call.op, "the loser must not delete the winner's hairpin")
 	}
 	added := false
 	for _, call := range execs {
@@ -2270,7 +2267,7 @@ func Test_cleanupNftableLbService_keepsSuccessorIdentity(t *testing.T) {
 
 	var eipDeletes, clusterIPDeletes int
 	for _, call := range execs {
-		if call.op != natGwNftDnatMapDel && call.op != natGwVipHairpinDel {
+		if call.op != natGwNftDnatMapDel {
 			continue
 		}
 		for _, rule := range call.rules {
@@ -2443,7 +2440,7 @@ func TestBuildNftableLbIdentities(t *testing.T) {
 	require.ElementsMatch(t, []string{"10.0.0.2:8080", "10.0.0.3:8080"}, got["10.96.1.5/80/tcp"].backends)
 }
 
-func TestBuildNftableLbPrograms(t *testing.T) {
+func TestSortedNftableLbIdentities(t *testing.T) {
 	t.Parallel()
 
 	records := map[string]*kubeovnv1.IptablesDnatRule{
@@ -2452,12 +2449,12 @@ func TestBuildNftableLbPrograms(t *testing.T) {
 			InternalIP: "10.0.0.2", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
 		}},
 	}
-	programs := buildNftableLbPrograms(records, "203.0.113.10")
-	require.Len(t, programs, 2)
-	require.Equal(t, "10.96.1.5,80,tcp", programs[0].hairpinRule)
-	require.Equal(t, "203.0.113.10,80,tcp", programs[1].hairpinRule)
-	require.Equal(t, []string{"10.0.0.2:8080"}, programs[0].identity.backends)
-	require.Equal(t, []string{"10.0.0.2:8080"}, programs[1].identity.backends)
+	identities := sortedNftableLbIdentities(records, "203.0.113.10")
+	require.Len(t, identities, 2)
+	require.Equal(t, "10.96.1.5", identities[0].vip)
+	require.Equal(t, "203.0.113.10", identities[1].vip)
+	require.Equal(t, []string{"10.0.0.2:8080"}, identities[0].backends)
+	require.Equal(t, []string{"10.0.0.2:8080"}, identities[1].backends)
 }
 
 func TestNftableLbExistingIdentities(t *testing.T) {

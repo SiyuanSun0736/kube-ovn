@@ -29,7 +29,8 @@ import (
 // The nftable LB service feature makes a vpc-nat-gw act like kube-proxy. Service and
 // EndpointSlice are the source of truth and the only trigger: this controller derives each
 // VIP:port:protocol identity and its complete backend set, then writes the gateway nft map,
-// hairpin rule, loopback VIP and VPC route directly.
+// loopback VIP and VPC route directly. The hairpin SNAT is the gateway's own single rule and
+// needs no per-identity programming.
 //
 // It owns exactly the identities its flags name (see validateServiceFeatureGates for the
 // partition): a LoadBalancer Service's EIP identities with --enable-gw-nftable-lb-svc, and
@@ -48,7 +49,7 @@ import (
 //     accounts for, flips Ready only after the data plane converged, and a stale record (or the
 //     retired-generation snapshot of an identity-changing update) is retired only after its rule
 //     is gone, so cleanup always finds a claim for what exists.
-//   - The Kube-OVN controller finalizer claims the whole data plane. Cleanup removes nft identities, hairpin,
+//   - The Kube-OVN controller finalizer claims the whole data plane. Cleanup removes nft identities,
 //     loopback VIPs and routes, then deletes the records and finally releases the Service.
 //   - EIP, Pod and ordinary gateway events do not trigger this controller. Their state is read
 //     when a Service or EndpointSlice event reconciles the Service. Gateway instance replacement
@@ -348,7 +349,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 
 	// A share DNAT identity (EIP, external port and protocol) has one Service writer. When
 	// several Services declare it, the deterministic Service winner keeps it. The loser must
-	// also never delete what it yielded: the winner owns that nft map and hairpin now (its add
+	// also never delete what it yielded: the winner owns that nft map now (its add
 	// rewrites the complete backend set), and no event would wake it to repair the damage.
 	var yielded map[string]struct{}
 	if serveEIP {
@@ -368,7 +369,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	}
 	// Records deleted out of band before this pass leave no ledger for an identity the Service
 	// trimmed since (its EIP annotation is gone, or a gate closed): the restored records would
-	// only describe the identities still served, and the old nft map and hairpin would be
+	// only describe the identities still served, and the old nft map would be
 	// deleted by nobody. Recover the evidence first so any later failure replays it.
 	evidence, clusterEvidence, err := c.ensureNftableLbTrimmedIdentityRecords(cachedSvc, existing, serveEIP, serveClusterIP)
 	if err != nil {
@@ -427,13 +428,6 @@ type nftableLbIdentity struct {
 	affinityTimeout int32
 }
 
-// nftableLbProgram is the executable desired state of one identity. Keeping construction pure
-// makes the Service writer testable without a Kubernetes pod-exec server.
-type nftableLbProgram struct {
-	identity    *nftableLbIdentity
-	hairpinRule string
-}
-
 // buildNftableLbIdentities groups Service accounting records into the identities the Service
 // controller will eventually program. A LoadBalancer record with both EIP and ClusterIP produces
 // two identities with the same backend set; a ClusterIP-only record produces one.
@@ -479,14 +473,12 @@ func buildNftableLbIdentities(records map[string]*kubeovnv1.IptablesDnatRule, ei
 // the fresh instance without rules and blackhole the Service.
 // protected holds the identities another Service currently claims: they are stale for this
 // Service but owned elsewhere, so their deletion is suppressed.
-func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs []nftableLbProgram,
+func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, identities []*nftableLbIdentity,
 	existing []*kubeovnv1.IptablesDnatRule, protected map[string]struct{},
 ) error {
-	wanted := make(map[string]struct{}, len(programs))
-	addRules := make([]string, 0, len(programs))
-	hairpinAddRules := make([]string, 0, len(programs))
-	for _, program := range programs {
-		identity := program.identity
+	wanted := make(map[string]struct{}, len(identities))
+	addRules := make([]string, 0, len(identities))
+	for _, identity := range identities {
 		wanted[identity.vip+"/"+identity.externalPort+"/"+identity.protocol] = struct{}{}
 		rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
 			identity.backends, identity.affinity, identity.affinityTimeout)
@@ -495,7 +487,6 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 				identity.vip, identity.externalPort, identity.protocol, err)
 		}
 		addRules = append(addRules, rule)
-		hairpinAddRules = append(hairpinAddRules, program.hairpinRule)
 	}
 
 	// One exec per Pod for the whole Service: the gateway script accepts several rules per
@@ -505,35 +496,23 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 			return err
 		}
 	}
-	if len(hairpinAddRules) != 0 {
-		if err := c.execNatGwRulesInPods(pods, natGwVipHairpinAdd, hairpinAddRules); err != nil {
-			return err
-		}
-	}
 
 	delRules := make([]string, 0, len(existing))
-	hairpinDelRules := make([]string, 0, len(existing))
 	for key, identity := range nftableLbExistingIdentities(existing) {
 		if _, ok := wanted[key]; ok {
 			continue
 		}
 		if _, ok := protected[key]; ok {
 			// The Service lost this EIP identity to another Service winner, whose claim proves it
-			// owns the nft map and hairpin now: deleting here would tear down what the winner just
+			// owns the nft map now: deleting here would tear down what the winner just
 			// programmed, and no event tells the winner to rebuild it. The loser's records already
 			// dropped the identity, so nothing else references it from this Service.
 			continue
 		}
 		delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
-		hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
 	}
 	if len(delRules) != 0 {
 		if err := c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
-			return err
-		}
-	}
-	if len(hairpinDelRules) != 0 {
-		if err := c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
 			return err
 		}
 	}
@@ -561,8 +540,8 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 		return err
 	}
 
-	programs := buildNftableLbPrograms(desired, eipIP)
-	if err = c.programNftableLbServiceIdentities(pods, programs, ledger, protected); err != nil {
+	identities := sortedNftableLbIdentities(desired, eipIP)
+	if err = c.programNftableLbServiceIdentities(pods, identities, ledger, protected); err != nil {
 		return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 
@@ -611,22 +590,19 @@ func nftableLbExistingIdentities(records []*kubeovnv1.IptablesDnatRule) map[stri
 	return identities
 }
 
-func buildNftableLbPrograms(records map[string]*kubeovnv1.IptablesDnatRule, eipIP string) []nftableLbProgram {
+// sortedNftableLbIdentities returns the identities to program, in a deterministic order.
+func sortedNftableLbIdentities(records map[string]*kubeovnv1.IptablesDnatRule, eipIP string) []*nftableLbIdentity {
 	identities := buildNftableLbIdentities(records, eipIP)
 	keys := make([]string, 0, len(identities))
 	for key := range identities {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
-	programs := make([]nftableLbProgram, 0, len(keys))
+	sorted := make([]*nftableLbIdentity, 0, len(keys))
 	for _, key := range keys {
-		id := identities[key]
-		programs = append(programs, nftableLbProgram{
-			identity:    id,
-			hairpinRule: fmt.Sprintf("%s,%s,%s", id.vip, id.externalPort, id.protocol),
-		})
+		sorted = append(sorted, identities[key])
 	}
-	return programs
+	return sorted
 }
 
 // claimNftableLbRecords persists the accounting records of the desired identities before the
@@ -638,7 +614,7 @@ func buildNftableLbPrograms(records map[string]*kubeovnv1.IptablesDnatRule, eipI
 //
 // An in-place update that drops an identity (the EIP annotation removed, the ClusterIP gate
 // closed, a conflicting EIP identity yielded) would erase the only ledger the gateway cleanup
-// reads and release the old EIP's UID claim before the old nft map and hairpin are actually
+// reads and release the old EIP's UID claim before the old nft map is actually
 // removed: a failed gateway pass would then retry with records that no longer know what to
 // delete. Before such an update the record is therefore snapshotted under a derived name
 // (acquire the new claim, keep the old one): the snapshot preserves the old identities and UID
@@ -971,7 +947,7 @@ func (c *Controller) nftableLbSvcTeardownLedger(svc *v1.Service) []*kubeovnv1.Ip
 
 // ensureNftableLbTrimmedIdentityRecords recreates the ledger of identities the Service trimmed
 // while its accounting records were missing. Records deleted out of band erase exactly the
-// evidence a trim reconcile needs to remove the old nft map and hairpin: the restored records
+// evidence a trim reconcile needs to remove the old nft map: the restored records
 // only describe the identities still served, and the ingress-clearing guard above would never
 // fire either. It returns the persisted EIP-leg tombstones (retired by settle once the data
 // plane converged) and the in-memory ClusterIP-leg entries, which join only the program view.
@@ -1099,26 +1075,19 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 			return err
 		}
 		delRules := make([]string, 0, len(ledger))
-		hairpinDelRules := make([]string, 0, len(ledger))
 		for key, identity := range nftableLbExistingIdentities(ledger) {
 			if _, ok := claimed[key]; ok {
-				// Another Service's record claims this identity: it owns the nft map and hairpin
+				// Another Service's record claims this identity: it owns the nft map
 				// now (its claim precedes its programming, and its add rewrote the complete
 				// backend set). Deleting here would tear down the wiring of a successor no event
 				// wakes to repair - the same handover the program phase honors via yielded.
 				continue
 			}
 			delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
-			hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
 		}
 		if len(delRules) != 0 {
 			if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
 				return fmt.Errorf("failed to remove identities of service %s/%s: %w", namespace, name, err)
-			}
-		}
-		if len(hairpinDelRules) != 0 {
-			if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
-				return fmt.Errorf("failed to remove hairpins of service %s/%s: %w", namespace, name, err)
 			}
 		}
 		owner := namespace + "/" + name
@@ -1329,7 +1298,7 @@ func buildDesiredNftableLbDnatRules(svc *v1.Service, eipName, gateway string, en
 // buildDesiredNftableLbDnatRulesForIdentities derives the records of the identities the enabled
 // feature gates select. The ClusterIP identity is dropped when its gate is off, the EIP identity
 // when its gate is off or the Service names no EIP, and both fields stay on one record when both
-// are served: everything else (nft maps, hairpin, lo addresses, VIP routes) is derived from these
+// are served: everything else (nft maps, lo addresses, VIP routes) is derived from these
 // records, so the gates are applied here once.
 func buildDesiredNftableLbDnatRulesForIdentities(svc *v1.Service, eipName, gateway string, serveEIP, serveClusterIP bool, endpointSlices []*discoveryv1.EndpointSlice, backendIP func(discoveryv1.Endpoint) (string, bool)) map[string]*kubeovnv1.IptablesDnatRule {
 	desired := make(map[string]*kubeovnv1.IptablesDnatRule)

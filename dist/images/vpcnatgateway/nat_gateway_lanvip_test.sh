@@ -211,25 +211,19 @@ assert_eq 3 "$(wc -l < "$ELEMENTS" | tr -d ' ')" "two lanVIP identities + one fo
 assert_file_contains "$ELEMENTS" "$vpc_addr tcp 80 "
 assert_file_contains "$ELEMENTS" "$vpc_addr udp 53 "
 assert_file_contains "$ELEMENTS" "$eip_addr tcp 443 dnat-e1a000000001"
-# postrouting jump + per-identity snat rules
-assert_file_contains "$RULES_LOG" " $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
-assert_file_contains "$RULES_LOG" "ct original ip daddr $vpc_addr ct original proto-dst 80 snat to $vpc_addr fully-random"
-assert_file_contains "$RULES_LOG" "ct original ip daddr $vpc_addr ct original proto-dst 53 snat to $vpc_addr fully-random"
-assert_file_contains "$RULES_LOG" "meta mark and 0x1 == 0x1"
+# the hairpin SNAT is the gateway's single iptables rule: this feature programs no SNAT of its own
+assert_file_lacks "$RULES_LOG" "snat to"
 # clientip identity got its affinity sets
 assert_eq 1 "$(grep -c '^aff-' "$SETS")" "one affinity set for the udp identity"
 # numeric chains exist for both identities, plus the foreign one
 assert_eq 3 "$(grep -c '^dnat-' "$CHAINS")" "two lanVIP identity chains + the foreign one"
-assert_eq 2 "$(grep -c "^$NFT_TABLE $NFT_LANVIP_SNAT_CHAIN " "$RULES_LOG")" "two snat rules"
 
-echo "== re-sync the identical set (chains already exist => still succeeds, SNAT chain rebuilt)"
+echo "== re-sync the identical set (chains already exist => still succeeds)"
 : > "$RULES_LOG"
 sync_nft_lanvip \
     "$vpc_addr,80,tcp,none,0,10.0.7.11:8080@10.0.7.12:8080" \
     "$vpc_addr,53,udp,clientip,600,10.0.7.13:53"
 assert_eq 3 "$(wc -l < "$ELEMENTS" | tr -d ' ')" "repeat sync: identities unchanged"
-assert_eq 2 "$(grep -c "^$NFT_TABLE $NFT_LANVIP_SNAT_CHAIN " "$RULES_LOG")" "repeat sync: snat chain rebuilt with both rules"
-assert_file_contains "$RULES_LOG" " $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
 
 echo "== shrink to one identity"
 sync_nft_lanvip "$vpc_addr,53,udp,clientip,600,10.0.7.13:53"
@@ -239,9 +233,6 @@ assert_file_contains "$ELEMENTS" "$eip_addr tcp 443 dnat-e1a000000001"
 assert_eq 2 "$(grep -c '^dnat-' "$CHAINS")" "stale tcp chain garbage-collected; udp + foreign chains stay"
 assert_file_contains "$tmp_dir/cmd.log" "delete-element $vpc_addr tcp 80"
 assert_file_contains "$tmp_dir/cmd.log" "conntrack -D -d $vpc_addr -p tcp --dport 80"
-# the snat chain was rebuilt with only the udp rule
-assert_eq 1 "$(grep -c "^$NFT_TABLE $NFT_LANVIP_SNAT_CHAIN " "$RULES_LOG")" "snat chain shrunk to one rule"
-assert_file_contains "$RULES_LOG" "ct original proto-dst 53 "
 
 echo "== wipe (zero args)"
 sync_nft_lanvip

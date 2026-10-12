@@ -169,8 +169,8 @@ func dedupSortedBackends(backends []string) []string {
 }
 
 // gwNftableLbSvcEnabled reports whether this feature is enabled. It gates everything the feature
-// owns beyond the share DNAT identity itself: the per-identity hairpin SNAT rules, the addresses
-// held on lo, and the VIP routes.
+// owns beyond the share DNAT identity itself: the addresses held on lo and the VIP routes. The
+// hairpin SNAT is the gateway's own single rule and belongs to no feature.
 func (c *Controller) gwNftableLbSvcEnabled() bool {
 	return c.config != nil && (c.config.EnableGwNftableLbSvc || c.config.EnableGwNftableSvcClusterIP)
 }

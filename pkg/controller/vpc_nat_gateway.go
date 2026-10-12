@@ -55,10 +55,8 @@ const (
 	natGwSubnetRouteDel   = "subnet-route-del"
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
-	// held on lo and the per-identity hairpin SNAT rules (see nft_dnat.go).
-	natGwVipAddrSync   = "vip-addr-sync"
-	natGwVipHairpinAdd = "vip-hairpin-add"
-	natGwVipHairpinDel = "vip-hairpin-del"
+	// held on lo (see nft_dnat.go).
+	natGwVipAddrSync = "vip-addr-sync"
 
 	getIptablesVersion = "get-iptables-version"
 )

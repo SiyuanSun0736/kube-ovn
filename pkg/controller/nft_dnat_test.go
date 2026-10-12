@@ -88,16 +88,14 @@ func TestProgramNftableLbServiceIdentitiesReprogramsUnchangedRecords(t *testing.
 	}
 
 	pods := []*v1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "gw-0", Namespace: metav1.NamespaceSystem}}}
-	programs := buildNftableLbPrograms(map[string]*kubeovnv1.IptablesDnatRule{record.Name: record}, "")
+	identities := sortedNftableLbIdentities(map[string]*kubeovnv1.IptablesDnatRule{record.Name: record}, "")
 	// The records already match the desired state, as they do right after a gateway instance is
 	// replaced (the reconcile that would refresh them has not run yet).
-	require.NoError(t, c.programNftableLbServiceIdentities(pods, programs, []*kubeovnv1.IptablesDnatRule{record}, nil))
+	require.NoError(t, c.programNftableLbServiceIdentities(pods, identities, []*kubeovnv1.IptablesDnatRule{record}, nil))
 
 	require.Equal(t, []string{"10.96.0.10,80,tcp,none,0,10.0.0.5:8080"}, programmed[natGwNftDnatMapAdd],
 		"the identity must be programmed again for the new gateway instance")
-	require.Equal(t, []string{"10.96.0.10,80,tcp"}, programmed[natGwVipHairpinAdd])
 	require.Empty(t, programmed[natGwNftDnatMapDel], "an identity the Service still wants must not be deleted")
-	require.Empty(t, programmed[natGwVipHairpinDel])
 }
 
 // TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile

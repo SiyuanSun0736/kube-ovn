@@ -12,6 +12,7 @@ export NAT_GW_ENV_FILE="$tmp_dir/nat-gateway.env"
 eval "$(sed '/^opt=\$1$/,$d' "$script")"
 
 VPC_INTERFACE=eth0
+EXTERNAL_INTERFACE=net1
 vpc_addr=10.0.7.254
 vpc_has_addr=true
 
@@ -28,11 +29,15 @@ lo_foreign="$tmp_dir/lo.foreign"
 ip_log="$tmp_dir/ip.log"
 ipt_log="$tmp_dir/iptables.log"
 hairpin_state="$tmp_dir/hairpin.rules"
+snat_state="$tmp_dir/exclusive_snat.rules"
+dnat_state="$tmp_dir/exclusive_dnat.rules"
 : > "$lo_addrs"
 printf '127.0.0.1/8\n10.99.0.1/32\n' > "$lo_foreign"
 : > "$ip_log"
 : > "$ipt_log"
 : > "$hairpin_state"
+: > "$snat_state"
+: > "$dnat_state"
 
 ip() {
     printf 'ip %s\n' "$*" >> "$ip_log"
@@ -69,20 +74,30 @@ ip() {
     esac
 }
 
-# Only the check-and-create/delete forms the VIP helpers use are emulated.
+# Only the chains and forms the two ensure_* helpers use are emulated.
 iptables() {
     printf 'iptables %s\n' "$*" >> "$ipt_log"
-    local full="$*" op rule
+    local full="$*" op chain rule state
     op="${3}"
-    rule="${full#-t nat $op HAIRPIN_SNAT }"
-    rule="${rule#1 }"
-    rule="${rule% --random-fully}"
+    chain="${4}"
+    rule="${full#-t nat $op $chain}"
+    rule="${rule# }"
+    case "$chain" in
+        HAIRPIN_SNAT) state="$hairpin_state" ;;
+        EXCLUSIVE_SNAT) state="$snat_state" ;;
+        EXCLUSIVE_DNAT) state="$dnat_state" ;;
+        *)
+            echo "unexpected iptables chain: $*" >&2
+            return 1
+            ;;
+    esac
     case "$op" in
-        -C) grep -qxF -e "$rule" "$hairpin_state" ;;
-        -I) grep -qxF -e "$rule" "$hairpin_state" || printf '%s\n' "$rule" >> "$hairpin_state" ;;
+        -N) ;;
+        -F) : > "$state" ;;
+        -A) grep -qxF -e "$rule" "$state" || printf '%s\n' "$rule" >> "$state" ;;
         -D)
-            grep -vxF -e "$rule" "$hairpin_state" > "$hairpin_state.new" || true
-            mv "$hairpin_state.new" "$hairpin_state"
+            grep -vxF -e "$rule" "$state" > "$state.new" || true
+            mv "$state.new" "$state"
             ;;
         *)
             echo "unexpected iptables invocation: $*" >&2
@@ -91,13 +106,28 @@ iptables() {
     esac
 }
 
+# The migration helper locates the rules to rewrite in the iptables-save output.
 iptables_save() {
-    while IFS= read -r rule; do
-        rule=$(echo "$rule" | sed -E 's/(--comment )([^ ]+)/\1"\2"/')
-        printf -- '-A HAIRPIN_SNAT %s --random-fully\n' "$rule"
-    done < "$hairpin_state"
+    local rule
+    while IFS= read -r rule; do [ -n "$rule" ] && printf -- '-A HAIRPIN_SNAT %s\n' "$rule"; done < "$hairpin_state"
+    while IFS= read -r rule; do [ -n "$rule" ] && printf -- '-A EXCLUSIVE_SNAT %s\n' "$rule"; done < "$snat_state"
+    while IFS= read -r rule; do [ -n "$rule" ] && printf -- '-A EXCLUSIVE_DNAT %s\n' "$rule"; done < "$dnat_state"
+    return 0
 }
 iptables_save_cmd=iptables_save
+conntrack_log="$tmp_dir/conntrack.log"
+conntrack() { printf '%s\n' "$*" >> "$conntrack_log"; }
+
+nft_log="$tmp_dir/nft.log"
+: > "$nft_log"
+nft() {
+    if [[ "$*" == "-f -" ]]; then
+        cat >> "$nft_log"
+        return 0
+    fi
+    echo "unexpected nft invocation: $*" >&2
+    return 1
+}
 
 # The ClusterIPs are held on lo as single /32s, under a label that scopes the set this feature
 # owns, so the sync can release the ones the controller no longer asks for.
@@ -128,70 +158,57 @@ vip_addr_sync
 [[ "$inited_calls" == 5 ]]
 ! ( vip_addr_sync 'not-an-ip' ) 2>/dev/null
 
-# Hairpin SNAT: both the internal (ClusterIP) and public (EIP) VIP of one service get a
-# per-identity rule that SNATs VPC-originated traffic to this gateway's own VPC address,
-# so the backend reply returns to the replica holding the conntrack.
-vip_hairpin_add '10.96.1.5,80,tcp'
-vip_hairpin_add '203.0.113.10,80,tcp'
-[[ "$(wc -l < "$hairpin_state")" == 2 ]]
-grep -qF -- '-m mark --mark 0x1/0x1 -o eth0 -p tcp -m conntrack --ctstate DNAT --ctorigdst 10.96.1.5 --ctorigdstport 80' "$hairpin_state"
-grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-80 -j SNAT --to-source 10.0.7.254' "$hairpin_state"
-grep -qF -- '--ctorigdst 203.0.113.10 --ctorigdstport 80' "$hairpin_state"
-# inserted at the head, otherwise the VIP-wide rule from eip-add (SNAT to the EIP) would win
-grep -qF 'iptables -t nat -I HAIRPIN_SNAT 1 ' "$ipt_log"
-# repeated add keeps exactly one rule per identity
-vip_hairpin_add '10.96.1.5,80,tcp'
-[[ "$(wc -l < "$hairpin_state")" == 2 ]]
-# deletion is idempotent and identity-scoped
-vip_hairpin_del '10.96.1.5,80,tcp'
+# Hairpin SNAT: one wildcard rule, rebuilt from scratch, replaces whatever an older version left
+# in the chain (per-EIP and per-identity rules).
+printf '%s\n' \
+    '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT --ctorigdst 203.0.113.10 -j SNAT --to-source 203.0.113.10' \
+    '-m mark --mark 0x1/0x1 -o eth0 -p tcp -m conntrack --ctstate DNAT --ctorigdst 10.96.1.5 --ctorigdstport 80 -j SNAT --to-source 10.0.7.254' \
+    > "$hairpin_state"
+ensure_hairpin_snat
 [[ "$(wc -l < "$hairpin_state")" == 1 ]]
-grep -qF -- '--ctorigdst 203.0.113.10' "$hairpin_state"
-vip_hairpin_del '10.96.1.5,80,tcp'
+grep -qxF -- '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT -j MASQUERADE --random-fully' "$hairpin_state"
+# the legacy nft hairpin chains of the lanVIP feature go with them
+grep -qF 'delete chain ip kube-ovn postrouting' "$nft_log"
+grep -qF 'delete chain ip kube-ovn lanvip-snat' "$nft_log"
+# rebuilding converges instead of stacking
+ensure_hairpin_snat
 [[ "$(wc -l < "$hairpin_state")" == 1 ]]
-
-# Deletion uses the installed rule, not the current interface address: both an address change and
-# a missing address must still remove the stale rule carrying the old --to-source.
-vip_hairpin_add '10.96.1.6,80,tcp'
-vpc_addr=10.0.7.253
-vip_hairpin_del '10.96.1.6,80,tcp'
-! grep -qF -- '--ctorigdst 10.96.1.6' "$hairpin_state"
-vip_hairpin_add '10.96.1.7,80,tcp'
+# the rule is address-independent: no VPC address is read to build it
 vpc_has_addr=false
-vip_hairpin_del '10.96.1.7,80,tcp'
-! grep -qF -- '--ctorigdst 10.96.1.7' "$hairpin_state"
+ensure_hairpin_snat
+[[ "$(wc -l < "$hairpin_state")" == 1 ]]
 vpc_has_addr=true
-# a second port of the same VIP is a distinct identity
-vip_hairpin_add '10.96.1.5,443,udp'
-grep -qF -- '--comment kube-ovn-vip-hairpin-udp-10.96.1.5-443 -j SNAT --to-source 10.0.7.253' "$hairpin_state"
-# the protocol is normalized, so the controller may pass either case
-vip_hairpin_add '10.96.1.5,8443,TCP'
-grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-8443 -j SNAT --to-source 10.0.7.253' "$hairpin_state"
-vip_hairpin_del '10.96.1.5,8443,TCP'
-! grep -qF -- '--ctorigdstport 8443' "$hairpin_state"
 
-# Ports that share a decimal prefix are distinct identities: garbage-collecting port 80 must not
-# take the still-used 8080 hairpin down with it (the installed rule is located by its comment, and
-# a substring match would hit both).
-vip_hairpin_add '10.96.1.5,80,tcp'
-vip_hairpin_add '10.96.1.5,8080,tcp'
-vip_hairpin_del '10.96.1.5,80,tcp'
-grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-8080' "$hairpin_state"
-! grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-80 ' "$hairpin_state"
-# the surviving identity is really intact, not just its comment
-grep -qF -- '--ctorigdst 10.96.1.5 --ctorigdstport 8080' "$hairpin_state"
-# and removing it afterwards is a clean sweep
-vip_hairpin_del '10.96.1.5,8080,tcp'
-! grep -qF -- '--ctorigdstport 8080' "$hairpin_state"
+# FIP egress SNAT must be scoped to the external interface, otherwise it also catches the
+# VPC-bound hairpin traffic of its own client. Rules an older script wrote carry no -o and
+# add_floating_ip never repairs them (it returns early once the DNAT rule exists), so init
+# rewrites them.
+printf '%s\n' \
+    '-s 10.0.7.1/32 -j SNAT --to-source 203.0.113.20' \
+    '-o net1 -s 10.0.7.2/32 -j SNAT --to-source 203.0.113.21' \
+    > "$snat_state"
+ensure_exclusive_snat_oif
+[[ "$(wc -l < "$snat_state")" == 2 ]]
+grep -qxF -- '-o net1 -s 10.0.7.1/32 -j SNAT --to-source 203.0.113.20' "$snat_state"
+# a rule that is already scoped is left alone, down to its field order
+grep -qxF -- '-o net1 -s 10.0.7.2/32 -j SNAT --to-source 203.0.113.21' "$snat_state"
+[[ "$(grep -c -- '-t nat -D EXCLUSIVE_SNAT ' "$ipt_log")" == 1 ]]
+# converged: a second run rewrites nothing
+ensure_exclusive_snat_oif
+[[ "$(wc -l < "$snat_state")" == 2 ]]
+[[ "$(grep -c -- '-t nat -D EXCLUSIVE_SNAT ' "$ipt_log")" == 1 ]]
 
-# Invalid input must fail instead of interpolating into the iptables command line.
-! ( vip_hairpin_add '10.96.1.5,70000,tcp' ) 2>/dev/null
-! ( vip_hairpin_add 'not-an-ip,80,tcp' ) 2>/dev/null
-! ( vip_hairpin_add '10.96.1.5,80,icmp' ) 2>/dev/null
-
-# Without an address on the VPC interface the SNAT source is unknown: fail loudly.
-vpc_has_addr=false
-! ( vip_hairpin_add '10.96.1.5,80,tcp' ) 2>/dev/null
-vpc_has_addr=true
+# FIP deletion recovers the full installed rule, including the new output-interface match.
+printf '%s\n' '-d 203.0.113.20/32 -j DNAT --to-destination 10.0.7.1' > "$dnat_state"
+if ! del_floating_ip 203.0.113.20; then exit 1; fi
+[[ ! -s "$dnat_state" ]]
+! grep -qF -- '--to-source 203.0.113.20' "$snat_state"
+grep -qxF -- '-o net1 -s 10.0.7.2/32 -j SNAT --to-source 203.0.113.21' "$snat_state"
+grep -qxF -- '-D -d 203.0.113.20' "$conntrack_log"
+del_calls=$(grep -c -- '-t nat -D EXCLUSIVE_' "$ipt_log")
+if ! del_floating_ip 203.0.113.20; then exit 1; fi
+[[ "$(grep -c -- '-t nat -D EXCLUSIVE_' "$ipt_log")" == "$del_calls" ]]
+[[ "$(wc -l < "$conntrack_log")" == 1 ]]
 
 # QoS filter cleanup must distinguish the EIP class range (0x1-0x7ffe) from the NatGw range
 # (0x8000-0xfeff) by value. tc prints classids without leading zeros, so a three-digit classid
