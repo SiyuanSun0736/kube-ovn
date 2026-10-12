@@ -268,6 +268,10 @@ func (c *Controller) enqueueDeletePod(obj any) {
 		return
 	}
 
+	if isGw, gwName := c.checkIsPodVpcNatGw(p); isGw {
+		c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw-pod-delete")
+	}
+
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
 

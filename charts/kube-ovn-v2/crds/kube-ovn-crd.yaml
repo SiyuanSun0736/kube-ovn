@@ -2473,6 +2473,10 @@ spec:
                         type: string
                       bfdId:
                         type: string
+                      gateway:
+                        type: string
+                      gatewayType:
+                        type: string
                     type: object
                   type: array
                 vpcPeerings:

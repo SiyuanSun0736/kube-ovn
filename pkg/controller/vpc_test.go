@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/keymutex"
 
@@ -584,6 +585,105 @@ func Test_handleAddOrUpdateVpc_policyRoutes_withBfd(t *testing.T) {
 		string(kubeovnv1.PolicyRouteActionReroute),
 		[]string{"192.168.1.1", "192.168.1.2"},
 		[]string{"bfd-session-1", "bfd-session-2"},
+		externalIDs,
+	).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalSwitch(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalSwitch{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().ListLogicalRouter(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalRouter{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().DeleteLogicalRouterPort(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+	mockOvnClient.EXPECT().DeleteHAChassisGroup(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+
+	err = ctrl.handleAddOrUpdateVpc(vpcName)
+	require.NoError(t, err)
+}
+
+func Test_handleAddOrUpdateVpc_policyRoutes_with_Gateway(t *testing.T) {
+	t.Parallel()
+
+	vpcName := "test-vpc-gw-policy"
+	gwName := "test-gw"
+
+	gw := &kubeovnv1.VpcNatGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gwName,
+		},
+		Spec: kubeovnv1.VpcNatGatewaySpec{
+			Vpc:    vpcName,
+			Subnet: "net1",
+			LanIP:  "192.168.1.100",
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw-0",
+			Namespace: "kube-system",
+			Labels: map[string]string{
+				"app":                    util.GenNatGwName(gwName),
+				util.VpcNatGatewayLabel: "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+			PodIPs: []corev1.PodIP{
+				{IP: "192.168.1.10"},
+			},
+		},
+	}
+
+	vpc := &kubeovnv1.Vpc{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vpcName,
+		},
+		Spec: kubeovnv1.VpcSpec{
+			PolicyRoutes: []*kubeovnv1.PolicyRoute{
+				{
+					Priority: 100,
+					Match:    "ip4.dst == 10.1.0.0/16",
+					Action:   kubeovnv1.PolicyRouteActionReroute,
+					Gateway:  gwName,
+				},
+			},
+		},
+	}
+
+	opts := &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
+	}
+	fakeController, err := newFakeControllerWithOptions(t, opts)
+	require.NoError(t, err)
+
+	ctrl := fakeController.fakeController
+	mockOvnClient := fakeController.mockOvnClient
+	ctrl.vpcKeyMutex = keymutex.NewHashed(500)
+
+	externalIDs := map[string]string{"vendor": util.CniTypeName}
+
+	mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+	mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+		Name: vpcName,
+		Nat:  []string{},
+	}, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(vpcName, -1, nil, true).Return(nil, nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(
+		vpcName,
+		100,
+		"ip4.dst == 10.1.0.0/16",
+		string(kubeovnv1.PolicyRouteActionReroute),
+		[]string{"192.168.1.10"},
+		nil,
 		externalIDs,
 	).Return(nil)
 	mockOvnClient.EXPECT().ListLogicalSwitch(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalSwitch{}, nil).AnyTimes()

@@ -531,7 +531,18 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	targetPolicyRoutes := make([]*kubeovnv1.PolicyRoute, len(vpc.Spec.PolicyRoutes))
 	for i, pr := range vpc.Spec.PolicyRoutes {
 		prCopy := *pr
-		if prCopy.BfdID == "" {
+		if prCopy.Action == kubeovnv1.PolicyRouteActionReroute && prCopy.Gateway != "" {
+			// Dynamically resolve gateway member IPs from gateway name
+			gwIPs := c.getGatewayMemberLANIPs(prCopy.Gateway)
+			if len(gwIPs) > 0 {
+				prCopy.NextHopIP = strings.Join(gwIPs, ",")
+			} else {
+				// Degrade to drop when no gateway member is ready to prevent traffic blackhole
+				prCopy.Action = kubeovnv1.PolicyRouteActionDrop
+				prCopy.NextHopIP = ""
+			}
+		}
+		if prCopy.BfdID == "" && prCopy.NextHopIP != "" {
 			nextHops := splitNextHops(prCopy.NextHopIP)
 			bfdSessions := c.getVpcBfdSessions(vpc.Name, nextHops, "")
 			if len(bfdSessions) > 0 {
@@ -1249,6 +1260,10 @@ func (c *Controller) formatVpc(vpc *kubeovnv1.Vpc) (*kubeovnv1.Vpc, error) {
 				changed = true
 			}
 		} else {
+			if route.Gateway != "" && route.NextHopIP == "" {
+				// Gateway is specified, nextHopIP will be dynamically resolved by controller
+				continue
+			}
 			// ecmp policy route may reroute to multiple next hop ips
 			for ipStr := range strings.SplitSeq(route.NextHopIP, ",") {
 				if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip == nil {
@@ -1596,3 +1611,30 @@ func (c *Controller) updateVpcExternalStatus(key string) error {
 
 	return nil
 }
+
+// getGatewayMemberLANIPs dynamically resolves LAN IPs of ready member pods for the specified NAT gateway
+func (c *Controller) getGatewayMemberLANIPs(gatewayName string) []string {
+	if gatewayName == "" || c.vpcNatGatewayLister == nil {
+		return nil
+	}
+	gw, err := c.vpcNatGatewayLister.Get(gatewayName)
+	if err != nil {
+		klog.V(3).Infof("failed to get vpc nat gateway %s: %v", gatewayName, err)
+		return nil
+	}
+	pods, err := c.listNatGwPods(gw)
+	if err != nil || len(pods) == 0 {
+		return nil
+	}
+	nextHops, err := getNatGwNextHops(gw, pods)
+	if err != nil || len(nextHops) == 0 {
+		return nil
+	}
+	ips := make([]string, 0, len(nextHops))
+	for _, ip := range nextHops {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	return ips
+}
+

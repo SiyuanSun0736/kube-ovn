@@ -451,6 +451,10 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		}
 	}
 
+	if gw.Spec.Vpc != "" && c.addOrUpdateVpcQueue != nil {
+		c.addOrUpdateVpcQueue.Add(gw.Spec.Vpc)
+	}
+
 	// Return backfillErr last so the StatefulSet work above is always attempted,
 	// but the work queue still retries with rate-limited backoff if backfill failed.
 	return backfillErr
