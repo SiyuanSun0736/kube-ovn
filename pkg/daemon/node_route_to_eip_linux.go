@@ -599,43 +599,37 @@ func (c *Controller) buildEipRouteInfo(eip *kubeovnv1.IptablesEIP) *eipRouteInfo
 		return nil
 	}
 
-	// If this EIP is enabled for BGP Anycast, it must use L3 BGP ECMP and veth penetration routing.
-	// Never create L2 macvlan routes to prevent ARP conflicts and route flapping.
-	if eip.Annotations != nil && eip.Annotations[util.BgpAnnotation] == "true" {
-		return &eipRouteInfo{
-			eipName: eip.Name,
-			v4ip:    eip.Spec.V4ip,
-			mode:    "veth",
-		}
-	}
-
 	subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
 	if err != nil {
 		klog.Errorf("failed to get subnet %s for EIP %s: %v", eip.Spec.ExternalSubnet, eip.Name, err)
 		return nil
 	}
 
-	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
-	if master == "" {
-		// Non-macvlan subnet (e.g., ptp veth-pair subnet)
+	if util.IsMacvlanSubnet(subnet) {
+		if util.IsHAOrBgpEIP(eip) {
+			klog.Errorf("HA/BGP IptablesEIP %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", eip.Name, subnet.Name)
+			return nil
+		}
+		master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
+		macvlanName, err := util.GenMacvlanIfaceName(master)
+		if err != nil {
+			klog.Errorf("failed to generate macvlan name for EIP %s (master=%s): %v", eip.Name, master, err)
+			return nil
+		}
+
 		return &eipRouteInfo{
-			eipName: eip.Name,
-			v4ip:    eip.Spec.V4ip,
-			mode:    "veth",
+			eipName:     eip.Name,
+			v4ip:        eip.Spec.V4ip,
+			macvlanName: macvlanName,
+			mode:        "macvlan",
 		}
 	}
 
-	macvlanName, err := util.GenMacvlanIfaceName(master)
-	if err != nil {
-		klog.Errorf("failed to generate macvlan name for EIP %s (master=%s): %v", eip.Name, master, err)
-		return nil
-	}
-
+	// Non-macvlan subnet (e.g., ptp veth-pair subnet for HA / BGP Anycast)
 	return &eipRouteInfo{
-		eipName:     eip.Name,
-		v4ip:        eip.Spec.V4ip,
-		macvlanName: macvlanName,
-		mode:        "macvlan",
+		eipName: eip.Name,
+		v4ip:    eip.Spec.V4ip,
+		mode:    "veth",
 	}
 }
 

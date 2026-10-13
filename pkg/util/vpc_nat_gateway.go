@@ -313,3 +313,64 @@ func GenMacvlanIfaceName(master string) (string, error) {
 	h.Write([]byte(master))
 	return fmt.Sprintf("%s%08x", MacvlanLinkPrefix, h.Sum32()), nil
 }
+
+// IsMacvlanSubnet returns true when a Subnet is backed by a macvlan NetworkAttachmentDefinition.
+func IsMacvlanSubnet(subnet *kubeovnv1.Subnet) bool {
+	if subnet == nil {
+		return false
+	}
+	if subnet.Annotations != nil && subnet.Annotations[NadMacvlanMasterAnnotation] != "" {
+		return true
+	}
+	if subnet.Labels != nil && subnet.Labels[NadMacvlanTypeLabel] == "true" {
+		return true
+	}
+	return false
+}
+
+// IsStatelessNatGateway returns true when a VpcNatGateway is configured in HA stateless mode
+// or carries HA member labels/annotations.
+func IsStatelessNatGateway(gw *kubeovnv1.VpcNatGateway) bool {
+	if gw == nil {
+		return false
+	}
+	for _, ann := range []map[string]string{gw.Annotations, gw.Spec.Annotations} {
+		if ann == nil {
+			continue
+		}
+		if mode := ann[NatGatewayDataplaneModeAnnotation]; mode == "stateless" || mode == "stateless-nft" {
+			return true
+		}
+		if ann[NatGatewayMemberLabel] != "" || ann[NatGatewayMemberLegacyLabel] != "" {
+			return true
+		}
+	}
+	if gw.Labels != nil {
+		if gw.Labels[NatGatewayMemberLabel] != "" || gw.Labels[NatGatewayMemberLegacyLabel] != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsHAOrBgpEIP returns true when an IptablesEIP is used for HA / BGP Anycast mode.
+func IsHAOrBgpEIP(eip *kubeovnv1.IptablesEIP) bool {
+	if eip == nil {
+		return false
+	}
+	if eip.Annotations != nil {
+		if eip.Annotations[BgpAnnotation] == "true" ||
+			eip.Annotations[NatGatewayMemberLabel] != "" ||
+			eip.Annotations[NatGatewayMemberLegacyLabel] != "" {
+			return true
+		}
+	}
+	if eip.Labels != nil {
+		if eip.Labels[NatGatewayMemberLabel] != "" ||
+			eip.Labels[NatGatewayMemberLegacyLabel] != "" {
+			return true
+		}
+	}
+	return false
+}
+

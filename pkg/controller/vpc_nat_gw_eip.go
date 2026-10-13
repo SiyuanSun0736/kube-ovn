@@ -246,6 +246,18 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
 		return err
 	}
+	if util.IsMacvlanSubnet(subnet) {
+		if util.IsHAOrBgpEIP(cachedEip) {
+			err := fmt.Errorf("HA/BGP IptablesEIP %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", cachedEip.Name, subnet.Name)
+			klog.Error(err)
+			return err
+		}
+		if gw, gwErr := c.vpcNatGatewayLister.Get(cachedEip.Spec.NatGwDp); gwErr == nil && util.IsStatelessNatGateway(gw) {
+			err := fmt.Errorf("IptablesEIP %s attached to stateless HA VpcNatGateway %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", cachedEip.Name, gw.Name, subnet.Name)
+			klog.Error(err)
+			return err
+		}
+	}
 
 	// v6 ip address can not use upper case
 	if util.ContainsUppercase(cachedEip.Spec.V6ip) {

@@ -1268,6 +1268,11 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 		klog.Error(err)
 		return nil, err
 	}
+	if util.IsStatelessNatGateway(gw) && util.IsMacvlanSubnet(net1Subnet) {
+		err := fmt.Errorf("stateless HA VpcNatGateway %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", gw.Name, net1Subnet.Name)
+		klog.Error(err)
+		return nil, err
+	}
 
 	routes = routes[0:0]
 	net1V4Gateway, net1V6Gateway := util.SplitStringIP(net1Subnet.Spec.Gateway)

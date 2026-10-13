@@ -467,7 +467,7 @@ func TestBuildEipRouteInfoModes(t *testing.T) {
 	assert.Equal(t, "macvlan", info1.mode)
 	assert.Equal(t, "macbond1", info1.macvlanName)
 
-	// Case 2: Macvlan subnet but has BGP Anycast annotation -> forces veth mode, prevents macbond conflict
+	// Case 2: Macvlan subnet with BGP Anycast or HA member label -> rejected (HA does not support macvlan)
 	bgpEip := &kubeovnv1.IptablesEIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "eip-bgp",
@@ -481,9 +481,21 @@ func TestBuildEipRouteInfoModes(t *testing.T) {
 		},
 	}
 	info2 := c.buildEipRouteInfo(bgpEip)
-	require.NotNil(t, info2)
-	assert.Equal(t, "veth", info2.mode)
-	assert.Empty(t, info2.macvlanName)
+	assert.Nil(t, info2)
+
+	haMemberEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "eip-ha-member",
+			Labels: map[string]string{
+				util.NatGatewayMemberLabel: "gw-m1",
+			},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "183.240.180.136",
+			ExternalSubnet: "macvlan-sub",
+		},
+	}
+	assert.Nil(t, c.buildEipRouteInfo(haMemberEip))
 
 	// Case 3: Ptp / veth subnet without macvlan master annotation -> veth mode
 	vethEip := &kubeovnv1.IptablesEIP{

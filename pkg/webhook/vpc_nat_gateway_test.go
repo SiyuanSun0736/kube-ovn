@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -262,3 +263,91 @@ func TestVpcNatGatewayDataplaneModeImmutable(t *testing.T) {
 	require.False(t, resp.Allowed)
 	require.Contains(t, resp.Result.Message, "is immutable once initialized")
 }
+
+func TestStatelessHAVpcNatGatewayRejectsMacvlanSubnet(t *testing.T) {
+	t.Parallel()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ovnv1.AddToScheme(scheme))
+
+	natCm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: util.VpcNatConfig, Namespace: metav1.NamespaceSystem},
+		Data:       map[string]string{"natGwNamePrefix": "vpc-nat-gw"},
+	}
+	vpc := &ovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "test-vpc"}}
+	lanSub := &ovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "lan-sub"},
+		Spec:       ovnv1.SubnetSpec{CIDRBlock: "10.0.0.0/24"},
+	}
+	macvlanSub := &ovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "macvlan-ext",
+			Annotations: map[string]string{util.NadMacvlanMasterAnnotation: "bond1"},
+			Labels:      map[string]string{util.NadMacvlanTypeLabel: "true"},
+		},
+		Spec: ovnv1.SubnetSpec{CIDRBlock: "183.240.180.128/27"},
+	}
+	vethSub := &ovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "veth-ext"},
+		Spec:       ovnv1.SubnetSpec{CIDRBlock: "183.240.180.128/27"},
+	}
+	statelessGw := &ovnv1.VpcNatGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ha-gw-m1",
+			Annotations: map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"},
+		},
+		Spec: ovnv1.VpcNatGatewaySpec{
+			Vpc:             "test-vpc",
+			Subnet:          "lan-sub",
+			LanIP:           "10.0.0.254",
+			ExternalSubnets: []string{"veth-ext"},
+		},
+	}
+
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(natCm, vpc, lanSub, macvlanSub, vethSub, statelessGw).Build()
+	hook := &ValidatingHook{
+		decoder: admission.NewDecoder(scheme),
+		cache:   &hookCache{reader: reader},
+	}
+
+	t.Run("stateless HA gateway with veth subnet is allowed", func(t *testing.T) {
+		require.NoError(t, hook.ValidateVpcNatGW(t.Context(), statelessGw))
+	})
+
+	t.Run("stateless HA gateway with macvlan subnet is rejected", func(t *testing.T) {
+		badGw := statelessGw.DeepCopy()
+		badGw.Spec.ExternalSubnets = []string{"macvlan-ext"}
+		err := hook.ValidateVpcNatGW(t.Context(), badGw)
+		require.ErrorContains(t, err, "cannot use macvlan external subnet")
+	})
+
+	t.Run("BGP Anycast EIP on macvlan subnet is rejected", func(t *testing.T) {
+		bgpEip := &ovnv1.IptablesEIP{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "bgp-eip",
+				Annotations: map[string]string{util.BgpAnnotation: "true"},
+			},
+			Spec: ovnv1.IptablesEIPSpec{
+				NatGwDp:        "ha-gw-m1",
+				ExternalSubnet: "macvlan-ext",
+				V4ip:           "183.240.180.136",
+			},
+		}
+		err := hook.ValidateIptablesEIP(t.Context(), bgpEip)
+		require.ErrorContains(t, err, "cannot use macvlan external subnet")
+	})
+
+	t.Run("EIP without BGP annotation but attached to stateless HA gateway on macvlan subnet is rejected", func(t *testing.T) {
+		eip := &ovnv1.IptablesEIP{
+			ObjectMeta: metav1.ObjectMeta{Name: "plain-eip-on-ha-gw"},
+			Spec: ovnv1.IptablesEIPSpec{
+				NatGwDp:        "ha-gw-m1",
+				ExternalSubnet: "macvlan-ext",
+				V4ip:           "183.240.180.136",
+			},
+		}
+		err := hook.ValidateIptablesEIP(t.Context(), eip)
+		require.ErrorContains(t, err, "cannot use macvlan external subnet")
+	})
+}
+
