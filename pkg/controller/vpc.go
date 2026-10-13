@@ -1612,27 +1612,67 @@ func (c *Controller) updateVpcExternalStatus(key string) error {
 	return nil
 }
 
-// getGatewayMemberLANIPs dynamically resolves LAN IPs of ready member pods for the specified NAT gateway
+// getGatewayMemberLANIPs dynamically resolves LAN IPs of ready member pods for the specified NAT gateway.
+// Supports exact VpcNatGateway name ("phase2-gw-m1"), comma-separated names ("phase2-gw-m1,phase2-gw-m2"),
+// and logical HA gateway prefix ("phase2-gw" -> ["phase2-gw-m1", "phase2-gw-m2"]).
 func (c *Controller) getGatewayMemberLANIPs(gatewayName string) []string {
 	if gatewayName == "" || c.vpcNatGatewayLister == nil {
 		return nil
 	}
-	gw, err := c.vpcNatGatewayLister.Get(gatewayName)
-	if err != nil {
-		klog.V(3).Infof("failed to get vpc nat gateway %s: %v", gatewayName, err)
+	var matchedGws []*kubeovnv1.VpcNatGateway
+	seenGw := make(map[string]bool)
+	for _, rawName := range strings.Split(gatewayName, ",") {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		if gw, err := c.vpcNatGatewayLister.Get(name); err == nil && gw != nil {
+			if !seenGw[gw.Name] {
+				seenGw[gw.Name] = true
+				matchedGws = append(matchedGws, gw)
+			}
+			continue
+		}
+		allGws, err := c.vpcNatGatewayLister.List(labels.Everything())
+		if err != nil {
+			klog.V(3).Infof("failed to list vpc nat gateways for %s: %v", name, err)
+			continue
+		}
+		prefix := name + "-m"
+		for _, gw := range allGws {
+			if gw == nil || seenGw[gw.Name] {
+				continue
+			}
+			if strings.HasPrefix(gw.Name, prefix) ||
+				(gw.Annotations != nil && gw.Annotations["ovn.kubernetes.io/ha-gateway-group"] == name) ||
+				(gw.Labels != nil && gw.Labels["ovn.kubernetes.io/ha-gateway-group"] == name) {
+				seenGw[gw.Name] = true
+				matchedGws = append(matchedGws, gw)
+			}
+		}
+	}
+	if len(matchedGws) == 0 {
+		klog.V(3).Infof("no matching vpc nat gateway found for %s", gatewayName)
 		return nil
 	}
-	pods, err := c.listNatGwPods(gw)
-	if err != nil || len(pods) == 0 {
-		return nil
-	}
-	nextHops, err := getNatGwNextHops(gw, pods)
-	if err != nil || len(nextHops) == 0 {
-		return nil
-	}
-	ips := make([]string, 0, len(nextHops))
-	for _, ip := range nextHops {
-		ips = append(ips, ip)
+
+	seenIP := make(map[string]bool)
+	var ips []string
+	for _, gw := range matchedGws {
+		pods, err := c.listNatGwPods(gw)
+		if err != nil || len(pods) == 0 {
+			continue
+		}
+		nextHops, err := getNatGwNextHops(gw, pods)
+		if err != nil || len(nextHops) == 0 {
+			continue
+		}
+		for _, ip := range nextHops {
+			if ip != "" && !seenIP[ip] {
+				seenIP[ip] = true
+				ips = append(ips, ip)
+			}
+		}
 	}
 	sort.Strings(ips)
 	return ips

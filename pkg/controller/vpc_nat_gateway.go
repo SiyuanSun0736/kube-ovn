@@ -1513,6 +1513,11 @@ func getNatGwNextHops(gw *kubeovnv1.VpcNatGateway, pods []*corev1.Pod) (map[stri
 		if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
 			continue
 		}
+		if pod.Annotations != nil &&
+			(pod.Annotations[util.NatGatewayDataplaneReadyAnnotation] == "false" ||
+				pod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno] == "false") {
+			continue
+		}
 		ready := true
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type == corev1.PodReady && cond.Status != corev1.ConditionTrue {

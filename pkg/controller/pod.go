@@ -189,6 +189,18 @@ func isPodStatusPhaseAlive(p *v1.Pod) bool {
 	return true
 }
 
+func isPodReadyConditionTrue(p *v1.Pod) bool {
+	if p == nil {
+		return false
+	}
+	for _, cond := range p.Status.Conditions {
+		if cond.Type == v1.PodReady {
+			return cond.Status == v1.ConditionTrue
+		}
+	}
+	return false
+}
+
 func (c *Controller) enqueueAddPod(obj any) {
 	p := obj.(*v1.Pod)
 	if p.Spec.HostNetwork {
@@ -304,8 +316,13 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 		newReady := newPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
 		oldLegacyReady := oldPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
 		newLegacyReady := newPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
-		if oldReady != newReady || oldLegacyReady != newLegacyReady {
-			c.enqueueAddOrUpdateVpcNatGwByName(gwName, "dataplane-ready annotation changed")
+		oldTerminating := !oldPod.DeletionTimestamp.IsZero()
+		newTerminating := !newPod.DeletionTimestamp.IsZero()
+		if oldReady != newReady || oldLegacyReady != newLegacyReady ||
+			oldPod.Status.Phase != newPod.Status.Phase ||
+			oldTerminating != newTerminating ||
+			isPodReadyConditionTrue(oldPod) != isPodReadyConditionTrue(newPod) {
+			c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw pod readiness/state changed")
 		}
 	}
 
