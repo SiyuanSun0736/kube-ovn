@@ -53,6 +53,15 @@ const (
 	natGwSubnetFipDel     = "floating-ip-del"
 	natGwSubnetRouteAdd   = "subnet-route-add"
 	natGwSubnetRouteDel   = "subnet-route-del"
+	natGwHairpinSNATSet   = "hairpin-snat-set"
+
+	// The two states of the lanIP fallback the gateway script accepts, also the values recorded
+	// in VpcNatGatewayStatus.HairpinSNAT.
+	hairpinSNATEnable  = "enable"
+	hairpinSNATDisable = "disable"
+	// Recorded instead when the Pod runs a gateway script that has no hairpin-snat-set: the
+	// field cannot be honoured until that Pod is replaced by the gateway image that has it.
+	hairpinSNATUnsupported = "unsupported"
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
@@ -261,6 +270,49 @@ func isVpcNatGwChanged(gw *kubeovnv1.VpcNatGateway) bool {
 	return false
 }
 
+// hairpinSNATMode is the fallback hairpin rule the gateway script has to program for VIPs that are
+// not floating IPs. It is off unless the spec asks for it. FIP traffic is not covered by it: its
+// hairpin rule is part of the FIP itself.
+func hairpinSNATMode(gw *kubeovnv1.VpcNatGateway) string {
+	if gw.Spec.EnableLanIPAsHairpinSNAT {
+		return hairpinSNATEnable
+	}
+	return hairpinSNATDisable
+}
+
+// syncNatGwHairpinSNAT programs spec.enableLanIpAsHairpinSnat on the gateway Pod when it differs
+// from the state the status records as programmed. The chain is rewritten in place, so no Pod
+// recreation.
+//
+// "unsupported" (or an empty value, before init has run at all) means the Pod runs a gateway
+// script without hairpin-snat-set: see handleInitVpcNatGw, which records that instead of a state
+// it could not program. Sending the command to such a Pod would fail on every retry and stop the
+// whole gateway reconcile from converging, and no subcommand of that script writes HAIRPIN_SNAT,
+// so the unconditional lanIP fallback it installs at init cannot be turned off from here at all.
+// The field therefore takes effect once the Pod is replaced by a gateway image that has the
+// command, whose init programs the chain and records the real state.
+//
+// TODO: the status gate means out-of-band changes to the chain are not repaired. A replaced Pod
+// re-converges through handleInitVpcNatGw, but a hand-run "nat-gateway.sh init" (the
+// natGwScriptHostPath workflow) resets the fallback to off while the status still claims it is on,
+// and nothing re-applies it until the Pod is replaced. Repairing it would mean reading the rule
+// back on every reconcile, i.e. a pod exec per gateway event, which is why this is a note and not
+// a fix.
+func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
+	if gw.Status.HairpinSNAT == "" || gw.Status.HairpinSNAT == hairpinSNATUnsupported {
+		return nil
+	}
+	mode := hairpinSNATMode(gw)
+	if mode == gw.Status.HairpinSNAT {
+		return nil
+	}
+	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwHairpinSNATSet, []string{mode}); err != nil {
+		klog.Errorf("failed to set hairpin snat mode %s for nat gw %s, %v", mode, gw.Name, err)
+		return err
+	}
+	return c.patchNatGwHairpinSNATStatus(gw.Name, mode)
+}
+
 func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	gw, err := c.vpcNatGatewayLister.Get(key)
 	if err != nil {
@@ -409,6 +461,16 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		}
 	}
 
+	// Hairpin SNAT is hot-applied like QoS: the gateway script rewrites the chain in place.
+	// getNatGwPod only returns a running pod, and only an initialized one holds the chains.
+	if pod != nil {
+		if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
+			if err = c.syncNatGwHairpinSNAT(gw, pod); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Return backfillErr last so the StatefulSet work above is always attempted,
 	// but the work queue still retries with rate-limited backoff if backfill failed.
 	return backfillErr
@@ -521,11 +583,33 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 			strings.Join([]string{vpcNadIfName, externalNadIfName}, ","),
 		}
 	}
-	if err = c.execNatGwRules(pod, natGwInit, interfaces); err != nil {
+	// Routed through execNatGwRulesInPods like the hairpin command below, so the whole init path
+	// goes through the one exec seam the tests stub.
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwInit, interfaces); err != nil {
 		// Check if this is a transient initialization error (e.g., first attempt before iptables chains are created)
 		// The init script may fail on first run but succeed on retry after chains are established
 		klog.Warningf("vpc nat gateway %s init attempt failed (will retry): %v", key, err)
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
+	}
+
+	// The state is recorded only after the command succeeded, so the status never claims a state
+	// the data plane does not have. A controller running ahead of the gateway image (the script
+	// comes from cm/ovn-vpc-nat-config data.image and may predate hairpin-snat-set) would fail
+	// here: a gateway that does not ask for the fallback tolerates that and initializes anyway,
+	// recording "unsupported" so the state of the field is visible instead of silently ignored.
+	// A gateway that does ask for it fails loudly instead, because the image cannot deliver it.
+	mode := hairpinSNATMode(gw)
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwHairpinSNATSet, []string{mode}); err != nil {
+		if mode != hairpinSNATDisable {
+			klog.Errorf("failed to set hairpin snat state %s for nat gw %s, %v", mode, key, err)
+			return err
+		}
+		klog.Warningf("nat gw %s runs a script without %s: spec.enableLanIpAsHairpinSnat cannot take effect until the Pod is replaced by a gateway image that has it (%v)", key, natGwHairpinSNATSet, err)
+		mode = hairpinSNATUnsupported
+	}
+	if err = c.patchNatGwHairpinSNATStatus(key, mode); err != nil {
+		klog.Errorf("failed to patch hairpin snat status for nat gw %s, %v", key, err)
+		return err
 	}
 
 	if gw.Spec.QoSPolicy != "" {
@@ -1604,6 +1688,36 @@ func (c *Controller) patchNatGwQoSStatus(key, qos string) error {
 			klog.Errorf("failed to patch gw %s, %v", gw.Name, err)
 			return err
 		}
+	}
+	return nil
+}
+
+func (c *Controller) patchNatGwHairpinSNATStatus(key, mode string) error {
+	oriGw, err := c.vpcNatGatewayLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
+		return err
+	}
+	if oriGw.Status.HairpinSNAT == mode {
+		return nil
+	}
+	// Only this field is sent: a whole-status patch would carry the lister's snapshot of every
+	// other status field and could write back a value another path has already moved on from.
+	patch, err := json.Marshal(map[string]any{"status": map[string]string{"hairpinSnat": mode}})
+	if err != nil {
+		klog.Errorf("failed to marshal vpc nat gw %s status, %v", key, err)
+		return err
+	}
+	if _, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), key, types.MergePatchType,
+		patch, metav1.PatchOptions{}, "status"); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to patch gw %s, %v", key, err)
+		return err
 	}
 	return nil
 }

@@ -215,6 +215,9 @@ spec:
                 qosPolicy:
                   type: string
                   description: QoS policy applied to the NAT gateway
+                hairpinSnat:
+                  type: string
+                  description: State of the lanIP fallback hairpin SNAT programmed on the NAT gateway (enable, disable, or unsupported when the running gateway image cannot switch it)
                 tolerations:
                   type: array
                   items:
@@ -553,6 +556,15 @@ spec:
                 noDefaultEIP:
                   type: boolean
                   description: Disable default EIP assignment
+                enableLanIpAsHairpinSnat:
+                  type: boolean
+                  description: |-
+                    Turns on the fallback hairpin SNAT, off by default: VPC traffic that this gateway
+                    DNAT'd back towards the VPC then leaves with the gateway lanIP as source. Leave it
+                    off when the backend preserves the client address and routes its replies back
+                    through this gateway itself. It covers every VIP that is not a floating IP;
+                    traffic dialed at a FIP is always SNAT'd to that FIP, independently of this
+                    field. Applied without Pod recreation.
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

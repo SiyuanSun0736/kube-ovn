@@ -218,11 +218,11 @@ EXT_PEER_IP=$(kubectl -n "$NS" get pod hairpin-ext-peer \
 [ -n "$EXT_PEER_IP" ] || fail "the external peer has no address on $EXTERNAL_NAD"
 echo "   backend eip $BACKEND_EIP, client eip $CLIENT_EIP, external peer $EXT_PEER_IP"
 
-step "the hairpin chain holds exactly one rule, built from no address at all"
+step "the hairpin chain holds the per-FIP jump, and the lanIP fallback is off by default"
 rules=$(gw_rules)
 [ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "expected one hairpin rule, got: $rules"
-grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j MASQUERADE --random-fully" \
-    <<< "$rules" || fail "the single masquerade rule is not installed: $rules"
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+    <<< "$rules" || fail "the per-FIP jump is not installed: $rules"
 
 step "binding the FIPs"
 kubectl apply -f - >/dev/null <<EOF
@@ -238,13 +238,15 @@ wait_for 120 "backend fip rule" bash -c "kubectl exec -n $GW_NS $GW_POD -- iptab
 gw_rules | grep -q -- "^-A EXCLUSIVE_SNAT -s $BACKEND_IP/32 -o $EXTERNAL_INTERFACE -j SNAT --to-source $BACKEND_EIP" \
     || fail "the FIP egress rule is not scoped to $EXTERNAL_INTERFACE: $(gw_rules)"
 
-step "a VPC client reaching the backend's FIP is masqueraded to the gateway lanIP"
+step "a VPC client reaching the backend's FIP is SNAT'd to that FIP"
+gw_exec bash -c "iptables-save -t nat | grep -- '-A HAIRPIN_FIP ' | grep -q -- '--to-source $BACKEND_EIP'" \
+    || fail "the backend FIP has no hairpin rule"
 flush_conntrack
 src=$(seen_source "$BACKEND_EIP" 8080)
-[ "$src" = "$LAN_IP" ] || fail "backend saw $src, want the gateway lanIP $LAN_IP"
+[ "$src" = "$BACKEND_EIP" ] || fail "backend saw $src, want its own FIP $BACKEND_EIP"
 echo "   backend saw $src"
 
-step "the client gets its own FIP: hairpin must still win over the FIP egress rule"
+step "the client gets its own FIP: the hairpin source stays the dialed FIP, not the client EIP"
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: kubeovn.io/v1
 kind: IptablesFIPRule
@@ -257,7 +259,7 @@ EOF
 wait_for 120 "client fip rule" bash -c "kubectl exec -n $GW_NS $GW_POD -- iptables-save -t nat | grep -q -- '-A EXCLUSIVE_SNAT -s $CLIENT_IP/32 -o $EXTERNAL_INTERFACE'"
 flush_conntrack
 src=$(seen_source "$BACKEND_EIP" 8080)
-[ "$src" = "$LAN_IP" ] || fail "backend saw $src, want the gateway lanIP $LAN_IP"
+[ "$src" = "$BACKEND_EIP" ] || fail "backend saw $src, want the dialed FIP $BACKEND_EIP"
 echo "   backend saw $src, not the client EIP"
 
 step "egress is untouched: the same client reaching the external network keeps its EIP"
@@ -285,10 +287,11 @@ check_local_source "$BACKEND_EIP"
 gw_exec iptables -t nat -D DNAT_FILTER -d "$BACKEND_EIP" -p tcp --dport 18080 -j DNAT --to-destination "$LAN_IP"
 echo "   direct and DNAT-local services saw $CLIENT_IP"
 
-step "nft ClusterIP and lanVIP forwarding use the same masquerade rule"
+step "a VIP with no EIP (ClusterIP, lanVIP) follows the lanIP fallback switch"
 # Program via the real gateway script: this validates nft/iptables interoperability, not
 # Service-controller feature gates (the test cluster may run an older controller).
 CLUSTER_VIP=10.96.254.254
+gw_exec bash /kube-ovn/nat-gateway.sh hairpin-snat-set enable >/dev/null
 gw_exec bash /kube-ovn/nat-gateway.sh vip-addr-sync "$CLUSTER_VIP" >/dev/null
 gw_exec bash /kube-ovn/nat-gateway.sh nft-dnat-map-add "$CLUSTER_VIP,8080,tcp,$BACKEND_IP:8080" >/dev/null
 src=$(seen_source "$CLUSTER_VIP" 8080)
@@ -300,6 +303,19 @@ gw_exec bash /kube-ovn/nat-gateway.sh nft-dnat-map-del "$CLUSTER_VIP,8080,tcp" >
 gw_exec bash /kube-ovn/nat-gateway.sh vip-addr-sync >/dev/null
 gw_exec bash /kube-ovn/nat-gateway.sh nft-lanvip-sync >/dev/null
 echo "   nft ClusterIP and lanVIP backends saw $LAN_IP"
+
+step "the fallback is a switch, the per-FIP rules are not"
+[ "$(gw_rules | grep -c '^-A HAIRPIN_SNAT ')" = 2 ] || fail "the fallback is not on: $(gw_rules)"
+gw_exec bash /kube-ovn/nat-gateway.sh hairpin-snat-set disable >/dev/null
+rules=$(gw_rules)
+[ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "none must leave only the per-FIP jump: $rules"
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+    <<< "$rules" || fail "none dropped the per-FIP jump: $rules"
+# FIP traffic is unaffected by the switch: it is still SNAT'd to the dialed FIP
+flush_conntrack
+src=$(seen_source "$BACKEND_EIP" 8080)
+[ "$src" = "$BACKEND_EIP" ] || fail "with the fallback off the backend saw $src, want $BACKEND_EIP"
+echo "   fallback off again, FIP traffic kept $src"
 
 step "legacy rules of an older script, and their convergence on the next init"
 gw_exec bash -c "
@@ -319,16 +335,20 @@ echo "   legacy rules reproduced (backend saw the client EIP $src)"
 gw_exec bash /kube-ovn/nat-gateway.sh init "$VPC_INTERFACE,$EXTERNAL_INTERFACE" >/dev/null
 rules=$(gw_rules)
 [ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "expected one hairpin rule after init, got: $rules"
-grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j MASQUERADE --random-fully" \
-    <<< "$rules" || fail "init did not rebuild the masquerade rule: $rules"
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+    <<< "$rules" || fail "init did not rebuild the per-FIP jump: $rules"
 grep -q -- "^-A EXCLUSIVE_SNAT -s $CLIENT_IP/32 -o $EXTERNAL_INTERFACE " <<< "$rules" \
     || fail "init did not scope the FIP egress rule: $rules"
+# the per-FIP chain is rebuilt from the FIP map in EXCLUSIVE_DNAT, without the controller
+# replaying a single FIP
+gw_exec bash -c "iptables-save -t nat | grep -- '-A HAIRPIN_FIP ' | grep -q -- '--to-source $CLIENT_EIP'" \
+    || fail "init did not rebuild the per-FIP hairpin rules"
 flush_conntrack
 src=$(seen_source "$BACKEND_EIP" 8080)
-[ "$src" = "$LAN_IP" ] || fail "after init the backend saw $src, want $LAN_IP"
+[ "$src" = "$BACKEND_EIP" ] || fail "after init the backend saw $src, want $BACKEND_EIP"
 flush_conntrack
 src=$(seen_source "$EXT_PEER_IP" 9090)
 [ "$src" = "$CLIENT_EIP" ] || fail "after init the external peer saw $src, want $CLIENT_EIP"
-echo "   converged: one masquerade rule, egress untouched"
+echo "   converged: per-FIP rules rebuilt, fallback back to its default, egress untouched"
 
 echo 'PASS: hairpin_snat_test.sh'
