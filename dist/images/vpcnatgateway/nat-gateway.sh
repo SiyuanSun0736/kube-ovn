@@ -280,20 +280,25 @@ function del_vpc_external_route() {
 function add_eip() {
     # make sure inited
     check_inited
+    local ptp_peer
+    ptp_peer=$(ip -4 route show dev "$EXTERNAL_INTERFACE" scope link 2>/dev/null | awk '/^169\.254\./ {print $1; exit}')
     for rule in $@
     do
         eip=${rule}
         eip_without_prefix=(${eip//\// })
-        exec_cmd "ip addr replace $eip dev $EXTERNAL_INTERFACE"
-        exec_cmd "arping -I $EXTERNAL_INTERFACE -c 3 -U $eip_without_prefix"
+        if [ -n "$ptp_peer" ]; then
+            exec_cmd "ip addr replace ${eip_without_prefix}/32 dev $EXTERNAL_INTERFACE"
+        else
+            exec_cmd "ip addr replace $eip dev $EXTERNAL_INTERFACE"
+            exec_cmd "arping -I $EXTERNAL_INTERFACE -c 3 -U $eip_without_prefix"
+        fi
     done
 
-    # Use "onlink" to skip the kernel's "gateway must be directly reachable" check.
-    # This allows EIPs from a different external subnet to share the NAT gateway's
-    # default route, as long as the gateway is L2-reachable (same VLAN/broadcast domain).
-    # When the gateway IS on the same subnet, "onlink" has no behavioral difference
-    # from the non-onlink form — the forwarding path and ARP resolution are identical.
-    if [ -n "$GATEWAY_V4" ]; then
+    # In point-to-point (veth) mode, keep the default route pointing to the link-local host peer.
+    # In L2 (macvlan) mode, use "onlink" via GATEWAY_V4.
+    if [ -n "$ptp_peer" ]; then
+        exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE"
+    elif [ -n "$GATEWAY_V4" ]; then
         exec_cmd "ip route replace default via $GATEWAY_V4 dev $EXTERNAL_INTERFACE onlink"
     fi
 
@@ -1175,19 +1180,19 @@ function stateless_dnat_add() {
         IFS=',' read -r eip extPort proto intIp intPort <<< "$rule"
         [ -n "$eip" ] && [ -n "$extPort" ] && [ -n "$proto" ] && [ -n "$intIp" ] && [ -n "$intPort" ] || continue
         proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
-        # Disable conntrack specifically for this bidirectional port mapping
+        # Protocol packet rewriting (insert at top of prerouting/postrouting to prioritize over broader L3 SNAT/FIP)
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip daddr $eip $proto dport $extPort ip daddr set $intIp $proto dport set $intPort"; then
+            nft insert rule ip "$table" prerouting ip daddr "$eip" "$proto" dport "$extPort" ip daddr set "$intIp" "$proto" dport set "$intPort" || return 1
+        fi
+        if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $intIp $proto sport $intPort ip saddr set $eip $proto sport set $extPort"; then
+            nft insert rule ip "$table" postrouting ip saddr "$intIp" "$proto" sport "$intPort" ip saddr set "$eip" "$proto" sport set "$extPort" || return 1
+        fi
+        # Disable conntrack specifically for this bidirectional port mapping (inserted at very top)
         if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip daddr $eip $proto dport $extPort notrack"; then
             nft insert rule ip "$table" prerouting ip daddr "$eip" "$proto" dport "$extPort" notrack || return 1
         fi
         if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip saddr $intIp $proto sport $intPort notrack"; then
             nft insert rule ip "$table" prerouting ip saddr "$intIp" "$proto" sport "$intPort" notrack || return 1
-        fi
-        # Protocol packet rewriting (insert at top of postrouting to prioritize over broader SNAT)
-        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip daddr $eip $proto dport $extPort ip daddr set $intIp $proto dport set $intPort"; then
-            nft add rule ip "$table" prerouting ip daddr "$eip" "$proto" dport "$extPort" ip daddr set "$intIp" "$proto" dport set "$intPort" || return 1
-        fi
-        if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $intIp $proto sport $intPort ip saddr set $eip $proto sport set $extPort"; then
-            nft insert rule ip "$table" postrouting ip saddr "$intIp" "$proto" sport "$intPort" ip saddr set "$eip" "$proto" sport set "$extPort" || return 1
         fi
     done
 }
