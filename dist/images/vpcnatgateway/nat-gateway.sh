@@ -1252,17 +1252,21 @@ function stateless_snat_add() {
         [ -n "$eip" ] && [ -n "$internalCIDR" ] || continue
         local internalIp="${internalCIDR%/*}"
         local prefix="${internalCIDR#*/}"
+        local matchCIDR="$internalCIDR"
+        if [ "$prefix" = "32" ]; then
+            matchCIDR="$internalIp"
+        fi
 
         # 1. Outgoing traffic: disable conntrack and rewrite source IP to EIP
-        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip saddr $internalCIDR notrack"; then
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR notrack"; then
             nft insert rule ip "$table" prerouting ip saddr "$internalCIDR" notrack || return 1
         fi
         if [ -n "$EXTERNAL_INTERFACE" ]; then
-            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $internalCIDR oifname \"$EXTERNAL_INTERFACE\" ip saddr set $eip"; then
+            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR oifname \"$EXTERNAL_INTERFACE\" ip saddr set $eip"; then
                 nft add rule ip "$table" postrouting ip saddr "$internalCIDR" oifname "$EXTERNAL_INTERFACE" ip saddr set "$eip" || return 1
             fi
         else
-            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $internalCIDR ip saddr set $eip"; then
+            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR ip saddr set $eip"; then
                 nft add rule ip "$table" postrouting ip saddr "$internalCIDR" ip saddr set "$eip" || return 1
             fi
         fi
@@ -1296,9 +1300,14 @@ function stateless_snat_del() {
         IFS=',' read -r eip internalCIDR <<< "$rule"
         [ -n "$eip" ] && [ -n "$internalCIDR" ] || continue
         local internalIp="${internalCIDR%/*}"
+        local prefix="${internalCIDR#*/}"
+        local matchCIDR="$internalCIDR"
+        if [ "$prefix" = "32" ]; then
+            matchCIDR="$internalIp"
+        fi
 
         local post_handles pre_handles
-        post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "ip saddr $internalCIDR[[:space:]].*ip saddr set $eip[[:space:]]?" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "ip saddr $matchCIDR[[:space:]].*ip saddr set $eip[[:space:]]?" | grep -oE "handle [0-9]+" | awk '{print $2}')
         for h in $post_handles; do
             nft delete rule ip "$table" postrouting handle "$h" 2>/dev/null || true
         done
@@ -1308,10 +1317,10 @@ function stateless_snat_del() {
             nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
         done
 
-        if ! _has_other_nat_refs "$table" postrouting "ip saddr $internalCIDR" "ip saddr $internalCIDR ip saddr set $eip"; then
+        if ! _has_other_nat_refs "$table" postrouting "ip saddr $matchCIDR" "ip saddr $matchCIDR ip saddr set $eip"; then
             local cidr_notrack
             cidr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
-                | grep -F "ip saddr $internalCIDR notrack" \
+                | grep -F "ip saddr $matchCIDR notrack" \
                 | grep -oE "handle [0-9]+" | awk '{print $2}')
             for h in $cidr_notrack; do
                 nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
