@@ -32,7 +32,7 @@ type VpcNatGatewayList struct {
 //  2. Runtime state (vpc_cidrs, init status) is managed by separate handlers and will be
 //     automatically restored after Pod recreation through the normal reconciliation flow
 //
-// The only exception is QoSPolicy, which can be updated without Pod restart.
+// The exceptions are QoSPolicy and EnableLanIPAsHairpinSNAT, which are applied without Pod restart.
 type VpcNatGateway struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
@@ -66,6 +66,16 @@ type VpcNatGatewaySpec struct {
 	Routes []Route `json:"routes"`
 	// Disable default EIP assignment
 	NoDefaultEIP bool `json:"noDefaultEIP"`
+	// EnableLanIPAsHairpinSNAT turns on the fallback hairpin SNAT, off by default: VPC traffic
+	// that this gateway DNAT'd back towards the VPC then leaves with the gateway lanIP as source,
+	// which guarantees the reply returns to the instance holding the conntrack entry. Leave it off
+	// when the backend preserves the client address and routes its replies back through this
+	// gateway itself (an LB/envoy pod with a policy route to the lanIP).
+	// It covers every VIP that is not a floating IP (Service ClusterIPs, the gateway lanIP,
+	// share-DNAT VIPs); traffic dialed at a FIP is always SNAT'd to that FIP, independently of
+	// this field. Applied without Pod recreation.
+	// +kubebuilder:validation:Optional
+	EnableLanIPAsHairpinSNAT bool `json:"enableLanIpAsHairpinSnat,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -85,7 +95,14 @@ type VpcBgpSpeaker struct {
 
 // TODO: Consider removing redundant Status fields since statefulset template changes always trigger Pod recreation.
 type VpcNatGatewayStatus struct {
-	QoSPolicy       string              `json:"qosPolicy" patchStrategy:"merge"`
+	QoSPolicy string `json:"qosPolicy" patchStrategy:"merge"`
+	// HairpinSNAT is the state of the lanIP fallback currently programmed on the gateway Pod,
+	// "enable" or "disable" (see Spec.EnableLanIPAsHairpinSNAT), or "unsupported" when that Pod
+	// runs a gateway script that cannot switch it, in which case the Spec field only takes
+	// effect once the Pod is replaced by a gateway image that can. omitempty keeps the other
+	// status writers, which all serialize the whole struct from their own lister snapshot, from
+	// patching a value they never read back over the one this field's own writer just set.
+	HairpinSNAT     string              `json:"hairpinSnat,omitempty" patchStrategy:"merge"`
 	ExternalSubnets []string            `json:"externalSubnets" patchStrategy:"merge"`
 	Selector        []string            `json:"selector" patchStrategy:"merge"`
 	Tolerations     []corev1.Toleration `json:"tolerations" patchStrategy:"merge"`

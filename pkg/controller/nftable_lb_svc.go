@@ -29,8 +29,10 @@ import (
 // The nftable LB service feature makes a vpc-nat-gw act like kube-proxy. Service and
 // EndpointSlice are the source of truth and the only trigger: this controller derives each
 // VIP:port:protocol identity and its complete backend set, then writes the gateway nft map,
-// loopback VIP and VPC route directly. The hairpin SNAT is the gateway's own single rule and
-// needs no per-identity programming.
+// loopback VIP and VPC route directly. These VIPs carry no EIP, so their hairpin SNAT is the
+// gateway's lanIP fallback rule (VpcNatGateway spec.enableLanIpAsHairpinSnat, off by default,
+// which means the backend keeps the client address and is responsible for routing the reply
+// back through the gateway). Either way it needs no per-identity programming.
 //
 // It owns exactly the identities its flags name (see validateServiceFeatureGates for the
 // partition): a LoadBalancer Service's EIP identities with --enable-gw-nftable-lb-svc, and
