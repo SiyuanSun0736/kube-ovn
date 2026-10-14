@@ -64,8 +64,18 @@ import (
 //   topology-aware routing, or terminating-endpoint fallback. Those node-local
 //   semantics do not map cleanly onto a centralized vpc-nat-gw (which is not
 //   per-node), and Cluster policy is the intended, sufficient behavior here.
-//   Consequently client source IP is not preserved (traffic is DNAT'd through the
-//   gateway), matching what Cluster policy already implies.
+//
+//   Whether the client source IP survives is not decided here: these VIPs carry no
+//   floating IP, so they are covered by the gateway's lanIP fallback hairpin SNAT
+//   (VpcNatGateway spec.enableLanIpAsHairpinSnat, off by default, see
+//   nat-gateway.sh). On, every client - VPC-internal or external - reaches the
+//   backend as the gateway lanIP, which is what Cluster policy does with the node
+//   address and is the only mode that needs no cooperation from the backend. Off,
+//   the real client address is preserved and the backend owns the route that brings
+//   its replies back through this gateway. The switch is per gateway, not per
+//   Service: a Service has no field that could express it (ExternalTrafficPolicy
+//   would, but its endpoint-selection half is deliberately unimplemented), and the
+//   Services bound to one gateway share its public identity anyway.
 //
 
 // nftableLbSvcCandidate reports whether a Service can be considered by the gateway controller.

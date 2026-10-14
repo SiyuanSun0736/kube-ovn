@@ -221,7 +221,7 @@ echo "   backend eip $BACKEND_EIP, client eip $CLIENT_EIP, external peer $EXT_PE
 step "the hairpin chain holds the per-FIP jump, and the lanIP fallback is off by default"
 rules=$(gw_rules)
 [ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "expected one hairpin rule, got: $rules"
-grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
     <<< "$rules" || fail "the per-FIP jump is not installed: $rules"
 
 step "binding the FIPs"
@@ -309,7 +309,7 @@ step "the fallback is a switch, the per-FIP rules are not"
 gw_exec bash /kube-ovn/nat-gateway.sh hairpin-snat-set disable >/dev/null
 rules=$(gw_rules)
 [ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "none must leave only the per-FIP jump: $rules"
-grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
     <<< "$rules" || fail "none dropped the per-FIP jump: $rules"
 # FIP traffic is unaffected by the switch: it is still SNAT'd to the dialed FIP
 flush_conntrack
@@ -321,7 +321,7 @@ step "legacy rules of an older script, and their convergence on the next init"
 gw_exec bash -c "
 set -e
 iptables -t nat -F HAIRPIN_SNAT
-iptables -t nat -A HAIRPIN_SNAT -m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT \
+iptables -t nat -A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT \
     --ctorigdst $BACKEND_EIP -j SNAT --to-source $BACKEND_EIP --random-fully
 iptables -t nat -D EXCLUSIVE_SNAT -o $EXTERNAL_INTERFACE -s $CLIENT_IP -j SNAT --to-source $CLIENT_EIP
 iptables -t nat -A EXCLUSIVE_SNAT -s $CLIENT_IP -j SNAT --to-source $CLIENT_EIP" >/dev/null
@@ -335,7 +335,7 @@ echo "   legacy rules reproduced (backend saw the client EIP $src)"
 gw_exec bash /kube-ovn/nat-gateway.sh init "$VPC_INTERFACE,$EXTERNAL_INTERFACE" >/dev/null
 rules=$(gw_rules)
 [ "$(grep -c '^-A HAIRPIN_SNAT ' <<< "$rules")" = 1 ] || fail "expected one hairpin rule after init, got: $rules"
-grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m mark --mark 0x1/0x1 -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
+grep -q -- "^-A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j HAIRPIN_FIP" \
     <<< "$rules" || fail "init did not rebuild the per-FIP jump: $rules"
 grep -q -- "^-A EXCLUSIVE_SNAT -s $CLIENT_IP/32 -o $EXTERNAL_INTERFACE " <<< "$rules" \
     || fail "init did not scope the FIP egress rule: $rules"

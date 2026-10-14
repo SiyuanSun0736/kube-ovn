@@ -151,7 +151,7 @@ networking:
   podNicType: "veth-pair"
   # -- Enable EIP and SNAT.
   # @section -- Network parameters of the CNI
-  enableEipSnat: true
+  enableEipSnat: false
   # -- Comma-separated string of NodeLocal DNS IP addresses.
   # @section -- Network parameters of the CNI
   nodeLocalDnsIp: ""
@@ -190,7 +190,7 @@ features:
   enableLoadbalancer: false
   # -- Enable Kube-OVN network policies
   # @section -- Opt-in/out Features
-  enableNetworkPolicies: true
+  enableNetworkPolicies: false
   # -- Enable external VPCs
   # @section -- Opt-in/out Features
   enableExternalVpcs: false

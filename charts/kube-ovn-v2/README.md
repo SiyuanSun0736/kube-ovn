@@ -851,7 +851,7 @@ false
   "enableLoadbalancer": false,
   "enableLoadbalancerService": false,
   "enableNatGateways": true,
-  "enableNetworkPolicies": true,
+  "enableNetworkPolicies": false,
   "enableOvnInterconnections": false,
   "enableOvnIpsec": false,
   "enableSecureServing": false,
@@ -965,7 +965,7 @@ true
 			<td>features.enableNetworkPolicies</td>
 			<td>bool</td>
 			<td><pre lang="json">
-true
+false
 </pre>
 </td>
 			<td>Enable Kube-OVN network policies</td>
@@ -1364,7 +1364,7 @@ false
 			<td>networking.enableEipSnat</td>
 			<td>bool</td>
 			<td><pre lang="json">
-true
+false
 </pre>
 </td>
 			<td>Enable EIP and SNAT.</td>
