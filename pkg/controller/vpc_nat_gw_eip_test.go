@@ -170,6 +170,59 @@ func TestEnqueueAddIptablesEip(t *testing.T) {
 	require.Equal(t, 1, c.updateIptablesFipQueue.Len())
 }
 
+// An EIP that holds an address but is not ready is mid-convergence: redoEip puts it there
+// (gateway Pod replaced -> Ready=false, Redo=<timestamp>) and the update handler's redo branch
+// is what reprograms it and marks it ready again. That branch only runs when the EIP is
+// enqueued, and the watched fields never change again on their own - an informer resync
+// delivers old == new - so without an explicit wake-up the EIP stays not ready forever while
+// every rule referencing it retries without end. Observed on a live cluster: an EIP sat at
+// ready=false for 30 minutes with its DNAT rule logging "eip is not ready" every 20s, and a
+// single hand-made status edit was enough to make it converge.
+func TestEnqueueUpdateIptablesEipRequeuesHalfProgrammed(t *testing.T) {
+	c := &Controller{
+		updateIptablesEipQueue: newTypedRateLimitingQueue[string]("update_iptables_eip", nil),
+	}
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	// resync of an EIP stuck mid-convergence: nothing changed, yet it must be reconciled
+	stuck := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "stuck"},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{IP: "1.1.1.1", Ready: false, Redo: "2026-01-01T00:00:00"},
+	}
+	c.enqueueUpdateIptablesEip(stuck, stuck.DeepCopy())
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len(), "a not-ready EIP holding an address must be requeued")
+	drainQueue(c.updateIptablesEipQueue)
+
+	// a converged one is left alone: requeueing every resync of every EIP would be a busy loop
+	ready := stuck.DeepCopy()
+	ready.Status.Ready = true
+	c.enqueueUpdateIptablesEip(ready, ready.DeepCopy())
+	require.Zero(t, c.updateIptablesEipQueue.Len(), "a ready EIP must not be requeued by a resync")
+
+	// and neither is one that has no address yet: the add handler owns that phase
+	noAddr := stuck.DeepCopy()
+	noAddr.Status.IP = ""
+	c.enqueueUpdateIptablesEip(noAddr, noAddr.DeepCopy())
+	require.Zero(t, c.updateIptablesEipQueue.Len(), "an EIP without an address must not be requeued here")
+
+	// a terminating one is handled by the deletion branch, which the first condition already covers
+	terminating := stuck.DeepCopy()
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	c.enqueueUpdateIptablesEip(terminating, terminating.DeepCopy())
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len(), "a terminating EIP is still enqueued")
+	drainQueue(c.updateIptablesEipQueue)
+}
+
+func drainQueue(q workqueue.TypedRateLimitingInterface[string]) {
+	for q.Len() != 0 {
+		item, _ := q.Get()
+		q.Done(item)
+		q.Forget(item)
+	}
+}
+
 func TestEnqueueUpdateIptablesEipWakesPendingNatRules(t *testing.T) {
 	now := metav1.Now()
 	pendingFip := &kubeovnv1.IptablesFIPRule{
@@ -252,10 +305,14 @@ func TestEnqueueUpdateIptablesEipWakesPendingNatRules(t *testing.T) {
 	c.updateIptablesDnatRuleQueue = newTypedRateLimitingQueue[string]("UpdateIptablesDnat", nil)
 	c.addIptablesSnatRuleQueue = newTypedRateLimitingQueue[string]("AddIptablesSnat", nil)
 	c.updateIptablesSnatRuleQueue = newTypedRateLimitingQueue[string]("UpdateIptablesSnat", nil)
+	// The EIP's own queue: an update that leaves it not ready now requeues the EIP itself, which
+	// is what drives the redo branch of its handler.
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
 	for _, queue := range []workqueue.TypedRateLimitingInterface[string]{
 		c.addIptablesFipQueue, c.updateIptablesFipQueue,
 		c.addIptablesDnatRuleQueue, c.updateIptablesDnatRuleQueue,
 		c.addIptablesSnatRuleQueue, c.updateIptablesSnatRuleQueue,
+		c.updateIptablesEipQueue,
 	} {
 		t.Cleanup(queue.ShutDown)
 	}

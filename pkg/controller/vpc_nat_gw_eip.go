@@ -119,9 +119,16 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	oldEip := oldObj.(*kubeovnv1.IptablesEIP)
 	newEip := newObj.(*kubeovnv1.IptablesEIP)
+	// An EIP that holds an address but is not ready is mid-convergence: the redo branch of the
+	// update handler reprograms it in the gateway Pod and marks it ready again. Nothing else
+	// moves it forward - the fields watched above never change again on their own, and an
+	// informer resync delivers old == new, so without this an EIP that failed once stays not
+	// ready forever while every FIP/DNAT/SNAT referencing it retries without end.
+	halfProgrammed := newEip.DeletionTimestamp.IsZero() && !newEip.Status.Ready && newEip.Status.IP != ""
 	if !newEip.DeletionTimestamp.IsZero() ||
 		oldEip.Status.Redo != newEip.Status.Redo ||
-		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy {
+		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy ||
+		halfProgrammed {
 		key := cache.MetaObjectToName(newEip).String()
 		klog.Infof("enqueue update iptables eip %s", key)
 		c.updateIptablesEipQueue.Add(key)
