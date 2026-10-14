@@ -79,7 +79,7 @@ function show_help() {
     echo "  vip-addr-sync            - Hold exactly the given share-DNAT VIPs (Service ClusterIPs) on lo"
     echo "  floating-ip-add          - Add floating IP mapping"
     echo "  floating-ip-del          - Delete floating IP mapping"
-    echo "  hairpin-snat-set         - Turn the lanIP fallback hairpin SNAT on/off: disable (default) | enable"
+    echo "  hairpin-snat-set         - Turn the lanIP fallback hairpin SNAT on/off: enable | disable"
     echo "  dnat-add                 - Add DNAT rule"
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
@@ -166,11 +166,12 @@ function init() {
     # version converges onto it. This runs before the init-once guard.
     #
     # init converges the form of the chain, it does not decide policy, so the lanIP fallback
-    # that is already in place is carried over: a fresh Pod has no chain and therefore starts
-    # with it disabled (the default), a hot-replaced script keeps whatever the gateway was
-    # running with. Resetting it here instead would silently drop the return-path SNAT of every
-    # non-FIP VIP the moment an operator reloads the script by hand, and the controller would
-    # not notice, because its recorded state would still say enable.
+    # that is already in place is carried over: a hot-replaced script keeps whatever the gateway
+    # was running with. Resetting it here instead would silently drop the return-path SNAT of
+    # every non-FIP VIP the moment an operator reloads the script by hand, and the controller
+    # would not notice, because its recorded state would still say enable. A fresh Pod has no
+    # chain, so it starts without the fallback and the controller programs the state the spec
+    # asks for (on unless it opts out) right after init, on the same code path.
     ensure_hairpin_fip
     ensure_hairpin_snat "$(current_hairpin_fallback_state)"
     ensure_exclusive_snat_oif
@@ -340,7 +341,7 @@ function del_eip() {
 # Two chains, and they do not overlap:
 #
 #   a FIP          -> HAIRPIN_FIP, owned by the FIP, always installed, not switchable.
-#   anything else  -> the lanIP fallback, a single wildcard MASQUERADE. Opt-in, off by default.
+#   anything else  -> the lanIP fallback, a single wildcard MASQUERADE. On by default, opt-out.
 #
 # HAIRPIN_FIP, maintained by add/del_floating_ip, two rules per FIP:
 #
@@ -360,7 +361,7 @@ function del_eip() {
 # default route, the same route that makes FIP egress work, which assumes a single active
 # gateway instance for the VPC.
 #
-# The lanIP fallback, switched by VpcNatGateway spec.enableLanIpAsHairpinSnat, off by default:
+# The lanIP fallback, switched by VpcNatGateway spec.enableLanIpAsHairpinSnat, on by default:
 #
 #   -A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j MASQUERADE --random-fully
 #
@@ -370,12 +371,12 @@ function del_eip() {
 # gateway is the unit: either every non-FIP VIP on it is masqueraded or none is, because the
 # gateway cannot tell which of its IP resources a given client expects to be transparent.
 #
-#   off (the default) - no SNAT, the backend sees the real client address and is responsible for
+#   off - no SNAT, the backend sees the real client address and is responsible for
 #     routing its reply back through this gateway (an envoy/LB pod with a policy route to the
 #     gateway lanIP, or a VPC policy route matched on the backend's own source address, which is
 #     what a public cloud can express - the client addresses are not knowable in advance).
 #     conntrack then un-DNATs the reply on the way out.
-#   on - the source becomes the address the kernel picks for the output interface, i.e. this
+#   on (the default) - the source becomes the address the kernel picks for the output interface, i.e. this
 #     instance's own VPC-side address, which guarantees the reply comes back to the instance
 #     holding the conntrack entry without any cooperation from the backend. This is the
 #     equivalent of kube-proxy's default Cluster traffic policy, which masquerades to the node
@@ -520,7 +521,7 @@ function ensure_exclusive_snat_oif() {
 # and through its ClusterIP. The ClusterIP is held on lo (/32) so the gateway owns the VIP
 # locally; the hairpin SNAT above needs no per-VIP support. Reached through its EIP the traffic
 # takes the per-FIP rule only if that EIP is a FIP; otherwise both paths land on the lanIP
-# fallback, which is off by default.
+# fallback, which is on by default.
 
 function local_vpc_ipv4() {
     # The address the gateway uses to talk to the VPC, used to scope the lanVIP identities this

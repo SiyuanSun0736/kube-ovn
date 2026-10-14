@@ -271,13 +271,18 @@ func isVpcNatGwChanged(gw *kubeovnv1.VpcNatGateway) bool {
 }
 
 // hairpinSNATMode is the fallback hairpin rule the gateway script has to program for VIPs that are
-// not floating IPs. It is off unless the spec asks for it. FIP traffic is not covered by it: its
-// hairpin rule is part of the FIP itself.
+// not floating IPs. On by default, which is what kube-proxy's Cluster traffic policy does: the
+// backend then needs no route of its own for the reply to come back. FIP traffic is not covered
+// by it: its hairpin rule is part of the FIP itself.
+//
+// The field is defaulted by the CRD, so nil only reaches here on a cluster whose CRD predates it.
+// Reading nil as the default keeps that cluster on the documented behavior instead of silently
+// inverting it.
 func hairpinSNATMode(gw *kubeovnv1.VpcNatGateway) string {
-	if gw.Spec.EnableLanIPAsHairpinSNAT {
-		return hairpinSNATEnable
+	if gw.Spec.EnableLanIPAsHairpinSNAT != nil && !*gw.Spec.EnableLanIPAsHairpinSNAT {
+		return hairpinSNATDisable
 	}
-	return hairpinSNATDisable
+	return hairpinSNATEnable
 }
 
 // syncNatGwHairpinSNAT programs spec.enableLanIpAsHairpinSnat on the gateway Pod when it differs

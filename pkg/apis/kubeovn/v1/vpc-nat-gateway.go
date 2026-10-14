@@ -66,16 +66,26 @@ type VpcNatGatewaySpec struct {
 	Routes []Route `json:"routes"`
 	// Disable default EIP assignment
 	NoDefaultEIP bool `json:"noDefaultEIP"`
-	// EnableLanIPAsHairpinSNAT turns on the fallback hairpin SNAT, off by default: VPC traffic
-	// that this gateway DNAT'd back towards the VPC then leaves with the gateway lanIP as source,
-	// which guarantees the reply returns to the instance holding the conntrack entry. Leave it off
-	// when the backend preserves the client address and routes its replies back through this
-	// gateway itself (an LB/envoy pod with a policy route to the lanIP).
-	// It covers every VIP that is not a floating IP (Service ClusterIPs, the gateway lanIP,
-	// share-DNAT VIPs); traffic dialed at a FIP is always SNAT'd to that FIP, independently of
-	// this field. Applied without Pod recreation.
+	// EnableLanIPAsHairpinSNAT turns on the fallback hairpin SNAT, on by default: traffic this
+	// gateway DNAT'd back towards the VPC then leaves with the gateway lanIP as source, whether
+	// the client dialed from inside the VPC or from the external network. That guarantees the
+	// reply returns to the instance holding the conntrack entry without any cooperation from the
+	// backend, which is what kube-proxy's default Cluster traffic policy does with the node
+	// address. Set it to false to keep the client address, in which case the backend owns the
+	// route that brings its replies back through this gateway (an LB/envoy pod with a policy
+	// route to the lanIP).
+	// The gateway is the unit: it covers every VIP that is not a floating IP (Service ClusterIPs,
+	// the gateway lanIP as a Service VIP, share-DNAT and port DNAT), either all of them or none.
+	// A floating IP is never affected: traffic dialed at a FIP from inside the VPC is always
+	// SNAT'd to that FIP, and an external client dialing it stays visible to its owner.
+	// Applied without Pod recreation.
+	//
+	// A pointer because the three states differ: unset takes the default, which the CRD fills in
+	// as true, while an explicit false must survive JSON marshalling (a plain bool with
+	// omitempty would drop it and the default would silently win).
 	// +kubebuilder:validation:Optional
-	EnableLanIPAsHairpinSNAT bool `json:"enableLanIpAsHairpinSnat,omitempty"`
+	// +kubebuilder:default=true
+	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`

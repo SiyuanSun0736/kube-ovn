@@ -558,19 +558,21 @@ spec:
                   description: Disable default EIP assignment
                 enableLanIpAsHairpinSnat:
                   type: boolean
+                  default: true
                   description: |-
-                    Turns on the fallback hairpin SNAT, off by default: traffic this gateway DNAT'd
+                    Turns on the fallback hairpin SNAT, on by default: traffic this gateway DNAT'd
                     back towards the VPC then leaves with the gateway lanIP as source, whether the
-                    client dialed from inside the VPC or from the external network. This is the
-                    equivalent of kube-proxy's default Cluster traffic policy, which masquerades to
-                    the node address for the same reason, and it frees the backend from routing its
-                    replies back through this gateway. Leave it off to keep the client address, in
-                    which case the backend owns that return route. The gateway is the unit: it
-                    covers every VIP that is not a floating IP (Service ClusterIP, the gateway lanIP
-                    as a Service VIP, share-DNAT and port DNAT), either all of them or none. A
-                    floating IP is never affected: traffic dialed at a FIP from inside the VPC is
-                    always SNAT'd to that FIP, and an external client dialing it stays visible to
-                    its owner. Applied without Pod recreation.
+                    client dialed from inside the VPC or from the external network. That guarantees
+                    the reply returns to the instance holding the conntrack entry without any
+                    cooperation from the backend, which is what kube-proxy's default Cluster traffic
+                    policy does with the node address. Set it to false to keep the client address,
+                    in which case the backend owns the route that brings its replies back through
+                    this gateway. The gateway is the unit: it covers every VIP that is not a
+                    floating IP (Service ClusterIP, the gateway lanIP as a Service VIP, share-DNAT
+                    and port DNAT), either all of them or none. A floating IP is never affected:
+                    traffic dialed at a FIP from inside the VPC is always SNAT'd to that FIP, and an
+                    external client dialing it stays visible to its owner. Applied without Pod
+                    recreation.
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"k8s.io/utils/ptr"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -609,7 +610,7 @@ func TestGetExternalSubnetNad(t *testing.T) {
 // state on every resync.
 func TestSyncNatGwHairpinSNAT(t *testing.T) {
 	gw := fakeGw("gw")
-	gw.Status.HairpinSNAT = hairpinSNATDisable // what handleInitVpcNatGw records on a fresh Pod
+	gw.Status.HairpinSNAT = hairpinSNATEnable // what handleInitVpcNatGw records on a fresh Pod
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
 	})
@@ -622,38 +623,54 @@ func TestSyncNatGwHairpinSNAT(t *testing.T) {
 		return nil
 	}
 
-	// converged: nothing is pushed
+	// converged: the spec is unset, which is the default the status already records
 	require.NoError(t, ctrl.syncNatGwHairpinSNAT(gw, fakeNatGwPod("gw", true)))
 	require.Empty(t, calls)
 
-	// asking for the fallback programs it and records it
-	gw.Spec.EnableLanIPAsHairpinSNAT = true
+	// opting out programs it and records it
+	gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(false)
 	require.NoError(t, ctrl.syncNatGwHairpinSNAT(gw, fakeNatGwPod("gw", true)))
-	require.Equal(t, [][]string{{natGwHairpinSNATSet, "enable"}}, calls)
+	require.Equal(t, [][]string{{natGwHairpinSNATSet, "disable"}}, calls)
 	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Equal(t, "enable", patched.Status.HairpinSNAT)
+	require.Equal(t, "disable", patched.Status.HairpinSNAT)
 
 	// already programmed: nothing is pushed again (the stored object carries the spec the API has,
 	// so state it explicitly rather than relying on what the fake client kept)
-	patched.Spec.EnableLanIPAsHairpinSNAT = true
+	patched.Spec.EnableLanIPAsHairpinSNAT = ptr.To(false)
 	require.NoError(t, ctrl.syncNatGwHairpinSNAT(patched, fakeNatGwPod("gw", true)))
 	require.Len(t, calls, 1)
 
-	// and switching it back off is pushed too
-	patched.Spec.EnableLanIPAsHairpinSNAT = false
+	// and switching it back on is pushed too
+	patched.Spec.EnableLanIPAsHairpinSNAT = ptr.To(true)
 	require.NoError(t, ctrl.syncNatGwHairpinSNAT(patched, fakeNatGwPod("gw", true)))
-	require.Equal(t, []string{natGwHairpinSNATSet, "disable"}, calls[1])
+	require.Equal(t, []string{natGwHairpinSNATSet, "enable"}, calls[1])
+
+	// clearing the field goes back to the default, which is on
+	patched.Spec.EnableLanIPAsHairpinSNAT = nil
+	patched.Status.HairpinSNAT = hairpinSNATDisable
+	require.NoError(t, ctrl.syncNatGwHairpinSNAT(patched, fakeNatGwPod("gw", true)))
+	require.Equal(t, []string{natGwHairpinSNATSet, "enable"}, calls[2])
 }
 
-// The fallback is off unless the gateway asks for it.
-func TestHairpinSNATModeDefaultsToOff(t *testing.T) {
+// The fallback is on unless the gateway opts out.
+// The default is on, matching kube-proxy's Cluster traffic policy: a backend that programs no
+// route of its own still gets its replies back through the gateway. Only an explicit false opts
+// out, which is why the field is a pointer - a plain bool could not tell "unset" from "off".
+func TestHairpinSNATModeDefaultsToOn(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "disable", hairpinSNATMode(fakeGw("unset")))
-	gw := fakeGw("gw")
-	gw.Spec.EnableLanIPAsHairpinSNAT = true
+	// unset: the CRD default fills this in as true, and a cluster whose CRD predates the field
+	// must land on the same behavior rather than silently inverting it
+	require.Equal(t, "enable", hairpinSNATMode(fakeGw("unset")))
+
+	gw := fakeGw("on")
+	gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(true)
 	require.Equal(t, "enable", hairpinSNATMode(gw))
+
+	off := fakeGw("off")
+	off.Spec.EnableLanIPAsHairpinSNAT = ptr.To(false)
+	require.Equal(t, "disable", hairpinSNATMode(off))
 }
 
 // The init path is the only place a replaced Pod gets its hairpin fallback back: it programs the
@@ -684,7 +701,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			t.Cleanup(func() { vpcNatEnabled = old })
 
 			gw := fakeGw("gw")
-			gw.Spec.EnableLanIPAsHairpinSNAT = tt.enabled
+			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
 			pod := fakeNatGwPod("gw", false)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
@@ -819,7 +836,7 @@ func TestSyncNatGwHairpinSNATSkipsUnprogrammedPod(t *testing.T) {
 
 			gw := fakeGw("gw")
 			gw.Status.HairpinSNAT = tt.status
-			gw.Spec.EnableLanIPAsHairpinSNAT = tt.enabled
+			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
 			})
@@ -857,7 +874,7 @@ func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
 			t.Cleanup(func() { vpcNatEnabled = old })
 
 			gw := fakeGw("gw")
-			gw.Spec.EnableLanIPAsHairpinSNAT = tt.enabled
+			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
 			pod := fakeNatGwPod("gw", false)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
