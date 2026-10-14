@@ -323,49 +323,66 @@ function del_eip() {
 
 # ===== hairpin SNAT =====
 #
-# Hairpin is VPC-originated traffic that this gateway DNAT'd and forwards back out the VPC
-# interface. Without SNAT the backend would answer the client directly, bypassing the gateway
-# that holds the conntrack entry, and the client would drop the reply because its source is the
-# backend address instead of the VIP it dialed. (DNAT to a gateway-local service takes INPUT
-# instead and keeps the client address; nothing here applies to it.)
+# This covers traffic that this gateway DNAT'd and forwards back out the VPC interface, whether
+# the client dialed from inside the VPC or from the external network. Without SNAT the backend
+# answers the client directly, bypassing the gateway that holds the conntrack entry, and the
+# client drops the reply because its source is the backend address instead of the VIP it dialed -
+# unless the backend itself routes the reply back through this gateway. (DNAT to a
+# gateway-local service takes INPUT instead and keeps the client address; nothing here applies.)
 #
-# Who provides that SNAT depends on what the client dialed, and the two cases do not overlap:
+# A centralized gateway is what makes this necessary at all. kube-proxy DNATs on the client's own
+# node, so the reply cannot avoid the conntrack entry and needs no SNAT for ClusterIP traffic; it
+# masquerades NodePort/LoadBalancer traffic for the same reason this gateway does, because the
+# node that accepted the connection may not be the one hosting the endpoint ("in case we cross
+# nodes"). Here every DNAT happens on the gateway, so the reply has to be brought back to it,
+# either by SNAT or by a route the backend owns.
 #
-#   a FIP          -> the FIP's own SNAT, in HAIRPIN_FIP. Always installed, owned by the FIP.
+# Two chains, and they do not overlap:
+#
+#   a FIP          -> HAIRPIN_FIP, owned by the FIP, always installed, not switchable.
 #   anything else  -> the lanIP fallback, a single wildcard MASQUERADE. Opt-in, off by default.
 #
-# HAIRPIN_FIP, maintained by add/del_floating_ip:
+# HAIRPIN_FIP, maintained by add/del_floating_ip, two rules per FIP:
 #
-#   -A HAIRPIN_SNAT -m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j HAIRPIN_FIP
-#   -A HAIRPIN_FIP -m conntrack --ctorigdst <eip> -j SNAT --to-source <eip> --random-fully
+#   -A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j HAIRPIN_FIP
+#   -A HAIRPIN_FIP -m conntrack --ctorigdst <eip> -m mark --mark 0x1/0x1 \
+#      -j SNAT --to-source <eip> --random-fully
+#   -A HAIRPIN_FIP -m conntrack --ctorigdst <eip> -j ACCEPT
 #
-# The match is the destination the client dialed before DNAT rewrote it, and the source becomes
-# that same FIP: reaching a FIP from inside the VPC looks to the backend exactly like reaching it
-# from outside, which is what owning a FIP means. This is part of the FIP, not a policy choice,
-# so the switch below does not apply to it; SNAT is terminating, so FIP traffic never reaches the
-# fallback. The reply addressed to the FIP returns through the VPC default route, the same route
-# that makes FIP egress work, which assumes a single active gateway instance for the VPC.
+# The match is the destination the client dialed before DNAT rewrote it. A client inside the VPC
+# (the 0x1 mark is set by the mangle VPC_MARK rule on $VPC_INTERFACE) is SNAT'd to that same FIP,
+# so reaching a FIP from inside the VPC looks to the backend exactly like reaching it from
+# outside, which is what owning a FIP means. A client from the external network is left alone:
+# a FIP is a 1:1 public address, its owner is supposed to see who dialed it. The second rule is
+# what keeps that true once the fallback below is on - ACCEPT ends nat traversal, so external
+# FIP traffic never reaches the wildcard rule. Both are part of the FIP, not a policy choice,
+# so the switch does not apply to either. The reply addressed to the FIP returns through the VPC
+# default route, the same route that makes FIP egress work, which assumes a single active
+# gateway instance for the VPC.
 #
 # The lanIP fallback, switched by VpcNatGateway spec.enableLanIpAsHairpinSnat, off by default:
 #
-#   -A HAIRPIN_SNAT -m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT \
-#      -j MASQUERADE --random-fully
+#   -A HAIRPIN_SNAT -o $VPC_INTERFACE -m conntrack --ctstate DNAT -j MASQUERADE --random-fully
 #
-# The three match conditions describe exactly one thing: traffic that entered from the VPC (the
-# 0x1 mark is set by the mangle VPC_MARK rule on $VPC_INTERFACE), was DNAT'd by this gateway, and
-# leaves towards the VPC again. What reaches this rule is whatever HAIRPIN_FIP did not claim,
-# i.e. a VIP that carries no FIP: a Service ClusterIP, the gateway's own lanIP as a Service VIP,
-# a share-DNAT VIP. One wildcard rule covers all of them, with no per-identity bookkeeping.
+# What reaches it is whatever HAIRPIN_FIP did not claim: a VIP that carries no FIP - a Service
+# ClusterIP, the gateway's own lanIP as a Service VIP, a share-DNAT VIP, a port DNAT rule. One
+# wildcard rule covers all of them in both directions, with no per-identity bookkeeping. The
+# gateway is the unit: either every non-FIP VIP on it is masqueraded or none is, because the
+# gateway cannot tell which of its IP resources a given client expects to be transparent.
 #
 #   off (the default) - no SNAT, the backend sees the real client address and is responsible for
 #     routing its reply back through this gateway (an envoy/LB pod with a policy route to the
-#     gateway lanIP); conntrack then un-DNATs the reply on the way out.
+#     gateway lanIP, or a VPC policy route matched on the backend's own source address, which is
+#     what a public cloud can express - the client addresses are not knowable in advance).
+#     conntrack then un-DNATs the reply on the way out.
 #   on - the source becomes the address the kernel picks for the output interface, i.e. this
 #     instance's own VPC-side address, which guarantees the reply comes back to the instance
-#     holding the conntrack entry without any cooperation from the backend. It is the only source
-#     that achieves this: it is instance-local (a VIP could be routed to a replica that knows
-#     nothing about the connection), it needs no VPC default route to pull the reply back, and it
-#     follows the interface, so an address change or a rescheduling needs no rule update.
+#     holding the conntrack entry without any cooperation from the backend. This is the
+#     equivalent of kube-proxy's default Cluster traffic policy, which masquerades to the node
+#     address for the same reason. It is the only source that achieves this: it is
+#     instance-local (a VIP could be routed to a replica that knows nothing about the
+#     connection), it needs no VPC default route to pull the reply back, and it follows the
+#     interface, so an address change or a rescheduling needs no rule update.
 #
 # Source-address preservation and that return-path guarantee are mutually exclusive, which is why
 # this is a switch and not a rule that is always there. DNAT and LB gateways share the one switch:
@@ -403,7 +420,9 @@ function ensure_hairpin_snat() {
     # lanVIP feature). They are dropped here; the per-FIP ones among them come back in
     # HAIRPIN_FIP, which ensure_hairpin_fip rebuilds from the FIP map.
     local state=${1:-disable}
-    local match="-m mark --mark 0x1/0x1 -o $VPC_INTERFACE -m conntrack --ctstate DNAT"
+    # No mark test here: the fallback covers both directions (see the block above). The mark is
+    # tested inside HAIRPIN_FIP, which needs to tell them apart.
+    local match="-o $VPC_INTERFACE -m conntrack --ctstate DNAT"
     $iptables_cmd -t nat -N HAIRPIN_SNAT >/dev/null 2>&1 || true
     # The jump target has to exist before the jump is added; creating it here (and not only in
     # ensure_hairpin_fip) is what lets a mode switch leave the per-FIP rules alone.
@@ -451,7 +470,8 @@ function ensure_hairpin_fip() {
     while read -r eip
     do
         [ -z "$eip" ] && continue
-        exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -j SNAT --to-source $eip --random-fully"
+        exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -m mark --mark 0x1/0x1 -j SNAT --to-source $eip --random-fully"
+        exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -j ACCEPT"
     done <<< "$($iptables_save_cmd -t nat | sed -n 's#^-A EXCLUSIVE_DNAT .*-d \([0-9.]*\)/32 .*#\1#p')"
 }
 
@@ -460,15 +480,21 @@ function add_hairpin_fip() {
     # reaches here for a FIP that is already programmed.
     local eip=$1
     $iptables_cmd -t nat -N HAIRPIN_FIP >/dev/null 2>&1 || true
-    $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -j SNAT --to-source "$eip" --random-fully >/dev/null 2>&1 && return 0
-    exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -j SNAT --to-source $eip --random-fully"
+    if ! $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -m mark --mark 0x1/0x1 -j SNAT --to-source "$eip" --random-fully >/dev/null 2>&1; then
+        exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -m mark --mark 0x1/0x1 -j SNAT --to-source $eip --random-fully"
+    fi
+    $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -j ACCEPT >/dev/null 2>&1 && return 0
+    exec_cmd "$iptables_cmd -t nat -A HAIRPIN_FIP -m conntrack --ctorigdst $eip -j ACCEPT"
 }
 
 function del_hairpin_fip() {
     # Lenient, like del_floating_ip: identity is the EIP, absence means already deleted.
     local eip=$1
-    $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -j SNAT --to-source "$eip" --random-fully >/dev/null 2>&1 || return 0
-    exec_cmd "$iptables_cmd -t nat -D HAIRPIN_FIP -m conntrack --ctorigdst $eip -j SNAT --to-source $eip --random-fully"
+    if $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -m mark --mark 0x1/0x1 -j SNAT --to-source "$eip" --random-fully >/dev/null 2>&1; then
+        exec_cmd "$iptables_cmd -t nat -D HAIRPIN_FIP -m conntrack --ctorigdst $eip -m mark --mark 0x1/0x1 -j SNAT --to-source $eip --random-fully"
+    fi
+    $iptables_cmd -t nat -C HAIRPIN_FIP -m conntrack --ctorigdst "$eip" -j ACCEPT >/dev/null 2>&1 || return 0
+    exec_cmd "$iptables_cmd -t nat -D HAIRPIN_FIP -m conntrack --ctorigdst $eip -j ACCEPT"
 }
 
 function ensure_exclusive_snat_oif() {

@@ -191,7 +191,7 @@ ensure_hairpin_snat
 # the lanIP fallback is off by default, so init leaves the per-FIP jump alone: traffic dialed at a
 # FIP is SNAT'd to that FIP whatever the switch says
 [[ "$(wc -l < "$hairpin_state")" == 1 ]]
-[[ "$(head -1 "$hairpin_state")" == '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' ]]
+[[ "$(head -1 "$hairpin_state")" == '-o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' ]]
 # the legacy nft hairpin chains of the lanVIP feature go with them
 grep -qF 'delete chain ip kube-ovn postrouting' "$nft_log"
 grep -qF 'delete chain ip kube-ovn lanvip-snat' "$nft_log"
@@ -203,8 +203,8 @@ ensure_hairpin_snat
 : > "$ipt_log"
 hairpin_snat_mode enable
 [[ "$(wc -l < "$hairpin_state")" == 2 ]]
-[[ "$(head -1 "$hairpin_state")" == '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' ]]
-[[ "$(tail -1 "$hairpin_state")" == '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT -j MASQUERADE --random-fully' ]]
+[[ "$(head -1 "$hairpin_state")" == '-o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' ]]
+[[ "$(tail -1 "$hairpin_state")" == '-o eth0 -m conntrack --ctstate DNAT -j MASQUERADE --random-fully' ]]
 # the fallback rule is address-independent: no VPC address is read to build it
 vpc_has_addr=false
 hairpin_snat_mode enable
@@ -213,13 +213,38 @@ vpc_has_addr=true
 # ... and switching it back off keeps the per-FIP jump
 hairpin_snat_mode disable
 [[ "$(wc -l < "$hairpin_state")" == 1 ]]
-grep -qxF -- '-m mark --mark 0x1/0x1 -o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' "$hairpin_state"
+grep -qxF -- '-o eth0 -m conntrack --ctstate DNAT -j HAIRPIN_FIP' "$hairpin_state"
 # switching the fallback must not touch the per-FIP chain: rebuilding it would leave the FIP
 # hairpin rules missing for the duration of an operation that has nothing to do with them
 refute grep -q -- '-t nat -F HAIRPIN_FIP' "$ipt_log"
 refute grep -q -- '-t nat -A HAIRPIN_FIP ' "$ipt_log"
 # ... and an unknown mode is refused rather than silently rewriting the chain
 refute hairpin_snat_mode bogus
+
+# The fallback is reached by external clients too (no mark test on the jump), which is what makes
+# it the equivalent of kube-proxy's Cluster policy. The one thing that must stay out of its way
+# is a FIP: its owner is supposed to see who dialed its public address. That is enforced by rule
+# order inside HAIRPIN_FIP, so assert the whole shape rather than the single rule.
+: > "$hairpin_fip_state"
+if ! ( add_floating_ip 203.0.113.70,10.0.7.7 ); then exit 1; fi
+hairpin_snat_mode enable
+# neither HAIRPIN_SNAT rule filters on the mark: both directions reach the two chains
+refute grep -q -- '-m mark' "$hairpin_state"
+[[ "$(wc -l < "$hairpin_state")" == 2 ]]
+# the FIP jump is evaluated before the wildcard masquerade
+[[ "$(grep -n -- '-j HAIRPIN_FIP' "$hairpin_state" | cut -d: -f1)" \
+   -lt "$(grep -n -- '-j MASQUERADE' "$hairpin_state" | cut -d: -f1)" ]]
+# and inside it the external-client rule terminates nat traversal, so the masquerade below can
+# never rewrite a client dialing a FIP
+grep -qxF -- '-m conntrack --ctorigdst 203.0.113.70 -j ACCEPT' "$hairpin_fip_state"
+hairpin_snat_mode disable
+if ! del_floating_ip 203.0.113.70; then exit 1; fi
+: > "$dnat_state"
+: > "$snat_state"
+: > "$hairpin_fip_state"
+# later sections count calls cumulatively, so this block must not leave any behind
+: > "$ipt_log"
+: > "$conntrack_log"
 
 # init converges the form of the chain, not the policy: an operator who hot-replaces the script
 # and runs init by hand must not silently lose the fallback the gateway was running with, because
@@ -232,8 +257,9 @@ hairpin_snat_mode disable
 # ... and init must actually be the caller of that decision, otherwise the function above is
 # dead code and a manual init silently resets the policy (the chain rebuild is form-only).
 grep -qF 'ensure_hairpin_snat "$(current_hairpin_fallback_state)"' "$script"
-# the state is only programmed on an initialized gateway (one check_inited per mode call)
-[[ "$inited_calls" == 10 ]]
+# the state is only programmed on an initialized gateway (one check_inited per mode call;
+# the count tracks the hairpin_snat_mode calls above, adjust it when adding one)
+[[ "$inited_calls" == 12 ]]
 
 # The per-FIP chain is derived from the authoritative FIP map in EXCLUSIVE_DNAT, so a gateway
 # whose script was hot-replaced gets it at init without the controller replaying every FIP.
@@ -243,10 +269,16 @@ printf '%s\n' \
     > "$dnat_state"
 printf '%s\n' '-m conntrack --ctorigdst 203.0.113.99 -j SNAT --to-source 203.0.113.99 --random-fully' > "$hairpin_fip_state"
 ensure_hairpin_fip
-[[ "$(wc -l < "$hairpin_fip_state")" == 2 ]]
-# the rule is keyed on the dialed EIP and SNATs to that same EIP, the form this gateway used
-# before the hairpin rules were unified
-grep -qxF -- '-m conntrack --ctorigdst 203.0.113.80 -j SNAT --to-source 203.0.113.80 --random-fully' "$hairpin_fip_state"
+# two rules per FIP: the dialed EIP is SNAT'd to itself for a VPC client, and left alone for an
+# external one. The second rule is not cosmetic - ACCEPT ends nat traversal, which is what keeps
+# an external client visible to the FIP owner once the lanIP fallback is on.
+[[ "$(wc -l < "$hairpin_fip_state")" == 4 ]]
+grep -qxF -- '-m conntrack --ctorigdst 203.0.113.80 -m mark --mark 0x1/0x1 -j SNAT --to-source 203.0.113.80 --random-fully' "$hairpin_fip_state"
+grep -qxF -- '-m conntrack --ctorigdst 203.0.113.80 -j ACCEPT' "$hairpin_fip_state"
+# the external-client rule comes after the VPC one, so a marked packet is SNAT'd and never
+# reaches the ACCEPT
+[[ "$(grep -n -- '--ctorigdst 203.0.113.80 ' "$hairpin_fip_state" | head -1 | cut -d: -f1)" \
+   -lt "$(grep -n -- '--ctorigdst 203.0.113.80 -j ACCEPT' "$hairpin_fip_state" | cut -d: -f1)" ]]
 refute grep -qF -- '203.0.113.99' "$hairpin_fip_state"
 : > "$dnat_state"
 : > "$hairpin_fip_state"
@@ -289,29 +321,30 @@ if ! del_floating_ip 203.0.113.20; then exit 1; fi
 : > "$hairpin_fip_state"
 : > "$ipt_log"
 if ! ( add_floating_ip 203.0.113.30,10.0.7.3 ); then exit 1; fi
-grep -qxF -- '-m conntrack --ctorigdst 203.0.113.30 -j SNAT --to-source 203.0.113.30 --random-fully' "$hairpin_fip_state"
+grep -qxF -- '-m conntrack --ctorigdst 203.0.113.30 -m mark --mark 0x1/0x1 -j SNAT --to-source 203.0.113.30 --random-fully' "$hairpin_fip_state"
+grep -qxF -- '-m conntrack --ctorigdst 203.0.113.30 -j ACCEPT' "$hairpin_fip_state"
 # re-adding the same FIP converges: add_floating_ip returns early on its DNAT rule, and the
 # hairpin rule is repaired on that path too (a gateway programmed before this feature existed).
 # The iptables stub ignores a duplicate -A, so idempotency is asserted on the calls, not on the
 # resulting state: exactly one -A, and every later call checking with -C first.
 if ! ( add_floating_ip 203.0.113.30,10.0.7.3 ); then exit 1; fi
 if ! ( add_floating_ip 203.0.113.30,10.0.7.3 ); then exit 1; fi
-[[ "$(grep -c -- '-t nat -A HAIRPIN_FIP ' "$ipt_log")" == 1 ]]
-[[ "$(grep -c -- '-t nat -C HAIRPIN_FIP ' "$ipt_log")" == 3 ]]
-[[ "$(wc -l < "$hairpin_fip_state")" == 1 ]]
+[[ "$(grep -c -- '-t nat -A HAIRPIN_FIP ' "$ipt_log")" == 2 ]]
+[[ "$(grep -c -- '-t nat -C HAIRPIN_FIP ' "$ipt_log")" == 6 ]]
+[[ "$(wc -l < "$hairpin_fip_state")" == 2 ]]
 # a conflicting binding is still rejected, and adds no second rule
 refute add_floating_ip 203.0.113.30,10.0.7.4
-[[ "$(grep -c -- '-t nat -A HAIRPIN_FIP ' "$ipt_log")" == 1 ]]
-[[ "$(wc -l < "$hairpin_fip_state")" == 1 ]]
+[[ "$(grep -c -- '-t nat -A HAIRPIN_FIP ' "$ipt_log")" == 2 ]]
+[[ "$(wc -l < "$hairpin_fip_state")" == 2 ]]
 # deleting the FIP takes its hairpin rule with it, idempotently: the second delete finds nothing
 # through -C and issues no -D
 : > "$ipt_log"
 if ! del_floating_ip 203.0.113.30; then exit 1; fi
 [[ ! -s "$hairpin_fip_state" ]]
-[[ "$(grep -c -- '-t nat -D HAIRPIN_FIP ' "$ipt_log")" == 1 ]]
+[[ "$(grep -c -- '-t nat -D HAIRPIN_FIP ' "$ipt_log")" == 2 ]]
 if ! del_floating_ip 203.0.113.30; then exit 1; fi
 [[ ! -s "$hairpin_fip_state" ]]
-[[ "$(grep -c -- '-t nat -D HAIRPIN_FIP ' "$ipt_log")" == 1 ]]
+[[ "$(grep -c -- '-t nat -D HAIRPIN_FIP ' "$ipt_log")" == 2 ]]
 
 # QoS filter cleanup must distinguish the EIP class range (0x1-0x7ffe) from the NatGw range
 # (0x8000-0xfeff) by value. tc prints classids without leading zeros, so a three-digit classid
