@@ -27,9 +27,9 @@ if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" ]]; then
 else
   ENABLE_LB=${ENABLE_LB:-true}
 fi
-ENABLE_NP=${ENABLE_NP:-true}
+ENABLE_NP=${ENABLE_NP:-false}
 NP_ENFORCEMENT=${NP_ENFORCEMENT:-standard}
-ENABLE_EIP_SNAT=${ENABLE_EIP_SNAT:-true}
+ENABLE_EIP_SNAT=${ENABLE_EIP_SNAT:-false}
 LS_DNAT_MOD_DL_DST=${LS_DNAT_MOD_DL_DST:-true}
 LS_CT_SKIP_DST_LPORT_IPS=${LS_CT_SKIP_DST_LPORT_IPS:-true}
 ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-false}
@@ -129,8 +129,6 @@ VLAN_ID="100"
 
 if [ "$ENABLE_VLAN" = "true" ]; then
   NETWORK_TYPE="vlan"
-  # ENABLE_EIP_SNAT is only supported when you use vpc, vlan not support
-  ENABLE_EIP_SNAT=${ENABLE_EIP_SNAT:-false}
   if [ "$VLAN_NIC" != "" ]; then
     VLAN_INTERFACE_NAME="$VLAN_NIC"
   fi
