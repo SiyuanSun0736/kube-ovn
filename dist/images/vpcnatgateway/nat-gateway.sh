@@ -308,8 +308,10 @@ function add_eip() {
     # In L2 (macvlan) mode, use "onlink" via GATEWAY_V4.
     if [ -n "$ptp_peer" ]; then
         exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE"
+        exec_cmd "ip route del default dev $VPC_INTERFACE 2>/dev/null || true"
     elif [ -n "$GATEWAY_V4" ]; then
         exec_cmd "ip route replace default via $GATEWAY_V4 dev $EXTERNAL_INTERFACE onlink"
+        exec_cmd "ip route del default dev $VPC_INTERFACE 2>/dev/null || true"
     fi
 
     if [ -n "$GATEWAY_V6" ]; then
