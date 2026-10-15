@@ -314,7 +314,8 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 }
 
 func (c *Controller) handleResetIptablesEip(key string) error {
-	if _, err := c.iptablesEipsLister.Get(key); err != nil {
+	cachedEip, err := c.iptablesEipsLister.Get(key)
+	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
@@ -326,7 +327,15 @@ func (c *Controller) handleResetIptablesEip(key string) error {
 		klog.Errorf("failed to patch label for eip %s, %v", key, err)
 		return err
 	}
-	if err := c.patchEipStatus(key, "", "", "", true); err != nil {
+	// The reset refreshes what the EIP records about itself (its QoS label and the status.nat
+	// field naming the rules that use it); readiness is not its call to make. An outstanding
+	// redo means a gateway Pod was recreated and this EIP's address still has to be put back
+	// on it - and the redo path keys off Ready being false. Declaring ready here would erase
+	// that work order and leave a ready EIP with nothing behind it, which for a LoadBalancer
+	// means an ingress IP that answers nobody. The EIP's own update path flips it to ready
+	// once the address is programmed.
+	ready := cachedEip.Status.Ready || cachedEip.Status.Redo == ""
+	if err := c.patchEipStatus(key, "", "", "", ready); err != nil {
 		klog.Errorf("failed to reset nat for eip %s, %v", key, err)
 		return err
 	}
