@@ -331,7 +331,8 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 }
 
 func (c *Controller) handleResetIptablesEip(key string) error {
-	if _, err := c.iptablesEipsLister.Get(key); err != nil {
+	cachedEip, err := c.iptablesEipsLister.Get(key)
+	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
@@ -343,7 +344,15 @@ func (c *Controller) handleResetIptablesEip(key string) error {
 		klog.Errorf("failed to patch label for eip %s, %v", key, err)
 		return err
 	}
-	if err := c.patchEipStatus(key, "", "", "", true); err != nil {
+	// The reset refreshes what the EIP records about itself (its QoS label and the status.nat
+	// field naming the rules that use it); readiness is not its call to make. An outstanding
+	// redo means a gateway Pod was recreated and this EIP's address still has to be put back
+	// on it - and the redo path keys off Ready being false. Declaring ready here would erase
+	// that work order and leave a ready EIP with nothing behind it, which for a LoadBalancer
+	// means an ingress IP that answers nobody. The EIP's own update path flips it to ready
+	// once the address is programmed.
+	ready := cachedEip.Status.Ready || cachedEip.Status.Redo == ""
+	if err := c.patchEipStatus(key, "", "", "", ready); err != nil {
 		klog.Errorf("failed to reset nat for eip %s, %v", key, err)
 		return err
 	}
@@ -494,6 +503,11 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			return fmt.Errorf("qos policy %s is not ready; wait for its first controller reconcile before referencing it", cachedEip.Spec.QoSPolicy)
 		}
 		uidMatches := cachedEip.Labels[util.QoSPolicyUIDLabel] == string(desiredQoS.UID)
+		// Fast path: the QoS policy is back, so readiness can be confirmed without touching
+		// the data plane. Status.Redo is never cleared once written (see the redo branch
+		// below), so the Redo == "" test below only holds for an EIP that has never been
+		// redone; a redo'd EIP can never take this shortcut and is recovered by the redo
+		// branch's idempotent reprogramming instead. That division is deliberate.
 		if uidMatches && !cachedEip.Status.Ready && cachedEip.Status.Redo == "" && cachedEip.Status.IP != "" {
 			if _, err = c.getBindableQoSPolicy(cachedEip.Spec.QoSPolicy); err != nil {
 				return err
@@ -544,6 +558,9 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			return err
 		}
 
+		// Same contract as the fast path above: Redo == "" is true only for an EIP that has
+		// never been redone; otherwise this stays not ready here and the redo branch flips
+		// it to ready once its replay has programmed the address back.
 		ready := cachedEip.Status.Ready || (cachedEip.Status.Redo == "" && cachedEip.Status.IP != "")
 		if err = c.patchEipQoSStatus(key, cachedEip.Spec.QoSPolicy, ready); err != nil {
 			klog.Errorf("failed to patch status for eip %s, %v", key, err)
@@ -556,18 +573,12 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 		cachedEip.Status.Redo != "" &&
 		cachedEip.Status.IP != "" &&
 		cachedEip.DeletionTimestamp.IsZero() {
-		gwPod, err := c.getNatGwPod(cachedEip.Spec.NatGwDp, c.natEipNamespace(cachedEip))
-		if err != nil {
-			klog.Error(err)
-			return err
-		}
-		// compare gw pod started time with eip redo time. if redo time before gw pod started. redo again
-		eipRedo, _ := time.ParseInLocation("2006-01-02T15:04:05", cachedEip.Status.Redo, time.Local)
-		if cachedEip.Status.Ready && cachedEip.Status.IP != "" && gwPod.Status.ContainerStatuses[0].State.Running.StartedAt.Before(&metav1.Time{Time: eipRedo}) {
-			// already ok
-			klog.V(3).Infof("eip %s already ok", key)
-			return nil
-		}
+		// The redo timestamp is never cleared once written (patchEipStatus only overwrites
+		// it with a non-empty value), so this combination is the sole signal that a replay
+		// is owed. Replaying is idempotent: the gateway script adds everything with
+		// "ip addr replace" and "tc ... replace". There is no "the gateway may have kept
+		// the state" shortcut: whatever was programmed on the previous Pod is gone with
+		// that Pod and must be replayed.
 		addrV4, err := util.GetIPAddrWithMask(cachedEip.Status.IP, v4Cidr)
 		if err != nil {
 			err = fmt.Errorf("failed to get eip %s with mask by cidr %s: %w", cachedEip.Status.IP, v4Cidr, err)

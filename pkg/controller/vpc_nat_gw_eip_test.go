@@ -1068,3 +1068,70 @@ func TestTerminatingQoSPolicyDeadlock(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, qos.Finalizers, "the terminating qos policy must be released")
 }
+
+// TestHandleResetIptablesEipKeepsRedoPending pins the one thing the reset path must not do:
+// declare an EIP ready while its address still has to be put back on a gateway Pod.
+//
+// The reset exists to refresh what an EIP records about itself - its QoS label and the
+// status.nat field naming the rules that use it - and it is enqueued by the nftable LB
+// Service reconcile once the Service is programmed. Marking the EIP ready is incidental to
+// that, but it is the only signal the redo path has: after a gateway Pod is recreated,
+// redoEip sets Ready=false with a Redo timestamp, and handleUpdateIptablesEip re-adds the
+// address only while Ready is false. A reset landing in that window erases the signal, so
+// the address is never programmed again and every controller sees a ready EIP with nothing
+// behind it - the Service keeps its ingress IP and no traffic ever arrives.
+//
+// Only EIPs serving a LoadBalancer reach this path (that LB reconcile is the single
+// enqueue site), which is why a gateway restart leaves its snat/dnat/fip EIPs working and
+// only the LB one dead.
+func TestHandleResetIptablesEipKeepsRedoPending(t *testing.T) {
+	t.Parallel()
+
+	// A gateway Pod was just recreated: redoEip left this EIP not ready with a redo stamp.
+	redoPending := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "redo-pending"},
+		Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "1.1.1.1", NatGwDp: "gw"},
+		Status: kubeovnv1.IptablesEIPStatus{
+			IP: "1.1.1.1", Ready: false, Redo: "2026-01-01T00:00:00",
+		},
+	}
+	// Steady state: no redo outstanding, so the reset may confirm readiness as before.
+	settled := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "settled"},
+		Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "2.2.2.2", NatGwDp: "gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{IP: "2.2.2.2", Ready: false},
+	}
+
+	client := kubeovnfake.NewSimpleClientset()
+	for _, obj := range []*kubeovnv1.IptablesEIP{redoPending, settled} {
+		_, err := client.KubeovnV1().IptablesEIPs().Create(t.Context(), obj, metav1.CreateOptions{})
+		require.NoError(t, err)
+	}
+	factory := kubeovninformerfactory.NewSharedInformerFactory(client, 0)
+	eipInformer := factory.Kubeovn().V1().IptablesEIPs()
+	qosInformer := factory.Kubeovn().V1().QoSPolicies()
+	for _, obj := range []*kubeovnv1.IptablesEIP{redoPending, settled} {
+		require.NoError(t, eipInformer.Informer().GetStore().Add(obj))
+	}
+
+	c := &Controller{
+		iptablesEipsLister:      eipInformer.Lister(),
+		qosPoliciesLister:       qosInformer.Lister(),
+		iptablesDnatRulesLister: factory.Kubeovn().V1().IptablesDnatRules().Lister(),
+		iptablesSnatRulesLister: factory.Kubeovn().V1().IptablesSnatRules().Lister(),
+		iptablesFipsLister:      factory.Kubeovn().V1().IptablesFIPRules().Lister(),
+		config:                  &Configuration{KubeOvnClient: client},
+	}
+
+	require.NoError(t, c.handleResetIptablesEip("redo-pending"))
+	got, err := client.KubeovnV1().IptablesEIPs().Get(t.Context(), "redo-pending", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, got.Status.Ready,
+		"reset must leave the EIP not ready while a redo is outstanding, otherwise its address is never put back on the gateway")
+	require.Equal(t, "2026-01-01T00:00:00", got.Status.Redo, "the redo stamp is the work order; reset must not drop it")
+
+	require.NoError(t, c.handleResetIptablesEip("settled"))
+	got, err = client.KubeovnV1().IptablesEIPs().Get(t.Context(), "settled", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.True(t, got.Status.Ready, "with no redo outstanding the reset still confirms readiness")
+}
