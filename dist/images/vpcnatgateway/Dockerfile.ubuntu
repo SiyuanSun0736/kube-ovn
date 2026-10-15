@@ -59,6 +59,7 @@ RUN curl -sSf -L --retry 5 -o /usr/bin/dumb-init \
 WORKDIR /kube-ovn
 COPY nat-gateway.sh /kube-ovn/
 COPY lb-svc.sh /kube-ovn/
+RUN chmod +x /kube-ovn/*.sh
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["sleep", "infinity"]
