@@ -16,6 +16,7 @@ RUN set -ex \
 WORKDIR /kube-ovn
 COPY nat-gateway.sh /kube-ovn/
 COPY lb-svc.sh /kube-ovn/
+RUN chmod +x /kube-ovn/*.sh
 
 # Container startup command. The controller does not override this,
 # keeping startup behavior decoupled and managed by the image.
