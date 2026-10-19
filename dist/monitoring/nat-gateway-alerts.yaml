@@ -66,3 +66,26 @@ spec:
           annotations:
             summary: "节点 {{ $labels.node }} 到上联交换机 Peer {{ $labels.peer }} 的 BGP 邻居中断！"
             description: "BGP 邻居失联，Anycast /32 EIP 路由无法对外宣告，将导致外部回包路由黑洞。"
+
+        # P1 告警：宿主机 table local 脏路由清理失败
+        - alert: HostLocalRouteCleanError
+          expr: rate(kube_ovn_host_local_route_clean_errors_total[2m]) > 0
+          for: 30s
+          labels:
+            severity: warning
+            tier: network
+          annotations:
+            summary: "节点 {{ $labels.node_name }} 针对 EIP {{ $labels.eip }} 的 table local 脏路由清理失败！"
+            description: "宿主机未能成功删除 table local 中的劫持路由，将导致网关外部回包被宿主机拦截产生路由黑洞。"
+
+        # P1 告警：检测到宿主机 table local 路由劫持
+        - alert: HostLocalRouteHijacked
+          expr: rate(kube_ovn_host_local_route_hijacked_total[2m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+            tier: network
+          annotations:
+            summary: "节点 {{ $labels.node_name }} 检测到 EIP {{ $labels.eip }} 频繁被内核 local 表劫持！"
+            description: "宿主机内核频繁生成针对 EIP 的 table local 路由，可能存在网卡事件震荡或点对点配置异常。"
+

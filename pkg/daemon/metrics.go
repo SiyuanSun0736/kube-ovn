@@ -144,6 +144,22 @@ var (
 	}, []string{
 		"hostname",
 	})
+
+	metricHostLocalRouteHijackedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kube_ovn_host_local_route_hijacked_total",
+			Help: "Cumulative number of hijacked local table routes detected on the host.",
+		},
+		[]string{"node_name", "eip"},
+	)
+
+	metricHostLocalRouteCleanErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kube_ovn_host_local_route_clean_errors_total",
+			Help: "Cumulative number of errors when cleaning hijacked local table routes on the host.",
+		},
+		[]string{"node_name", "eip"},
+	)
 )
 
 func InitMetrics() {
@@ -153,6 +169,8 @@ func InitMetrics() {
 	metrics.Registry.MustRegister(cniWaitAddressResult)
 	metrics.Registry.MustRegister(cniWaitTunnelKeyResult)
 	metrics.Registry.MustRegister(cniConnectivityResult)
+	metrics.Registry.MustRegister(metricHostLocalRouteHijackedTotal)
+	metrics.Registry.MustRegister(metricHostLocalRouteCleanErrors)
 }
 
 func registerOvnSubnetGatewayMetrics() {

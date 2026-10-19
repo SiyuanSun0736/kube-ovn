@@ -1206,10 +1206,18 @@ function stateless_init() {
     if ! nft list chain ip "$table" postrouting >/dev/null 2>&1; then
         nft add chain ip "$table" postrouting '{ type filter hook postrouting priority 100; policy accept; }' || return 1
     fi
-    # TCP MSS clamping to prevent MTU blackholes over encapsulated overlay networks
+    # TCP MSS clamping to prevent MTU blackholes over encapsulated overlay networks (with counter for Prometheus monitoring)
     if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "maxseg size set rt mtu"; then
-        nft add rule ip "$table" postrouting tcp flags \& \(syn \| rst\) == syn tcp option maxseg size set rt mtu 2>/dev/null || true
+        nft add rule ip "$table" postrouting tcp flags \& \(syn \| rst\) == syn counter tcp option maxseg size set rt mtu 2>/dev/null || true
     fi
+}
+
+function stateless_stats() {
+    local table=${1:-$STATELESS_NFT_TABLE}
+    if ! nft list table ip "$table" >/dev/null 2>&1; then
+        return 0
+    fi
+    nft list table ip "$table"
 }
 
 function stateless_apply() {
