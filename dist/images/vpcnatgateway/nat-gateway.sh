@@ -1236,7 +1236,7 @@ table ip $table {
     }
     chain postrouting {
         type filter hook postrouting priority 100; policy accept;
-        tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+        tcp flags & (syn | rst) == syn counter tcp option maxseg size set rt mtu
     }
 }
 EOF
