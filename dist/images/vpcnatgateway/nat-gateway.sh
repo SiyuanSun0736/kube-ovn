@@ -2720,6 +2720,9 @@ case $opt in
         echo "stateless-snat-del $*"
         stateless_snat_del "$@"
         ;;
+    stateless-stats|stateless_stats)
+        stateless_stats "$@"
+        ;;
     *)
         echo "Unknown command: $opt"
         echo ""
