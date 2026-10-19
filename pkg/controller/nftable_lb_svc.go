@@ -644,13 +644,24 @@ func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 	var retiring []string
 	for name, want := range desired {
 		current := existingByName[name]
-		switch {
-		case current == nil:
+		if current == nil {
 			created, err := client.Create(context.Background(), want, metav1.CreateOptions{})
-			if err != nil {
+			switch {
+			case err == nil:
+				live[name] = created
+				continue
+			case !k8serrors.IsAlreadyExists(err):
 				return nil, nil, fmt.Errorf("failed to create nftable LB record %s for Service %s/%s: %w", name, svc.Namespace, svc.Name, err)
 			}
-			live[name] = created
+			// The record exists but the informer has not delivered it yet - a pass that
+			// created it and then aborted leaves exactly this gap, and its retry must not
+			// turn a record it owns into a hard error. Read the live object and reconcile
+			// it like any other existing record.
+			if current, err = client.Get(context.Background(), name, metav1.GetOptions{}); err != nil {
+				return nil, nil, fmt.Errorf("failed to get nftable LB record %s for Service %s/%s: %w", name, svc.Namespace, svc.Name, err)
+			}
+		}
+		switch {
 		case !current.DeletionTimestamp.IsZero():
 			// The user is removing an accounting object. It has no data-plane semantics; keep its
 			// identity programmed, do not recreate the record in this pass. A legacy record also
