@@ -66,6 +66,26 @@ var (
 			"ip",
 			"pod_name",
 		})
+
+	metricNatGwReadyMembers = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "kube_ovn_nat_gw_ready_members",
+			Help: "Number of ready and healthy HA gateway member pods for a VpcNatGateway.",
+		},
+		[]string{
+			"gateway",
+			"vpc",
+		})
+
+	metricPolicyRouteResolveErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kube_ovn_policy_route_resolve_errors_total",
+			Help: "Cumulative number of errors when resolving dynamic next-hop LAN IPs for gateway policy routes.",
+		},
+		[]string{
+			"vpc",
+			"gateway",
+		})
 )
 
 func registerMetrics() {
@@ -74,5 +94,8 @@ func registerMetrics() {
 	metrics.Registry.MustRegister(metricCentralSubnetInfo)
 	metrics.Registry.MustRegister(metricSubnetIPAMInfo)
 	metrics.Registry.MustRegister(metricSubnetIPAssignedInfo)
+	metrics.Registry.MustRegister(metricNatGwReadyMembers)
+	metrics.Registry.MustRegister(metricPolicyRouteResolveErrors)
 	registerTunnelKeyMetrics()
 }
+
