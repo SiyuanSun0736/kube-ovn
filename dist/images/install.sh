@@ -2736,7 +2736,6 @@ spec:
                   type: boolean
                   description: Enable BFD (Bidirectional Forwarding Detection) for the VPC
                 namespaces:
-                  description: List of namespaces associated with this subnet.
                   items:
                     type: string
                   type: array
@@ -3561,7 +3560,6 @@ spec:
                     - rule: "self == oldSelf"
                       message: "This field is immutable."
                 namespaces:
-                  description: List of namespaces associated with this subnet.
                   type: array
                   x-kubernetes-list-type: set
                   description: Namespaces that can use this IP pool
