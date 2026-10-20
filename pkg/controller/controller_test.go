@@ -68,6 +68,7 @@ func alwaysReady() bool { return true }
 // FakeControllerOptions holds optional parameters for creating a fake controller
 type FakeControllerOptions struct {
 	Subnets            []*kubeovnv1.Subnet
+	IPPools            []*kubeovnv1.IPPool
 	VpcNatGateways     []*kubeovnv1.VpcNatGateway
 	QoSPolicies        []*kubeovnv1.QoSPolicy
 	IptablesEIPs       []*kubeovnv1.IptablesEIP
@@ -153,6 +154,14 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	for _, subnet := range opts.Subnets {
 		_, err := kubeovnClient.KubeovnV1().Subnets().Create(
 			context.Background(), subnet, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, ippool := range opts.IPPools {
+		_, err := kubeovnClient.KubeovnV1().IPPools().Create(
+			context.Background(), ippool, metav1.CreateOptions{},
 		)
 		if err != nil {
 			return nil, err
@@ -246,6 +255,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	kubeovnInformerFactory := kubeovninformerfactory.NewSharedInformerFactory(kubeovnClient, 0)
 	vpcInformer := kubeovnInformerFactory.Kubeovn().V1().Vpcs()
 	subnetInformer := kubeovnInformerFactory.Kubeovn().V1().Subnets()
+	ippoolInformer := kubeovnInformerFactory.Kubeovn().V1().IPPools()
 	ipInformer := kubeovnInformerFactory.Kubeovn().V1().IPs()
 	vpcNatGwInformer := kubeovnInformerFactory.Kubeovn().V1().VpcNatGateways()
 	qosPolicyInformer := kubeovnInformerFactory.Kubeovn().V1().QoSPolicies()
@@ -284,6 +294,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		vpcsLister:              vpcInformer.Lister(),
 		vpcSynced:               alwaysReady,
 		subnetsLister:           subnetInformer.Lister(),
+		ippoolLister:            ippoolInformer.Lister(),
 		subnetSynced:            alwaysReady,
 		ipsLister:               ipInformer.Lister(),
 		ipSynced:                alwaysReady,

@@ -455,6 +455,32 @@ func (ipam *IPAM) AddOrUpdateIPPool(subnet, ippool string, ips []string) error {
 	return s.AddOrUpdateIPPool(ippool, ips)
 }
 
+// ReserveIPPoolIPs picks the addresses of a named pool by per-family counts and reserves
+// them, see Subnet.ReserveIPPoolIPs.
+func (ipam *IPAM) ReserveIPPoolIPs(subnet, name string, keep []string, v4Count, v6Count int) ([]string, error) {
+	ipam.mutex.Lock()
+	defer ipam.mutex.Unlock()
+
+	s := ipam.Subnets[subnet]
+	if s == nil {
+		return nil, fmt.Errorf("subnet %s does not exist in IPAM", subnet)
+	}
+	return s.ReserveIPPoolIPs(name, keep, v4Count, v6Count)
+}
+
+// ReserveIPPool reserves exactly the given addresses for a named pool, see
+// Subnet.ReserveIPPool.
+func (ipam *IPAM) ReserveIPPool(subnet, name string, ips []string) error {
+	ipam.mutex.Lock()
+	defer ipam.mutex.Unlock()
+
+	s := ipam.Subnets[subnet]
+	if s == nil {
+		return fmt.Errorf("subnet %s does not exist in IPAM", subnet)
+	}
+	return s.ReserveIPPool(name, ips)
+}
+
 func (ipam *IPAM) RemoveIPPool(subnet, ippool string) {
 	ipam.mutex.Lock()
 	if s := ipam.Subnets[subnet]; s != nil {
