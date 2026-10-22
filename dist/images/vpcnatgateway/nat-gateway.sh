@@ -117,11 +117,77 @@ function exec_cmd() {
 }
 
 function check_inited() {
-    $iptables_save_cmd -t nat | grep SNAT_FILTER | grep SHARED_SNAT
-    if [ $? -ne 0 ]; then
+    if nft list table ip "$STATELESS_NFT_TABLE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! $iptables_save_cmd -t nat 2>/dev/null | grep SNAT_FILTER | grep -q SHARED_SNAT; then
         >&2 echo "nat gateway not initialized"
         exit 1
     fi
+}
+
+function health_check() {
+    local err_count=0
+
+    # 1. Check IP forwarding
+    local fwd
+    fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    if [ "$fwd" != "1" ]; then
+        >&2 echo "[HEALTH FAIL] IP forwarding is disabled (net.ipv4.ip_forward=$fwd)"
+        err_count=$((err_count + 1))
+    fi
+
+    # 2. Check VPC interface
+    local vpc_if=${VPC_INTERFACE:-eth0}
+    if [ ! -d "/sys/class/net/$vpc_if" ]; then
+        >&2 echo "[HEALTH FAIL] VPC interface $vpc_if does not exist"
+        err_count=$((err_count + 1))
+    else
+        local oper
+        oper=$(cat "/sys/class/net/$vpc_if/operstate" 2>/dev/null || echo "unknown")
+        if [ "$oper" = "down" ]; then
+            >&2 echo "[HEALTH FAIL] VPC interface $vpc_if is DOWN"
+            err_count=$((err_count + 1))
+        fi
+        if ! ip -4 addr show dev "$vpc_if" 2>/dev/null | grep -q "inet "; then
+            >&2 echo "[HEALTH FAIL] VPC interface $vpc_if has no IPv4 address"
+            err_count=$((err_count + 1))
+        fi
+    fi
+
+    # 3. Check External interface (if configured)
+    local ext_if=${EXTERNAL_INTERFACE:-net1}
+    if [ -d "/sys/class/net/$ext_if" ]; then
+        local ext_oper
+        ext_oper=$(cat "/sys/class/net/$ext_if/operstate" 2>/dev/null || echo "unknown")
+        if [ "$ext_oper" = "down" ]; then
+            >&2 echo "[HEALTH FAIL] External interface $ext_if is DOWN"
+            err_count=$((err_count + 1))
+        fi
+    fi
+
+    # 4. Check Dataplane tables/chains
+    if nft list table ip "$STATELESS_NFT_TABLE" >/dev/null 2>&1; then
+        if ! nft list chain ip "$STATELESS_NFT_TABLE" prerouting >/dev/null 2>&1; then
+            >&2 echo "[HEALTH FAIL] Stateless table missing prerouting chain"
+            err_count=$((err_count + 1))
+        fi
+        if ! nft list chain ip "$STATELESS_NFT_TABLE" postrouting >/dev/null 2>&1; then
+            >&2 echo "[HEALTH FAIL] Stateless table missing postrouting chain"
+            err_count=$((err_count + 1))
+        fi
+    elif $iptables_save_cmd -t nat 2>/dev/null | grep -q SNAT_FILTER; then
+        if ! $iptables_save_cmd -t nat 2>/dev/null | grep -q SHARED_SNAT; then
+            >&2 echo "[HEALTH FAIL] Stateful nat table missing SHARED_SNAT chain"
+            err_count=$((err_count + 1))
+        fi
+    fi
+
+    if [ "$err_count" -gt 0 ]; then
+        return 1
+    fi
+    echo "OK"
+    return 0
 }
 
 function init() {
@@ -2789,6 +2855,9 @@ case $opt in
         ;;
     stateless-stats|stateless_stats)
         stateless_stats "$@"
+        ;;
+    health-check|health_check)
+        health_check "$@"
         ;;
     *)
         echo "Unknown command: $opt"
