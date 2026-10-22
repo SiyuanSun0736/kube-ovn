@@ -1308,3 +1308,245 @@ func TestGetStaticMac(t *testing.T) {
 	err = subnet.GetStaticMac(podName, nicName, "", false)
 	require.NoError(t, err)
 }
+
+func TestSubnetReserveIPPoolIPs(t *testing.T) {
+	subnet, err := NewSubnet("dualSubnet", "10.0.0.0/24,2001:db8::/120", []string{"10.0.0.1", "10.0.0.2", "2001:db8::1"})
+	require.NoError(t, err)
+
+	// the reservation carves the addresses out of the subnet without handing them out
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 3, 2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.3", "10.0.0.4", "10.0.0.5", "2001:db8::2", "2001:db8::3"}, ips)
+	require.True(t, subnet.IPPools["pool1"].PendingActivation, "the pool hands out nothing until it is activated")
+	require.Equal(t, "10.0.0.3-10.0.0.5", subnet.IPPools["pool1"].V4IPs.String())
+	require.Equal(t, "10.0.0.6-10.0.0.254", subnet.IPPools[""].V4Available.String(), "the subnet lost them")
+
+	// activating the same set makes the pool hand them out
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+	require.False(t, subnet.IPPools["pool1"].PendingActivation)
+	require.Equal(t, "10.0.0.3-10.0.0.5", subnet.IPPools["pool1"].V4Available.String())
+
+	// another pool cannot pick the addresses of the first one
+	ips, err = subnet.ReserveIPPoolIPs("pool2", nil, 2, 1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.6", "10.0.0.7", "2001:db8::4"}, ips)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool2", ips))
+
+	// re-reserving recovers the membership the pool already has
+	ips, err = subnet.ReserveIPPoolIPs("pool1", nil, 2, 1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.3", "10.0.0.4", "2001:db8::2"}, ips)
+
+	// recorded addresses are retained in their order, then addresses the pool already
+	// holds, growing appends new picks last
+	ips, err = subnet.ReserveIPPoolIPs("pool1", []string{"10.0.0.3", "10.0.0.4", "2001:db8::2"}, 3, 2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.3", "10.0.0.4", "10.0.0.5", "2001:db8::2", "2001:db8::3"}, ips)
+
+	// recorded entries claimed by another pool in the meantime are dropped and
+	// replaced, retained entries not selected anymore are released to the default pool
+	ips, err = subnet.ReserveIPPoolIPs("pool1", []string{"10.0.0.6", "10.0.0.3"}, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.3", "10.0.0.4"}, ips)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+	require.Equal(t, "10.0.0.3-10.0.0.4", subnet.IPPools["pool1"].V4IPs.String())
+	require.Empty(t, subnet.IPPools["pool1"].V6IPs.String())
+
+	// requesting more than available fails without reserving anything
+	_, err = subnet.ReserveIPPoolIPs("pool4", nil, 250, 0)
+	require.ErrorContains(t, err, "does not have enough free addresses")
+	require.Nil(t, subnet.IPPools["pool4"])
+
+	// recorded entries that fell out of the usable range are dropped: on this /30 the
+	// only usable addresses are 10.1.0.1 (excluded) and 10.1.0.2, 10.1.0.3 is the
+	// broadcast address
+	small, err := NewSubnet("smallSubnet", "10.1.0.0/30", []string{"10.1.0.1"})
+	require.NoError(t, err)
+	_, err = small.ReserveIPPoolIPs("pool3", []string{"10.1.0.2", "10.1.0.3"}, 2, 0)
+	require.ErrorContains(t, err, "does not have enough free addresses")
+	ips, err = small.ReserveIPPoolIPs("pool3", []string{"10.1.0.2", "10.1.0.3"}, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.1.0.2"}, ips)
+}
+
+func TestSubnetWithoutCIDRReserveIPPoolIPs(t *testing.T) {
+	// a subnet without any pool at all must not panic
+	_, err := (&Subnet{}).ReserveIPPoolIPs("pool1", nil, 2, 2)
+	require.ErrorContains(t, err, "does not have enough free addresses")
+
+	// and neither must a reservation or a direct spec.ips update on it
+	require.Error(t, (&Subnet{}).ReserveIPPool("pool1", nil))
+	require.Error(t, (&Subnet{}).AddOrUpdateIPPool("pool1", nil))
+}
+
+// TestSubnetReserveIPPoolIPsDropsExcluded covers a subnet's excludeIps growing over an
+// address a count-based pool already holds: the address is not allocatable anymore,
+// so the selection must drop and replace it instead of counting it towards ipCount.
+func TestSubnetReserveIPPoolIPsDropsExcluded(t *testing.T) {
+	subnet, err := NewSubnet("exclSubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, ips)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+
+	// excludeIps grows over 10.0.0.2, as AddOrUpdateSubnet applies it in place
+	subnet.V4Reserved, err = NewIPRangeListFrom("10.0.0.2")
+	require.NoError(t, err)
+
+	// the now reserved member is dropped and replaced although the pool still holds it
+	ips, err = subnet.ReserveIPPoolIPs("pool1", []string{"10.0.0.1", "10.0.0.2"}, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.3"}, ips)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+
+	// the committed pool no longer claims the reserved address
+	ip, err := NewIP("10.0.0.2")
+	require.NoError(t, err)
+	require.False(t, subnet.IPPools["pool1"].V4IPs.Contains(ip))
+	for _, member := range ips {
+		ip, err = NewIP(member)
+		require.NoError(t, err)
+		require.True(t, subnet.IPPools["pool1"].V4IPs.Contains(ip))
+	}
+}
+
+// TestSubnetReserveIPPoolIPsFiltersHeldBeforeTruncating covers a pool whose first held
+// addresses became unusable: the selection must fall back to the next addresses it
+// holds instead of reporting the subnet as exhausted.
+func TestSubnetReserveIPPoolIPsFiltersHeldBeforeTruncating(t *testing.T) {
+	subnet, err := NewSubnet("heldSubnet", "10.0.0.0/29", []string{"10.0.0.1"})
+	require.NoError(t, err)
+	// the pool lists a range starting at the address the subnet excludes, as a pool
+	// switching from spec.ips to spec.ipCount does
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", []string{"10.0.0.1..10.0.0.6"}))
+
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2"}, ips, "the excluded 10.0.0.1 is skipped, not counted")
+}
+
+// TestSubnetReserveIPPoolIPsKeepsOthersOut covers the window the reservation closes: a
+// membership that is not activated yet must not be allocatable by anyone.
+func TestSubnetReserveIPPoolIPsKeepsOthersOut(t *testing.T) {
+	subnet, err := NewSubnet("raceSubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, ips)
+
+	// an allocation from the subnet skips the reserved addresses instead of stealing one
+	v4, _, _, err := subnet.GetRandomAddress("", "pod1.default", "nic1", nil, nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.3", v4.String())
+
+	// and the pool itself hands out nothing until it is activated
+	_, _, _, err = subnet.GetRandomAddress("pool1", "pod2.default", "nic2", nil, nil, true)
+	require.ErrorIs(t, err, ErrNoAvailable)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+	v4, _, _, err = subnet.GetRandomAddress("pool1", "pod2.default", "nic2", nil, nil, true)
+	require.NoError(t, err)
+	require.Contains(t, ips, v4.String())
+}
+
+// TestSubnetReserveIPPoolKeepsActiveMembershipAllocatable covers the reconcile of a pool
+// whose membership did not change: re-reserving it must not make the addresses
+// unallocatable for the rest of the reconcile, as their data plane is already published.
+func TestSubnetReserveIPPoolKeepsActiveMembershipAllocatable(t *testing.T) {
+	subnet, err := NewSubnet("steadySubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+
+	// the same membership is reserved again, as every reconcile of the pool does
+	require.NoError(t, subnet.ReserveIPPool("pool1", ips))
+	v4, _, _, err := subnet.GetRandomAddress("pool1", "pod1.default", "nic1", nil, nil, true)
+	require.NoError(t, err)
+	require.Contains(t, ips, v4.String())
+
+	// a changed membership is reserved for real again
+	grown, err := subnet.ReserveIPPoolIPs("pool1", ips, 3, 0)
+	require.NoError(t, err)
+	require.Len(t, grown, 3)
+	_, _, _, err = subnet.GetRandomAddress("pool1", "pod2.default", "nic2", nil, nil, true)
+	require.ErrorIs(t, err, ErrNoAvailable)
+}
+
+// TestSubnetReservedIPPoolKeepsStaticAddresses covers the startup restore: the pods that
+// already hold addresses of a reserved pool must still be recorded, otherwise their
+// addresses look free and the next selection hands one of them out twice.
+func TestSubnetReservedIPPoolKeepsStaticAddresses(t *testing.T) {
+	subnet, err := NewSubnet("restoreSubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	// what the startup restore does: reserve the recorded membership, then replay the
+	// addresses the pods hold
+	require.NoError(t, subnet.ReserveIPPool("pool1", []string{"10.0.0.1", "10.0.0.2"}))
+	held, err := NewIP("10.0.0.1")
+	require.NoError(t, err)
+	_, _, err = subnet.GetStaticAddress("pod1.default", "nic1", held, nil, false, true)
+	require.NoError(t, err, "a pod holding an address of a reserved pool must be restored")
+
+	// the reconcile activates the membership, and the restored address stays that pod's
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", []string{"10.0.0.1", "10.0.0.2"}))
+	v4, _, _, err := subnet.GetRandomAddress("pool1", "pod2.default", "nic2", nil, nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.2", v4.String(), "the address pod1 holds is not handed out again")
+}
+
+// TestSubnetReservedIPPoolReportsNoAvailable covers the statistics of a reserved pool:
+// it hands out nothing, so it must not report free addresses - the pod controller picks
+// an ippool of a namespace by that count and would otherwise choose a pool that can only
+// fail. The addresses in use are reported all the same, they are real.
+func TestSubnetReservedIPPoolReportsNoAvailable(t *testing.T) {
+	subnet, err := NewSubnet("statSubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	ips, err := subnet.ReserveIPPoolIPs("pool1", nil, 2, 0)
+	require.NoError(t, err)
+	v4a, _, _, _, v4ar, _, _, _ := subnet.IPPoolStatistics("pool1")
+	require.Zero(t, v4a.Int64(), "a reserved pool advertises no available address")
+	require.Empty(t, v4ar)
+
+	// activating it publishes the real numbers
+	require.NoError(t, subnet.AddOrUpdateIPPool("pool1", ips))
+	v4a, _, _, _, v4ar, _, _, _ = subnet.IPPoolStatistics("pool1")
+	require.Equal(t, int64(2), v4a.Int64())
+	require.Equal(t, "10.0.0.1-10.0.0.2", v4ar)
+
+	// a pod takes one, then the pool is reserved again by a reconcile that changes it
+	_, _, _, err = subnet.GetRandomAddress("pool1", "pod1.default", "nic1", nil, nil, true)
+	require.NoError(t, err)
+	require.NoError(t, subnet.ReserveIPPool("pool1", append(ips, "10.0.0.3")))
+	v4a, v4u, _, _, _, v4ur, _, _ := subnet.IPPoolStatistics("pool1")
+	require.Zero(t, v4a.Int64())
+	require.Equal(t, int64(1), v4u.Int64(), "the address a pod holds stays reported as in use")
+	require.Equal(t, "10.0.0.1", v4ur)
+}
+
+// TestSubnetReservedIPPoolIsolatedFromOthers pins the isolation a reservation must give
+// a membership whose data plane is not published yet: no other pool may take one of its
+// addresses, neither by picking - the addresses are out of the subnet's free list - nor
+// by listing them, which collides like it does with an active pool.
+func TestSubnetReservedIPPoolIsolatedFromOthers(t *testing.T) {
+	subnet, err := NewSubnet("isolSubnet", "10.0.0.0/29", nil)
+	require.NoError(t, err)
+
+	reserved, err := subnet.ReserveIPPoolIPs("poolA", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, reserved)
+
+	// another count pool picks around the reservation, although poolA is not active
+	other, err := subnet.ReserveIPPoolIPs("poolB", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.3", "10.0.0.4"}, other)
+
+	// and a pool listing one of the reserved addresses is rejected
+	err = subnet.AddOrUpdateIPPool("poolC", reserved[:1])
+	require.ErrorContains(t, err, "conflict IPs with ippool poolA")
+	require.Nil(t, subnet.IPPools["poolC"])
+}

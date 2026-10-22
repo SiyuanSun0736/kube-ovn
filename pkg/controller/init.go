@@ -347,6 +347,18 @@ func (c *Controller) initLoadBalancer() error {
 	return nil
 }
 
+// initIPPoolIPAM restores an ippool into IPAM at startup. A pool using spec.ipCount is
+// restored as a reservation: its recorded addresses stay carved out of the subnet, but
+// become allocatable only once the reconcile has republished the address set and
+// activated them, so a membership that never reached the data plane is not handed out
+// after a restart. A pool listing spec.ips is authoritative and restored as it is.
+func (c *Controller) initIPPoolIPAM(ippool *kubeovnv1.IPPool) error {
+	if ippool.Spec.IPCount > 0 {
+		return c.ipam.ReserveIPPool(ippool.Spec.Subnet, ippool.Name, ippool.Status.IPs)
+	}
+	return c.ipam.AddOrUpdateIPPool(ippool.Spec.Subnet, ippool.Name, ippool.Spec.IPs)
+}
+
 func (c *Controller) InitIPAM() error {
 	start := time.Now()
 	subnets, err := c.subnetsLister.List(labels.Everything())
@@ -391,7 +403,7 @@ func (c *Controller) InitIPAM() error {
 		return err
 	}
 	for _, ippool := range ippools {
-		if err = c.ipam.AddOrUpdateIPPool(ippool.Spec.Subnet, ippool.Name, ippool.Spec.IPs); err != nil {
+		if err = c.initIPPoolIPAM(ippool); err != nil {
 			klog.Errorf("failed to init ippool %s: %v", ippool.Name, err)
 		}
 	}

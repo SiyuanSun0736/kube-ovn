@@ -1,6 +1,7 @@
 package ipam
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -989,4 +990,128 @@ func TestGetSubnetV4Mask(t *testing.T) {
 	mask, err = ipam.GetSubnetV4Mask(nonExistSubnetName)
 	require.Equal(t, err, ErrNoAvailable)
 	require.Empty(t, mask)
+}
+
+func TestIPAMReserveIPPoolIPs(t *testing.T) {
+	ipam := NewIPAM()
+	require.NoError(t, ipam.AddOrUpdateSubnet("subnetSelect", "10.0.0.0/24", "10.0.0.1", []string{"10.0.0.1"}))
+
+	ips, err := ipam.ReserveIPPoolIPs("subnetSelect", "pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2", "10.0.0.3"}, ips, "an IPv4 subnet yields IPv4 addresses only")
+
+	// the reservation carves the addresses out without handing them out: neither the pool
+	// nor the subnet can allocate one, so nothing can hold an address of a membership
+	// whose data plane is not published yet
+	_, _, _, err = ipam.GetRandomAddress("pod1.default", "nic1", nil, "subnetSelect", "pool1", nil, true)
+	require.ErrorIs(t, err, ErrNoAvailable)
+	v4, _, _, err := ipam.GetRandomAddress("pod2.default", "nic2", nil, "subnetSelect", "", nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.4", v4, "the subnet must skip the reserved addresses")
+
+	// activating the very same set makes the pool hand them out
+	require.NoError(t, ipam.AddOrUpdateIPPool("subnetSelect", "pool1", ips))
+	v4, _, _, err = ipam.GetRandomAddress("pod3.default", "nic3", nil, "subnetSelect", "pool1", nil, true)
+	require.NoError(t, err)
+	require.Contains(t, ips, v4)
+
+	// another pool cannot pick the addresses of the first one
+	ips2, err := ipam.ReserveIPPoolIPs("subnetSelect", "pool2", nil, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.5"}, ips2)
+
+	// re-reserving recovers the membership the pool already has, e.g. after a failed
+	// status update, instead of picking new addresses
+	ips, err = ipam.ReserveIPPoolIPs("subnetSelect", "pool1", nil, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2"}, ips)
+
+	_, err = ipam.ReserveIPPoolIPs("unknownSubnet", "pool1", nil, 1, 0)
+	require.ErrorContains(t, err, "does not exist in IPAM")
+	require.ErrorContains(t, ipam.ReserveIPPool("unknownSubnet", "pool1", []string{"10.0.0.5"}), "does not exist in IPAM")
+}
+
+// TestIPAMReserveIPPool covers restoring a recorded membership at startup: the addresses
+// stay carved out of the subnet, but a pod of the pool gets one only after the reconcile
+// has republished the data plane and activated them.
+func TestIPAMReserveIPPool(t *testing.T) {
+	ipam := NewIPAM()
+	require.NoError(t, ipam.AddOrUpdateSubnet("subnetRestore", "10.0.0.0/24", "10.0.0.1", []string{"10.0.0.1"}))
+
+	recorded := []string{"10.0.0.2", "10.0.0.3"}
+	require.NoError(t, ipam.ReserveIPPool("subnetRestore", "pool1", recorded))
+
+	_, _, _, err := ipam.GetRandomAddress("pod1.default", "nic1", nil, "subnetRestore", "pool1", nil, true)
+	require.ErrorIs(t, err, ErrNoAvailable, "a restored membership is not allocatable before it is activated")
+	v4, _, _, err := ipam.GetRandomAddress("pod2.default", "nic2", nil, "subnetRestore", "", nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.4", v4, "but it is reserved, so the subnet does not hand it out either")
+
+	require.NoError(t, ipam.AddOrUpdateIPPool("subnetRestore", "pool1", recorded))
+	v4, _, _, err = ipam.GetRandomAddress("pod1.default", "nic1", nil, "subnetRestore", "pool1", nil, true)
+	require.NoError(t, err)
+	require.Contains(t, recorded, v4)
+}
+
+// TestIPAMShrinkIPPoolKeepsInUseAddress covers shrinking spec.ipCount over an address
+// a pod is using: dropping the most recently added members must not strand that pod.
+// The address goes back to the default pool together with its allocation, so the pod
+// keeps it - GetRandomAddress returns the address bound to the nic before looking at
+// the pool - and nobody else can be handed it meanwhile.
+func TestIPAMShrinkIPPoolKeepsInUseAddress(t *testing.T) {
+	ipam := NewIPAM()
+	require.NoError(t, ipam.AddOrUpdateSubnet("subnetShrink", "10.0.0.0/24", "10.0.0.1", []string{"10.0.0.1"}))
+
+	ips, err := ipam.ReserveIPPoolIPs("subnetShrink", "pool1", nil, 3, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2", "10.0.0.3", "10.0.0.4"}, ips)
+	require.NoError(t, ipam.AddOrUpdateIPPool("subnetShrink", "pool1", ips))
+
+	// a pod of a statefulset takes the member the shrink below drops
+	ip, _, _, err := ipam.GetRandomAddress("sts-0.default", "nic0", nil, "subnetShrink", "pool1", []string{"10.0.0.2", "10.0.0.3"}, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.4", ip)
+
+	shrunk, err := ipam.ReserveIPPoolIPs("subnetShrink", "pool1", ips, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2", "10.0.0.3"}, shrunk)
+	require.NoError(t, ipam.AddOrUpdateIPPool("subnetShrink", "pool1", shrunk))
+
+	// the pod is recreated and allocates through the pool again: it keeps its address
+	// although the pool does not hold it anymore
+	ip, _, _, err = ipam.GetRandomAddress("sts-0.default", "nic0", nil, "subnetShrink", "pool1", nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.4", ip)
+
+	// and the address stays allocated for everyone else: the default pool took it over
+	// as a used one, so it is neither handed out again nor lost from the statistics
+	other, _, _, err := ipam.GetRandomAddress("other.default", "nic1", nil, "subnetShrink", "", nil, true)
+	require.NoError(t, err)
+	require.NotEqual(t, "10.0.0.4", other)
+	_, v4Using, _, _, _, v4UsingRange, _, _ := ipam.IPPoolStatistics("subnetShrink", "")
+	require.Equal(t, int64(2), v4Using.Int64(), "the released address and the one just allocated are in use")
+	require.Contains(t, v4UsingRange, "10.0.0.4")
+}
+
+// TestIPAMRemoveReservedIPPool covers deleting a pool that is still reserved, e.g. while
+// its address set cannot be written: the addresses must go back to the subnet. A
+// reserved pool keeps its free lists exactly so that this - and the startup restore of
+// the addresses its pods hold - keeps working.
+func TestIPAMRemoveReservedIPPool(t *testing.T) {
+	ipam := NewIPAM()
+	require.NoError(t, ipam.AddOrUpdateSubnet("subnetRemove", "10.0.0.0/29", "10.0.0.1", nil))
+
+	ips, err := ipam.ReserveIPPoolIPs("subnetRemove", "pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, ips)
+	v4, _, _, err := ipam.GetRandomAddress("pod1.default", "nic1", nil, "subnetRemove", "", nil, true)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.3", v4, "the subnet skips the reserved addresses")
+
+	ipam.RemoveIPPool("subnetRemove", "pool1")
+	for i, want := range ips {
+		v4, _, _, err = ipam.GetRandomAddress("pod2.default", fmt.Sprintf("nic%d", i+2), nil, "subnetRemove", "", nil, true)
+		require.NoError(t, err)
+		require.Equal(t, want, v4, "the addresses of the deleted pool must be allocatable again")
+	}
 }

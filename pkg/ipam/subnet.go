@@ -240,6 +240,13 @@ func (s *Subnet) getV4RandomAddress(ippoolName, podName, nicName string, mac *st
 		klog.Errorf("no ip pool %s in subnet %s", ippoolName, s.Name)
 		return nil, nil, "", ErrNoAvailable
 	}
+	if pool.PendingActivation {
+		// the membership is carved out of the subnet but its data plane is not published
+		// yet, so handing out one of its addresses would bind a pod to a pool the network
+		// does not describe
+		klog.Infof("ip pool %s in subnet %s is reserved, not allocatable yet", ippoolName, s.Name)
+		return nil, nil, "", ErrNoAvailable
+	}
 
 	if pool.V4Free.Len() == 0 {
 		if pool.V4Released.Len() == 0 {
@@ -295,6 +302,13 @@ func (s *Subnet) getV6RandomAddress(ippoolName, podName, nicName string, mac *st
 	pool := s.IPPools[ippoolName]
 	if pool == nil {
 		klog.Errorf("no ip pool %s in subnet %s", ippoolName, s.Name)
+		return nil, nil, "", ErrNoAvailable
+	}
+	if pool.PendingActivation {
+		// the membership is carved out of the subnet but its data plane is not published
+		// yet, so handing out one of its addresses would bind a pod to a pool the network
+		// does not describe
+		klog.Infof("ip pool %s in subnet %s is reserved, not allocatable yet", ippoolName, s.Name)
 		return nil, nil, "", ErrNoAvailable
 	}
 
@@ -677,9 +691,182 @@ func (s *Subnet) isIPAssignedToOtherPod(ip, podName string) (string, bool) {
 	return "", false
 }
 
+// ReserveIPPoolIPs picks the addresses of a named pool by per-family counts and reserves
+// them in one step: they are carved out of the subnet's default pool, so nobody can be
+// allocated one of them, but the pool does not hand them out either until
+// AddOrUpdateIPPool activates the very same set. Selecting and reserving under one lock
+// is what makes a published membership unambiguous: an address can be taken neither by
+// the default pool nor by another ippool between the pick and the reservation.
+// The selection is deterministic for unchanged IPAM state and prefers, in order:
+//   - entries of keep - the addresses recorded for the pool so far - are retained in
+//     their recorded order while still usable, so the selection stays stable across
+//     reconciles and restarts;
+//   - addresses the pool already holds or has reserved are retained next;
+//   - the rest is taken from the subnet's default pool in ascending address order.
+//
+// Retained entries that no longer belong to the subnet's usable range - e.g. became
+// the network or broadcast address after a CIDR change, or got reserved by an expanded
+// excludeIps - or that are owned by another pool in the meantime are dropped and
+// replaced by new picks.
+func (s *Subnet) ReserveIPPoolIPs(name string, keep []string, v4Count, v6Count int) ([]string, error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+
+	v4, v6, err := s.selectIPPoolIPsLocked(name, keep, v4Count, v6Count)
+	if err != nil {
+		return nil, err
+	}
+	ips := append(v4, v6...)
+	if err = s.setIPPoolLocked(name, ips, true); err != nil {
+		return nil, err
+	}
+	return ips, nil
+}
+
+// ReserveIPPool reserves exactly the given addresses for a named pool, see
+// ReserveIPPoolIPs. It is how a pool whose membership is already recorded - restored at
+// startup - keeps its addresses carved out of the subnet until the reconcile that
+// republishes its data plane activates them.
+func (s *Subnet) ReserveIPPool(name string, ips []string) error {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+
+	return s.setIPPoolLocked(name, ips, true)
+}
+
+// selectIPPoolIPsLocked picks the addresses of a named pool, see ReserveIPPoolIPs; the
+// caller must hold the subnet lock.
+func (s *Subnet) selectIPPoolIPsLocked(name string, keep []string, v4Count, v6Count int) (v4, v6 []string, err error) {
+	var heldV4, heldV6 *IPRangeList
+	if held := s.IPPools[name]; held != nil {
+		heldV4, heldV6 = held.V4IPs, held.V6IPs
+	}
+	var defaultV4Available, defaultV6Available *IPRangeList
+	if defaultPool := s.IPPools[""]; defaultPool != nil {
+		defaultV4Available = defaultPool.V4Available
+		defaultV6Available = defaultPool.V6Available
+	}
+
+	keepV4, keepV6 := util.SplitIpsByProtocol(keep)
+	// the usable range subtracts the subnet's reserved addresses: an address moved into
+	// excludeIps is not allocatable even for the pool holding it, so retaining it would
+	// pin an unusable member to the pool instead of replacing it
+	v4 = s.pickIPPoolIPs(name, slices.Clone(keepV4), v4Count, usableRange(s.V4CIDR).Separate(s.V4Reserved), heldV4, defaultV4Available)
+	v6 = s.pickIPPoolIPs(name, slices.Clone(keepV6), v6Count, usableRange(s.V6CIDR).Separate(s.V6Reserved), heldV6, defaultV6Available)
+	if len(v4) < v4Count || len(v6) < v6Count {
+		return nil, nil, fmt.Errorf("subnet %s does not have enough free addresses for ippool %s: got %d/%d IPv4 and %d/%d IPv6 addresses",
+			s.Name, name, len(v4), v4Count, len(v6), v6Count)
+	}
+	return v4, v6, nil
+}
+
+// pickIPPoolIPs retains up to count candidates that are still usable - entries of the
+// recorded keep list in their recorded order first, addresses the pool already holds
+// next - and tops the result up from the default pool's available addresses. A
+// candidate is unusable when it falls outside usable - the subnet's address range
+// without its reserved addresses - or is owned by someone else now; it is dropped and
+// replaced by a new pick instead of conflicting.
+func (s *Subnet) pickIPPoolIPs(name string, candidates []string, count int, usable, held, available *IPRangeList) []string {
+	contains := func(list *IPRangeList, ip IP) bool {
+		return list != nil && list.Contains(ip)
+	}
+	picked := make([]string, 0, count)
+	seen := make(map[string]struct{}, len(candidates))
+	// the held addresses are filtered before they are cut down to count: a pool holding
+	// an address that became unusable - the subnet reserved it in the meantime - must
+	// fall back to the next one it holds instead of reporting the subnet as exhausted
+	if held != nil {
+		candidates = append(candidates, takeIPs(held.Intersect(usable), count)...)
+	}
+	for _, candidate := range candidates {
+		if len(picked) == count {
+			break
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ip, err := NewIP(candidate)
+		if err != nil {
+			klog.Warningf("ippool %s: skipping invalid recorded address %s: %v", name, candidate, err)
+			continue
+		}
+		if !contains(usable, ip) || (!contains(held, ip) && !contains(available, ip)) {
+			klog.Infof("ippool %s: dropping unusable recorded address %s in subnet %s", name, candidate, s.Name)
+			continue
+		}
+		picked = append(picked, candidate)
+	}
+	// top up from the default pool; retained candidates came from the same list, so
+	// over-fetch and skip them instead of picking one address twice
+	for _, candidate := range takeIPs(available, count+len(seen)) {
+		if len(picked) == count {
+			break
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		picked = append(picked, candidate)
+	}
+	return picked
+}
+
+// usableRange returns the subnet's usable address range, i.e. without the network and
+// broadcast addresses. A /31 or /127 prefix is point to point, so both of its addresses
+// are usable; a /32 or /128 one has none and yields an empty range.
+func usableRange(cidr *net.IPNet) *IPRangeList {
+	if cidr == nil {
+		return NewEmptyIPRangeList()
+	}
+	firstIP, err1 := util.FirstIP(cidr.String())
+	lastIP, err2 := util.LastIP(cidr.String())
+	if err1 != nil || err2 != nil {
+		return NewEmptyIPRangeList()
+	}
+	r, err := NewIPRangeListFrom(fmt.Sprintf("%s..%s", firstIP, lastIP))
+	if err != nil {
+		klog.Error(err)
+		return NewEmptyIPRangeList()
+	}
+	return r
+}
+
+func takeIPs(list *IPRangeList, count int) []string {
+	if list == nil || count <= 0 {
+		return nil
+	}
+	ips := make([]string, 0, count)
+	for i := 0; i < list.Len() && len(ips) < count; i++ {
+		r := list.At(i)
+		for ip := r.Start(); len(ips) < count; ip = ip.Add(1) {
+			ips = append(ips, ip.String())
+			if ip.Equal(r.End()) {
+				break
+			}
+		}
+	}
+	return ips
+}
+
 func (s *Subnet) AddOrUpdateIPPool(name string, ips []string) error {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+
+	return s.setIPPoolLocked(name, ips, false)
+}
+
+// setIPPoolLocked replaces the addresses of a named pool, moving previously held
+// addresses that are not part of the new set back to the default pool. A reserved pool
+// takes its addresses out of the default pool like an active one, but hands out none of
+// them, so a membership can be carved out before its data plane is published and become
+// allocatable only once it is. It fails on a subnet whose default pool is not set up
+// yet, as there is nothing to carve the addresses out of. The caller must hold the
+// subnet lock.
+func (s *Subnet) setIPPoolLocked(name string, ips []string, reserved bool) error {
+	if s.IPPools[""] == nil {
+		return fmt.Errorf("subnet %s has no default pool yet, cannot set ippool %s", s.Name, name)
+	}
 
 	pool := &IPPool{
 		V4IPs:       NewEmptyIPRangeList(),
@@ -741,6 +928,16 @@ func (s *Subnet) AddOrUpdateIPPool(name string, ips []string) error {
 		pool.V6Free = pool.V6Free.Intersect(pool.V6IPs).Separate(pool.V6Using).Separate(pool.V6Reserved)
 	}
 
+	if reserved {
+		if p := s.IPPools[name]; p != nil && !p.PendingActivation &&
+			p.V4IPs.Equal(pool.V4IPs) && p.V6IPs.Equal(pool.V6IPs) {
+			// the pool is already active with exactly this membership, so its data plane
+			// was published for it: reserving it again would only make it unallocatable
+			// for the rest of the reconcile without closing any window
+			return nil
+		}
+	}
+
 	defaultPool := s.IPPools[""]
 	if p := s.IPPools[name]; p != nil {
 		defaultPool.V4IPs = defaultPool.V4IPs.Merge(p.V4IPs).Separate(pool.V4IPs)
@@ -769,6 +966,11 @@ func (s *Subnet) AddOrUpdateIPPool(name string, ips []string) error {
 	defaultPool.V6Released = NewEmptyIPRangeList()
 	pool.V4Available = pool.V4Free.Clone()
 	pool.V6Available = pool.V6Free.Clone()
+	// a reserved pool keeps its free lists: GetStaticAddress resolves an address a pod
+	// already owns through them, which is how the startup restore records the pods holding
+	// pool addresses. What the reservation withholds is handing out an address nobody
+	// owns yet, see getV4RandomAddress.
+	pool.PendingActivation = reserved
 	s.IPPools[name] = pool
 
 	return nil
@@ -810,12 +1012,17 @@ func (s *Subnet) IPPoolStatistics(ippool string) (
 		return v4Available, v4Using, v6Available, v6Using, v4AvailableRange, v4UsingRange, v6AvailableRange, v6UsingRange
 	}
 
-	v4Available = p.V4Available.Count()
-	v6Available = p.V6Available.Count()
+	// a reserved pool keeps its free lists for GetStaticAddress, but hands out none of
+	// them: reporting them as available would make consumers - the pod controller picks
+	// an ippool of a namespace by this count - choose a pool that can only fail
+	if !p.PendingActivation {
+		v4Available = p.V4Available.Count()
+		v6Available = p.V6Available.Count()
+		v4AvailableRange = p.V4Available.String()
+		v6AvailableRange = p.V6Available.String()
+	}
 	v4Using = p.V4Using.Count()
 	v6Using = p.V6Using.Count()
-	v4AvailableRange = p.V4Available.String()
-	v6AvailableRange = p.V6Available.String()
 	v4UsingRange = p.V4Using.String()
 	v6UsingRange = p.V6Using.String()
 

@@ -678,3 +678,45 @@ func Test_handleAddOrUpdateGwNftableLbService_noTombstoneChurnAfterTrim(t *testi
 		require.NotEqual(t, "delete", action.GetVerb(), "a settled ledger has no tombstones or stale records to delete")
 	}
 }
+
+// Test_claimNftableLbRecords_toleratesUnobservedRecord pins the retry of a pass that created a
+// record and then aborted: the informer has not delivered the record yet, so the retry tries to
+// create it again. The create must not turn the pass into a hard error - the record is the
+// Service's own, and the retry reconciles it like any other existing one.
+func Test_claimNftableLbRecords_toleratesUnobservedRecord(t *testing.T) {
+	t.Parallel()
+
+	client := kubeovnfake.NewSimpleClientset()
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "unobserved-record",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web", util.NftableLbSvcRecordLabel: "true",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.0.5", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	_, err := client.KubeovnV1().IptablesDnatRules().Create(context.Background(), record, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	c := &Controller{config: &Configuration{KubeOvnClient: client}}
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}}
+	want := record.DeepCopy()
+	want.ResourceVersion = ""
+
+	// existing is empty: this is what the lister returns before it observed the create
+	live, retiring, err := c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want}, nil)
+	require.NoError(t, err, "a record the retry owns must not fail the pass")
+	require.Contains(t, live, record.Name, "the pass claims the record it read back")
+	require.Empty(t, retiring, "nothing is retired, the identity did not change")
+
+	// the same pass with a changed identity reconciles the record it read back
+	want = record.DeepCopy()
+	want.ResourceVersion = ""
+	want.Spec.InternalPort = "9090"
+	live, _, err = c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "9090", live[record.Name].Spec.InternalPort)
+}

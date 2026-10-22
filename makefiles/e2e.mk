@@ -377,3 +377,10 @@ kube-ovn-tunnel-id-e2e:
 .PHONY: e2e-vpc-nat-gw-hairpin
 e2e-vpc-nat-gw-hairpin:
 	bash test/e2e/iptables-vpc-nat-gw/hairpin_snat_test.sh
+
+# Control-plane test of ippool spec.ipCount against real resources (Subnet, IPPool, workload
+# Pod). Needs a cluster running a controller that supports spec.ipCount; the test skips itself
+# on an older CRD. See the script header for the preconditions.
+.PHONY: e2e-ippool-ipcount
+e2e-ippool-ipcount:
+	bash test/e2e/ippool/ipcount_test.sh
