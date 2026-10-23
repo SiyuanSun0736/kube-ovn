@@ -561,7 +561,7 @@ func (c *Controller) findLocalNatGwPod(natGwDp string) *corev1.Pod {
 	if err != nil {
 		return nil
 	}
-	prefix := "vpc-nat-gw-" + natGwDp
+	prefix := "vpc-nat-gw-" + natGwDp + "-"
 	for _, pod := range pods {
 		if pod.Spec.NodeName != c.config.NodeName {
 			continue
@@ -572,10 +572,10 @@ func (c *Controller) findLocalNatGwPod(natGwDp string) *corev1.Pod {
 		}
 		// Match by labels
 		if pod.Labels != nil {
-			if gw := pod.Labels[util.VpcNatGatewayNameLabel]; gw == natGwDp || strings.HasPrefix(gw, natGwDp) {
+			if gw := pod.Labels[util.VpcNatGatewayNameLabel]; gw == natGwDp || strings.HasPrefix(gw, natGwDp+"-") {
 				return pod
 			}
-			if app := pod.Labels["app"]; app == prefix || strings.HasPrefix(app, prefix) {
+			if app := pod.Labels["app"]; app == "vpc-nat-gw-"+natGwDp || strings.HasPrefix(app, prefix) {
 				return pod
 			}
 		}
