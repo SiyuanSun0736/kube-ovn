@@ -817,6 +817,13 @@ func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
 		return nil
 	}
 
+	// Clean any hijacked routes in table 255 (local) on all nodes for veth mode.
+	// Kube-proxy in IPVS mode binds LoadBalancer EIPs to kube-ipvs0 on every node,
+	// creating local table routes that intercept external/inter-node traffic.
+	if info.mode == "veth" {
+		_ = cleanHostLocalTableRouteForEIP(info.v4ip)
+	}
+
 	// If NAT GW pod is not on this node, delete routes (if any) and return
 	if !c.hasNatGwPodOnLocalNode(eip.Spec.NatGwDp) {
 		klog.V(3).Infof("NAT GW pod for iptables-eip %s not on local node, deleting routes if exist", info.eipName)

@@ -1283,10 +1283,22 @@ function stateless_init() {
         nft add rule ip "$table" postrouting tcp flags \& \(syn \| rst\) == syn counter tcp option maxseg size set rt mtu 2>/dev/null || true
     fi
     # Ensure traffic destined to the gateway's own VPC LAN IP is accepted in raw prerouting (never notrack)
+    ensure_lan_ip_bypass "$table"
+}
+
+function ensure_lan_ip_bypass() {
+    local table=${1:-$STATELESS_NFT_TABLE}
     local vpc_ip
     vpc_ip=$(local_vpc_ipv4 2>/dev/null || true)
     if [ -n "$vpc_ip" ]; then
-        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$VPC_INTERFACE\" ip daddr $vpc_ip accept"; then
+        local first_rule
+        first_rule=$(nft list chain ip "$table" prerouting 2>/dev/null | grep -E "iifname|ip daddr|ip saddr" | head -n 1)
+        if [[ "$first_rule" != *"ip daddr $vpc_ip accept"* ]]; then
+            local handles
+            handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $vpc_ip accept" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            for h in $handles; do
+                nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+            done
             nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip daddr "$vpc_ip" accept 2>/dev/null || true
         fi
     fi
@@ -1364,6 +1376,7 @@ function stateless_fip_add() {
         fi
         add_hairpin_fip "$eip"
     done
+    ensure_lan_ip_bypass "$table"
 }
 
 function stateless_fip_del() {
@@ -1465,6 +1478,7 @@ function stateless_dnat_add() {
             exec_cmd "$iptables_cmd -t nat -A SHARED_DNAT -i $VPC_INTERFACE -p $proto -d $eip --dport $extPort -j DNAT --to-destination $intIp:$intPort"
         fi
     done
+    ensure_lan_ip_bypass "$table"
 }
 
 function stateless_dnat_del() {
@@ -1577,6 +1591,7 @@ function stateless_snat_add() {
             fi
         fi
     done
+    ensure_lan_ip_bypass "$table"
 }
 
 function stateless_snat_del() {
