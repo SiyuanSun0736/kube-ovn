@@ -358,10 +358,12 @@ function add_eip() {
     check_inited
     local ptp_peer
     ptp_peer=$(ip -4 route show dev "$EXTERNAL_INTERFACE" scope link 2>/dev/null | awk '/^169\.254\./ {print $1; exit}')
+    first_eip=""
     for rule in $@
     do
         eip=${rule}
         eip_without_prefix=(${eip//\// })
+        [ -z "$first_eip" ] && first_eip="$eip_without_prefix"
         if [ -n "$ptp_peer" ]; then
             exec_cmd "ip addr replace ${eip_without_prefix}/32 dev $EXTERNAL_INTERFACE"
         else
@@ -373,7 +375,11 @@ function add_eip() {
     # In point-to-point (veth) mode, keep the default route pointing to the link-local host peer.
     # In L2 (macvlan) mode, use "onlink" via GATEWAY_V4.
     if [ -n "$ptp_peer" ]; then
-        exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE"
+        if [ -n "$first_eip" ]; then
+            exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE src $first_eip"
+        else
+            exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE"
+        fi
         ip route del default dev "$VPC_INTERFACE" 2>/dev/null || true
     elif [ -n "$GATEWAY_V4" ]; then
         exec_cmd "ip route replace default via $GATEWAY_V4 dev $EXTERNAL_INTERFACE onlink"
