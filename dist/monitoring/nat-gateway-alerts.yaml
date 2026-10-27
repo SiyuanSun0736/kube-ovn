@@ -20,7 +20,6 @@ spec:
           annotations:
             summary: "VPC NAT Gateway {{ $labels.gateway }} (VPC: {{ $labels.vpc }}) 所有 Member Pod 已全部离线！"
             description: "网关双活或单活实例已无任何就绪的 Pod，VPC 出网策略路由已自动降级为 Drop，出网流量发生完全中断。"
-            runbook_url: "http://las-wiki.qiniu.io/SOP/Network/KubeOVN-NatGw-Failover/"
 
         # P1 告警：双活网关单点运行，容灾冗余丧失
         - alert: NatGwMemberDegraded
@@ -32,7 +31,6 @@ spec:
           annotations:
             summary: "VPC NAT Gateway {{ $labels.gateway }} (VPC: {{ $labels.vpc }}) 处于降级运行状态，仅剩单节点存活！"
             description: "网关就绪 Member 数少于 2，当前处于单点运行，若存活节点再次突发异常将导致全网中断，请尽快排查故障 Member Pod 状态。"
-            runbook_url: "http://las-wiki.qiniu.io/SOP/Network/KubeOVN-NatGw-Failover/"
 
         # P0 告警：策略路由网关下一跳动态反解失败
         - alert: PolicyRouteResolveError
