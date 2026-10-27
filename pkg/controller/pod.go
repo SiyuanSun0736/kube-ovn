@@ -589,13 +589,6 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 				c.initVpcNatGatewayQueue.Add(vpcGwName)
 			}
 		}
-		if pod.DeletionTimestamp.IsZero() && pod.Status.Phase == v1.PodRunning {
-			podName := c.getNameByPod(pod)
-			portName := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
-			if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
-				klog.V(4).Infof("failed to enable layer2 forward for nat gw port %s: %v", portName, err)
-			}
-		}
 		if needRestartNatGatewayPod(pod) {
 			klog.Infof("restarting vpc nat gateway %s", vpcGwName)
 			c.addOrUpdateVpcNatGatewayQueue.Add(vpcGwName)
@@ -919,11 +912,7 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 				return nil, err
 			}
 
-			isNatGw, _ := c.checkIsPodVpcNatGw(pod)
-			if isNatGw {
-				patch[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] = "true"
-			}
-			if isNatGw || pod.Annotations[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] == "true" {
+			if pod.Annotations[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] == "true" {
 				if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
 					c.recorder.Eventf(pod, v1.EventTypeWarning, "SetOVNPortL2ForwardFailed", err.Error())
 					klog.Errorf("%v", err)
@@ -991,12 +980,6 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		if pod.DeletionTimestamp.IsZero() {
 			klog.Infof("init vpc nat gateway pod %s/%s with name %s", namespace, name, vpcGwName)
 			c.initVpcNatGatewayQueue.Add(vpcGwName)
-			podName := c.getNameByPod(pod)
-			portName := ovs.PodNameToPortName(podName, namespace, util.OvnProvider)
-			if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
-				klog.Errorf("failed to enable layer2 forward for nat gw port %s: %v", portName, err)
-				return nil, err
-			}
 		}
 	}
 
