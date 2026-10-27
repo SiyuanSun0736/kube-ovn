@@ -23,7 +23,6 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"github.com/prometheus/client_golang/prometheus"
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/request"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -245,7 +244,6 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	// re-enqueues its partition sync), so forget them here to track live gateways only.
 	c.natGwLanVipMergeNotes.Delete(gwName)
 	c.natGwLanVipLastSync.Delete(gwName)
-	metricNatGwReadyMembers.DeletePartialMatch(prometheus.Labels{"gateway": gwName})
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -503,12 +501,6 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 
 	if gw.Spec.Vpc != "" && c.addOrUpdateVpcQueue != nil {
 		c.addOrUpdateVpcQueue.Add(gw.Spec.Vpc)
-	}
-
-	if pods, err := c.listNatGwPods(gw); err == nil {
-		if nextHops, err := getNatGwNextHops(gw, pods); err == nil {
-			metricNatGwReadyMembers.WithLabelValues(gw.Name, gw.Spec.Vpc).Set(float64(len(nextHops)))
-		}
 	}
 
 	// Return backfillErr last so the StatefulSet work above is always attempted,

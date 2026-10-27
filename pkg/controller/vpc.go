@@ -540,7 +540,6 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 				// Degrade to drop when no gateway member is ready to prevent traffic blackhole
 				prCopy.Action = kubeovnv1.PolicyRouteActionDrop
 				prCopy.NextHopIP = ""
-				metricPolicyRouteResolveErrors.WithLabelValues(vpc.Name, prCopy.Gateway).Inc()
 			}
 		}
 		if prCopy.BfdID == "" && prCopy.NextHopIP != "" {

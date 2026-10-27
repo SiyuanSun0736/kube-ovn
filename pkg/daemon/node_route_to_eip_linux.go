@@ -299,9 +299,7 @@ func cleanHostLocalTableRouteForEIP(eip string) error {
 	}
 	for _, r := range routes {
 		if r.Type == syscall.RTN_LOCAL {
-			metricHostLocalRouteHijackedTotal.WithLabelValues(nodeName, eip).Inc()
 			if delErr := netlink.RouteDel(&r); delErr != nil {
-				metricHostLocalRouteCleanErrors.WithLabelValues(nodeName, eip).Inc()
 				klog.Warningf("failed to delete local table route for EIP %s: %v", eip, delErr)
 			} else {
 				klog.Infof("successfully deleted hijacked local table route for EIP %s", eip)
