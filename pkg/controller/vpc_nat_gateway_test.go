@@ -937,4 +937,13 @@ func TestNatGwCreatedAt_IsolatedPerGateway(t *testing.T) {
 	ctrl.setNatGwCreatedAt("gw1", "2026-10-28T10:10:00")
 	assert.Equal(t, "2026-10-28T10:10:00", ctrl.getNatGwCreatedAt("gw1"))
 	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Delete gw1 releases its entry and does not affect gw2
+	ctrl.deleteNatGwCreatedAt("gw1")
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Delete gw2
+	ctrl.deleteNatGwCreatedAt("gw2")
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
 }

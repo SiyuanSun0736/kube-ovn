@@ -46,6 +46,10 @@ func (c *Controller) setNatGwCreatedAt(key, createdAt string) {
 	c.natGwCreatedAt.Store(key, createdAt)
 }
 
+func (c *Controller) deleteNatGwCreatedAt(key string) {
+	c.natGwCreatedAt.Delete(key)
+}
+
 const (
 	natGwInit             = "init"
 	natGwEipAdd           = "eip-add"
@@ -235,6 +239,7 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	// re-enqueues its partition sync), so forget them here to track live gateways only.
 	c.natGwLanVipMergeNotes.Delete(gwName)
 	c.natGwLanVipLastSync.Delete(gwName)
+	c.deleteNatGwCreatedAt(gwName)
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
