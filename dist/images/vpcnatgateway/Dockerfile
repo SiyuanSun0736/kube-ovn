@@ -5,6 +5,7 @@ RUN set -ex \
     && apk upgrade \
     && apk add --no-cache \
     bash \
+    dumb-init \
     iproute2 \
     iptables iptables-legacy \
     nftables \
@@ -14,9 +15,11 @@ RUN set -ex \
     conntrack-tools
 
 WORKDIR /kube-ovn
-COPY nat-gateway.sh /kube-ovn/
-COPY lb-svc.sh /kube-ovn/
+COPY --chmod=0755 nat-gateway.sh /kube-ovn/
+COPY --chmod=0755 lb-svc.sh /kube-ovn/
+RUN chmod +x /kube-ovn/*.sh
 
 # Container startup command. The controller does not override this,
 # keeping startup behavior decoupled and managed by the image.
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["sleep", "infinity"]

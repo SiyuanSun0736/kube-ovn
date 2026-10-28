@@ -3,7 +3,7 @@ FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG DUMB_INIT_VERSION="1.2.5"
-ARG TARGETARCH
+ARG TARGETARCH=amd64
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -57,8 +57,9 @@ RUN curl -sSf -L --retry 5 -o /usr/bin/dumb-init \
     chmod +x /usr/bin/dumb-init
 
 WORKDIR /kube-ovn
-COPY nat-gateway.sh /kube-ovn/
-COPY lb-svc.sh /kube-ovn/
+COPY --chmod=0755 nat-gateway.sh /kube-ovn/
+COPY --chmod=0755 lb-svc.sh /kube-ovn/
+RUN chmod +x /kube-ovn/*.sh
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["sleep", "infinity"]
