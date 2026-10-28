@@ -67,6 +67,14 @@ for port in 6081 4789 8472; do
         "${cmd}" -w 5 -t raw -A OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null
     fi
   done
+
+  # Flush existing orphan conntrack entries for tunnel traffic
+  if command -v conntrack >/dev/null 2>&1; then
+    conntrack -D -p udp --dport "${port}" 2>/dev/null || true
+    conntrack -D -p udp --sport "${port}" 2>/dev/null || true
+    conntrack -D -f ipv6 -p udp --dport "${port}" 2>/dev/null || true
+    conntrack -D -f ipv6 -p udp --sport "${port}" 2>/dev/null || true
+  fi
 done
 set -e
 
