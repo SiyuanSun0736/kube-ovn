@@ -292,10 +292,10 @@ type Controller struct {
 	// gateway (instance pod UIDs + desired rules), so byte-identical re-syncs skip the pod exec.
 	natGwLanVipLastSync sync.Map
 	// natGwCreatedAt tracks creation timestamp per gateway instance for redo synchronization.
-	natGwCreatedAt sync.Map
-	deleteServiceQueue  workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue  workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex         keymutex.KeyMutex
+	natGwCreatedAt     sync.Map
+	deleteServiceQueue workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex        keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced

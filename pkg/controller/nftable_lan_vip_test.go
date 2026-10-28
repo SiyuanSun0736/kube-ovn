@@ -396,10 +396,12 @@ func TestHandleDelVpcNatGwClearsLanVipCaches(t *testing.T) {
 
 	c.natGwLanVipMergeNotes.Store(f.gw.Name, "80/tcp|ns/svc|clientIP=true timeout=300")
 	c.natGwLanVipLastSync.Store(f.gw.Name, "uid1\x00rules")
+	c.setNatGwCreatedAt(f.gw.Name, "2026-10-28T10:00:00")
 
 	require.NoError(t, c.handleDelVpcNatGw("kube-system/"+f.gw.Name))
 	_, ok := c.natGwLanVipMergeNotes.Load(f.gw.Name)
 	require.False(t, ok, "merge notes forgotten on gateway delete")
 	_, ok = c.natGwLanVipLastSync.Load(f.gw.Name)
 	require.False(t, ok, "last-sync signature forgotten on gateway delete")
+	require.Equal(t, "", c.getNatGwCreatedAt(f.gw.Name), "created-at timestamp forgotten on gateway delete")
 }
