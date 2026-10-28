@@ -914,3 +914,27 @@ func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
 		})
 	}
 }
+
+func TestNatGwCreatedAt_IsolatedPerGateway(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &Controller{}
+	// Initially empty
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Set gw1
+	ctrl.setNatGwCreatedAt("gw1", "2026-10-28T10:00:00")
+	assert.Equal(t, "2026-10-28T10:00:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Set gw2
+	ctrl.setNatGwCreatedAt("gw2", "2026-10-28T10:05:00")
+	assert.Equal(t, "2026-10-28T10:00:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Overwrite gw1 does not affect gw2
+	ctrl.setNatGwCreatedAt("gw1", "2026-10-28T10:10:00")
+	assert.Equal(t, "2026-10-28T10:10:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+}

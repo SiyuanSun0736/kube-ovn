@@ -291,6 +291,8 @@ type Controller struct {
 	// natGwLanVipLastSync stores the last successfully programmed partition signature per
 	// gateway (instance pod UIDs + desired rules), so byte-identical re-syncs skip the pod exec.
 	natGwLanVipLastSync sync.Map
+	// natGwCreatedAt tracks creation timestamp per gateway instance for redo synchronization.
+	natGwCreatedAt sync.Map
 	deleteServiceQueue  workqueue.TypedRateLimitingInterface[*vpcService]
 	updateServiceQueue  workqueue.TypedRateLimitingInterface[*updateSvcObject]
 	svcKeyMutex         keymutex.KeyMutex
