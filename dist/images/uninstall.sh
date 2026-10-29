@@ -28,8 +28,12 @@ iptables -t filter -D FORWARD -m set --match-set ovn40services src -j ACCEPT
 iptables -t filter -D OUTPUT -p udp -m udp --dport 6081 -j MARK --set-xmark 0x0
 iptables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
-  iptables -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
-  iptables -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+  for cmd in iptables iptables-nft; do
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+    fi
+  done
 done
 iptables -t filter -D OUTPUT -p tcp -m mark ! --mark 0x4000/0x4000 -m set --match-set ovn40services dst -m conntrack --ctstate NEW -j REJECT
 iptables -t mangle -D PREROUTING -m comment --comment "kube-ovn prerouting rules" -j OVN-PREROUTING
@@ -74,8 +78,12 @@ ip6tables -t filter -D FORWARD -m set --match-set ovn60services src -j ACCEPT
 ip6tables -t filter -D OUTPUT -p udp -m udp --dport 6081 -j MARK --set-xmark 0x0
 ip6tables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
-  ip6tables -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
-  ip6tables -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+  for cmd in ip6tables ip6tables-nft; do
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+    fi
+  done
 done
 ip6tables -t filter -D OUTPUT -p tcp -m mark ! --mark 0x4000/0x4000 -m set --match-set ovn60services dst -m conntrack --ctstate NEW -j REJECT
 ip6tables -t mangle -D PREROUTING -m comment --comment "kube-ovn prerouting rules" -j OVN-PREROUTING
