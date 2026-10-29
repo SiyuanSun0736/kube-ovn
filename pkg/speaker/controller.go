@@ -53,6 +53,9 @@ type Controller struct {
 	natgatewayLister kubeovnlister.VpcNatGatewayLister
 	natgatewaySynced cache.InformerSynced
 
+	// tcManager 负责管理物理宿主机网卡的 eBPF TC Ingress 过滤器生命周期与 BPF Map 路由表同步
+	tcManager TCManager
+
 	// eipQueue is used in node-route-eip-mode for processing EIP events
 	eipQueue workqueue.TypedRateLimitingInterface[string]
 
@@ -156,6 +159,7 @@ func NewController(config *Configuration) *Controller {
 		eipSynced:        eipInformer.Informer().HasSynced,
 		natgatewayLister: natgatewayInformer.Lister(),
 		natgatewaySynced: natgatewayInformer.Informer().HasSynced,
+		tcManager:        NewTCManager(config),
 
 		informerFactory:        informerFactory,
 		nodeInformerFactory:    nodeInformerFactory,
@@ -208,6 +212,16 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	}
 
 	klog.Info("Started workers")
+
+	// 若开启了 eBPF TC 旁路直通加速，则在物理宿主机主网卡上初始化挂载 TC clsact 队列与 BPF Ingress 过滤器
+	if c.config.EnableTcBpfRedirect {
+		if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
+			klog.Errorf("初始化挂载 TC BPF 过滤器失败: %v", err)
+		}
+		defer func() {
+			_ = c.tcManager.Close()
+		}()
+	}
 
 	// Start node-route-eip workers if in that mode
 	if c.config.NodeRouteEIPMode {

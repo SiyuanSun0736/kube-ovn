@@ -38,8 +38,11 @@ package speaker
 import (
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -151,10 +154,18 @@ func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
 			continue
 		}
 		if err := c.delRoute(ip); err != nil {
-			klog.Errorf("failed to withdraw BGP route for EIP %s: %v", ip, err)
+			klog.Errorf("撤销 EIP %s 的 BGP 路由失败: %v", ip, err)
 			errs = append(errs, err)
 		} else {
 			withdrawn = append(withdrawn, ip)
+			// 若启用了 eBPF TC 旁路直通，在撤销 BGP 路由时同步原子删除 BPF Map 映射，避免流量被错误短路
+			if c.config.EnableTcBpfRedirect {
+				if parsedIP := net.ParseIP(ip); parsedIP != nil {
+					if err := c.tcManager.DeleteEIP(parsedIP); err != nil {
+						klog.Errorf("从 TC BPF Map 剔除 EIP %s 失败: %v", ip, err)
+					}
+				}
+			}
 		}
 	}
 
@@ -230,7 +241,14 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		return nil
 	}
 
-	// Announce routes only if not already announced (idempotent)
+	// 仅在尚未宣告时发布路由（具备幂等性）
+	var pod *corev1.Pod
+	// 若启用了 TC 旁路直通，则提前检索本节点网关 Pod 实例，用于后续解析网关网卡 ifindex
+	if c.config.EnableTcBpfRedirect && eip.Spec.NatGwDp != "" {
+		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
+		pod, _ = c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
+	}
+
 	var errs []error
 	var announced []string
 	for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
@@ -238,14 +256,23 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 			continue
 		}
 		if c.isRouteAnnounced(ip) {
-			klog.V(3).Infof("BGP route for EIP %s already announced, skipping", ip)
+			klog.V(3).Infof("EIP %s 的 BGP 路由此前已宣告，跳过重复处理", ip)
 			continue
 		}
 		if err := c.addRoute(ip); err != nil {
-			klog.Errorf("failed to announce BGP route for EIP %s: %v", ip, err)
+			klog.Errorf("宣告 EIP %s 的 BGP 路由失败: %v", ip, err)
 			errs = append(errs, err)
 		} else {
 			announced = append(announced, ip)
+			// 若启用了 eBPF TC 旁路直通，在发布 BGP 路由的同时，原子写入 EIP ➔ 本地网关网卡 ifindex 映射至 BPF Map
+			if c.config.EnableTcBpfRedirect {
+				targetInfo := c.getNatGwTargetInfo(pod, eip)
+				if parsedIP := net.ParseIP(ip); parsedIP != nil {
+					if err := c.tcManager.AddEIP(parsedIP, targetInfo); err != nil {
+						klog.Errorf("写入 EIP %s 至 TC BPF Map 失败: %v", ip, err)
+					}
+				}
+			}
 		}
 	}
 
@@ -277,6 +304,44 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	return pod.Spec.NodeName == c.config.NodeName && pod.Status.Phase == corev1.PodRunning
 }
 
+// getNatGwTargetInfo 解析并定位本地网关 Pod 在物理宿主机根空间对应的网络接口设备索引与 MAC
+func (c *Controller) getNatGwTargetInfo(pod *corev1.Pod, _ *kubeovnv1.IptablesEIP) TargetInfo {
+	info := TargetInfo{}
+	if pod == nil {
+		return info
+	}
+
+	// 1. 若配置了物理主网卡，优先探测基于主网卡创建的 macvlan 子接口
+	if masterIface := c.config.TcBpfInterface; masterIface != "" {
+		if macvlanName, err := util.GenMacvlanIfaceName(masterIface); err == nil {
+			if link, err := netlink.LinkByName(macvlanName); err == nil {
+				info.TargetIfindex = link.Attrs().Index
+				info.TargetMAC = link.Attrs().HardwareAddr
+				return info
+			}
+		}
+	}
+
+	// 2. 通过 Netlink 扫描宿主机网络接口列表，匹配网关 Pod 所属的接口（如 veth 或容器网卡）
+	links, err := netlink.LinkList()
+	if err == nil {
+		podSuffix := ""
+		if len(pod.Name) > 11 {
+			podSuffix = pod.Name[len(pod.Name)-11:]
+		}
+		for _, l := range links {
+			name := l.Attrs().Name
+			if (podSuffix != "" && strings.Contains(name, podSuffix)) || strings.Contains(name, pod.Name) {
+				info.TargetIfindex = l.Attrs().Index
+				info.TargetMAC = l.Attrs().HardwareAddr
+				return info
+			}
+		}
+	}
+
+	return info
+}
+
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
 // This method finds all EIPs associated with local NAT gateway pods and announces them.
 // It also withdraws any EIPs that should no longer be announced.
@@ -286,6 +351,7 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 // can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
+	expectedTcMap := make(map[string]TargetInfo)
 
 	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
@@ -304,10 +370,29 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
+		// 若开启了 eBPF TC 旁路直通，则获取本地网关 Pod 网卡信息，参与全量对账
+		var targetInfo TargetInfo
+		if c.config.EnableTcBpfRedirect {
+			podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
+			if pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName); err == nil {
+				targetInfo = c.getNatGwTargetInfo(pod, eip)
+			}
+		}
+
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
+				if c.config.EnableTcBpfRedirect {
+					expectedTcMap[ip] = targetInfo
+				}
 			}
+		}
+	}
+
+	// 周期对账自愈：将当前期望的 EIP 映射全量同步至内核 BPF Map，清理异常残留的孤儿条目
+	if c.config.EnableTcBpfRedirect {
+		if err := c.tcManager.SyncEIPs(expectedTcMap); err != nil {
+			klog.Errorf("周期对账同步 TC BPF Map 失败: %v", err)
 		}
 	}
 
