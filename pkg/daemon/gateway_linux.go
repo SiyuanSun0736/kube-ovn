@@ -1236,13 +1236,6 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 		}
 		v6ObsoleteRules = []util.IPTableRule{
 			{Table: NAT, Chain: Postrouting, Rule: strings.Fields(`-m mark --mark 0x40000/0x40000 -j MASQUERADE`)},
@@ -1277,13 +1270,6 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 		}
 	)
 
