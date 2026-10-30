@@ -58,6 +58,16 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } kube_ovn_eip_v6_map SEC(".maps");
 
+static __always_inline int mac_eq(const __u8 *a, const __u8 *b) {
+    #pragma unroll
+    for (int i = 0; i < ETH_ALEN; i++) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // macvlan bridge egress reinjects local traffic through the master's ingress.
 // Once the destination MAC is rewritten, let its RX handler deliver to the Pod
 // instead of redirecting the same packet back through the macvlan indefinitely.
@@ -65,7 +75,7 @@ static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
                                              struct eip_target *target) {
     struct ethhdr *eth = data;
     return skb->ifindex == target->parent_ifindex &&
-           __builtin_memcmp(eth->h_dest, target->target_mac, ETH_ALEN) == 0;
+           mac_eq(eth->h_dest, target->target_mac);
 }
 
 // In direct-action mode TC_ACT_OK ends classification; it does not continue
