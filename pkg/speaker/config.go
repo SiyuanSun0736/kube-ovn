@@ -285,6 +285,9 @@ func ParseFlags() (*Configuration, error) {
 // - NatGwMode: speaker runs inside NAT gateway pod, announces EIPs for that specific gateway
 // - NodeRouteEIPMode: speaker runs on node, announces EIPs for all local NAT gateway pods
 func (config *Configuration) validateMutuallyExclusiveModes() error {
+	if config.EnableTcBpfRedirect && !config.NodeRouteEIPMode {
+		return errors.New("--enable-tc-bpf-redirect requires --node-route-eip-mode")
+	}
 	if config.NatGwMode && config.NodeRouteEIPMode {
 		return errors.New("--nat-gw-mode and --node-route-eip-mode are mutually exclusive")
 	}

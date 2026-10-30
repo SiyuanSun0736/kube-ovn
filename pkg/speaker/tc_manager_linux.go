@@ -3,369 +3,402 @@
 package speaker
 
 import (
-	"encoding/binary"
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
-	"syscall"
-	"unsafe"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-	"k8s.io/klog/v2"
 )
 
-// bpfEipTarget 对应 C 语言中的 struct eip_target，必须在 64 位下保持 32 字节且 8 字节对齐
+const (
+	tcEIPFilterName = "kube-ovn-eip"
+	tcEIPv4MapName  = "kube_ovn_eip_v4_map"
+	tcEIPv6MapName  = "kube_ovn_eip_v6_map"
+)
+
+// Keep this layout in sync with struct eip_target in tc_eip.c.
 type bpfEipTarget struct {
-	Ifindex   uint32   // 目标网卡接口设备索引 (4 字节)
-	TargetMAC [6]byte  // 目标 MAC 地址 (6 字节)
-	Pad       [2]byte  // 2 字节填充，对齐到 4 字节
-	Pad2      uint32   // 4 字节显式填充，使后方的 uint64 严格对齐到 8 字节边界
-	Packets   uint64   // 直通转发的数据包统计 (8 字节)
-	Bytes     uint64   // 直通转发的字节统计 (8 字节)
+	Ifindex       uint32
+	TargetMAC     [6]byte
+	Pad           [2]byte
+	ParentIfindex uint32
+	Packets       uint64
+	Bytes         uint64
 }
 
-// linuxTCManager 是 Linux 平台下 TCManager 的具体实现
 type linuxTCManager struct {
-	cfg      *Configuration
-	mu       sync.Mutex
-	attached map[string]bool
-	v4MapFD  int
-	v6MapFD  int
+	cfg        *Configuration
+	mu         sync.Mutex
+	collection *ebpf.Collection
+	v4Map      *ebpf.Map
+	v6Map      *ebpf.Map
+	closed     bool
 }
 
-// newPlatformTCManager 创建 Linux 平台的 TC 管理器
-func newPlatformTCManager(cfg *Configuration) TCManager {
-	return &linuxTCManager{
-		cfg:      cfg,
-		attached: make(map[string]bool),
-		v4MapFD:  -1,
-		v6MapFD:  -1,
-	}
-}
+func newPlatformTCManager(cfg *Configuration) TCManager { return &linuxTCManager{cfg: cfg} }
 
-// ensureClsactQdisc 确保物理网卡上存在 clsact 无锁队列调度器
 func ensureClsactQdisc(link netlink.Link) error {
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0), // clsact 的 handle 规定为 ffff:0
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-
-	// 添加 clsact 队列调度器，若已存在（如 Cilium 或先前端已添加）则忽略 EEXIST 错误
-	if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) && !errors.Is(err, syscall.EEXIST) {
-		return fmt.Errorf("为网卡 %s 添加 clsact qdisc 失败: %w", link.Attrs().Name, err)
+	qdisc := &netlink.GenericQdisc{QdiscAttrs: netlink.QdiscAttrs{
+		LinkIndex: link.Attrs().Index, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT,
+	}, QdiscType: "clsact"}
+	if err := netlink.QdiscAdd(qdisc); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
 	}
 	return nil
 }
 
-// Attach 在目标网卡上完成 clsact 队列创建并挂载 TC BPF 过滤器（prio 1 direct-action）
+// mapPaths honors the configured IPv4 pin path; the IPv6 pin is its sibling.
+func (m *linuxTCManager) mapPaths() (string, string) {
+	v4 := m.cfg.TcBpfMapPath
+	if v4 == "" {
+		v4 = "/sys/fs/bpf/kube_ovn_eip_v4_map"
+	}
+	v6 := strings.TrimSuffix(v4, "_v4_map") + "_v6_map"
+	return v4, v6
+}
+
+// Attach is idempotent, including recovery after a link or filter was recreated.
+// A failed attempt leaves no successful attachment marker and can be retried.
 func (m *linuxTCManager) Attach(linkName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("TC manager is closed")
+	}
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 若未指定网卡，优先使用配置中指定的网卡，否则自动推导宿主机默认路由物理网卡
 	if linkName == "" {
 		linkName = m.cfg.TcBpfInterface
 	}
 	if linkName == "" {
-		linkName = m.detectDefaultInterface()
+		var err error
+		linkName, err = detectDefaultInterface()
+		if err != nil {
+			return err
+		}
 	}
-	if linkName == "" {
-		return errors.New("tc-manager: 无法自动识别或未配置用于挂载 TC 的物理网卡接口")
-	}
-
 	link, err := netlink.LinkByName(linkName)
 	if err != nil {
-		return fmt.Errorf("tc-manager: 未在宿主机找到指定网卡 %s: %w", linkName, err)
-	}
-
-	// 1. 确保 clsact qdisc 存在
-	if err := ensureClsactQdisc(link); err != nil {
 		return err
 	}
-
-	// 2. 加载并挂载 BPF 程序到 ingress 队列
-	progPath := m.cfg.TcBpfProgPath
-	if progPath == "" {
-		progPath = "/etc/kube-ovn/tc_eip.o"
+	if err = ensureClsactQdisc(link); err != nil {
+		return err
 	}
-
-	if _, err := os.Stat(progPath); err == nil {
-		// 执行标准的 tc filter replace 命令，以 priority 1 保证优先于 Cilium (prio 10) 拦截 EIP 流量
-		cmd := exec.Command("tc", "filter", "replace", "dev", linkName, "ingress",
-			"prio", "1", "handle", "1", "bpf", "da", "obj", progPath, "sec", "classifier")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			klog.Warningf("通过 tc 命令行在网卡 %s 挂载 BPF 过滤器失败: %v, 输出: %s", linkName, err, string(output))
-		} else {
-			klog.Infof("已成功在网卡 %s 上挂载 eBPF TC 过滤器 (prio 1 direct-action, obj: %s)", linkName, progPath)
-			m.attached[linkName] = true
-			m.ensureMapFDs()
+	if m.collection == nil {
+		if err = m.load(); err != nil {
+			return err
+		}
+	}
+	prog := m.collection.Programs["tc_eip_ingress"]
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	if err != nil {
+		return err
+	}
+	info, err := prog.Info()
+	if err != nil {
+		return err
+	}
+	id, _ := info.ID()
+	for _, filter := range filters {
+		attrs := filter.Attrs()
+		if attrs.Priority != 1 {
+			continue
+		}
+		bpf, ok := filter.(*netlink.BpfFilter)
+		if !ok || !isEIPFilter(bpf) {
+			return fmt.Errorf("TC priority 1 on %s is already owned by another filter", linkName)
+		}
+		if bpf.Id == int(id) && bpf.DirectAction {
 			return nil
 		}
-	} else {
-		klog.Warningf("未在路径 %s 检测到编译好的 TC BPF 目标文件: %v，挂载将等待文件就绪后生效", progPath, err)
 	}
+	return netlink.FilterReplace(&netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
+			Handle: 1, Priority: 1, Protocol: unix.ETH_P_ALL,
+		},
+		Fd: prog.FD(), Name: tcEIPFilterName, DirectAction: true,
+	})
+}
 
-	m.attached[linkName] = true
-	m.ensureMapFDs()
+func (m *linuxTCManager) load() error {
+	path := m.cfg.TcBpfProgPath
+	if path == "" {
+		path = "/etc/kube-ovn/tc_eip.o"
+	}
+	spec, err := ebpf.LoadCollectionSpec(path)
+	if err != nil {
+		return fmt.Errorf("load TC object: %w", err)
+	}
+	if spec.Programs["tc_eip_ingress"] == nil || spec.Maps[tcEIPv4MapName] == nil || spec.Maps[tcEIPv6MapName] == nil {
+		return errors.New("TC object is missing its EIP classifier or maps")
+	}
+	// Start from an empty generation. Old pins must not resurrect stale ifindices
+	// after a speaker restart; periodic reconciliation repopulates current targets.
+	for _, ms := range spec.Maps {
+		ms.Pinning = ebpf.PinNone
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("remove BPF memlock limit: %w", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("load TC program: %w", err)
+	}
+	if err = m.cleanupFilters(""); err != nil {
+		coll.Close()
+		return err
+	}
+	v4, v6 := m.mapPaths()
+	for name, path := range map[string]string{tcEIPv4MapName: v4, tcEIPv6MapName: v6} {
+		if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+			err = removePin(path)
+		}
+		if err == nil {
+			err = coll.Maps[name].Pin(path)
+		}
+		if err != nil {
+			coll.Close()
+			return fmt.Errorf("pin EIP map %s: %w", path, err)
+		}
+	}
+	m.collection = coll
+	m.v4Map, m.v6Map = coll.Maps[tcEIPv4MapName], coll.Maps[tcEIPv6MapName]
 	return nil
 }
 
-// Detach 从指定物理网卡上安全卸载 TC BPF 过滤器
-func (m *linuxTCManager) Detach(linkName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if linkName == "" {
-		linkName = m.cfg.TcBpfInterface
-	}
-	if linkName == "" {
-		return nil
-	}
-
-	cmd := exec.Command("tc", "filter", "del", "dev", linkName, "ingress", "prio", "1")
-	_ = cmd.Run()
-	delete(m.attached, linkName)
-	klog.Infof("已成功从网卡 %s 上卸载 eBPF TC 过滤器", linkName)
-	return nil
-}
-
-// detectDefaultInterface 自动探测宿主机承载默认出向路由的物理网卡
-func (m *linuxTCManager) detectDefaultInterface() string {
+func detectDefaultInterface() (string, error) {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
-	if err == nil {
-		for _, r := range routes {
-			if r.Dst == nil && r.LinkIndex > 0 {
-				if link, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
-					return link.Attrs().Name
+	if err != nil {
+		return "", err
+	}
+	for _, r := range routes {
+		if r.Dst == nil && r.LinkIndex > 0 {
+			link, err := netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				return "", err
+			}
+			return link.Attrs().Name, nil
+		}
+	}
+	return "", errors.New("no default IPv4 interface found; specify --tc-bpf-interface")
+}
+
+// Match only our filter, including the name emitted by the original tc loader.
+// Never delete an entire priority or clsact qdisc shared with another CNI.
+func isEIPFilter(filter *netlink.BpfFilter) bool {
+	return filter.Handle == 1 && filter.Priority == 1 &&
+		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
+}
+
+func (m *linuxTCManager) cleanupFilters(linkName string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, link := range links {
+		if linkName != "" && link.Attrs().Name != linkName {
+			continue
+		}
+		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, filter := range filters {
+			if bpf, ok := filter.(*netlink.BpfFilter); ok && isEIPFilter(bpf) {
+				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
+					errs = append(errs, err)
 				}
 			}
 		}
 	}
-	return ""
+	return errors.Join(errs...)
 }
 
-// ensureMapFDs 确保 IPv4 与 IPv6 的 Pinned BPF Map 文件描述符已被打开并缓存
-func (m *linuxTCManager) ensureMapFDs() {
-	if m.v4MapFD < 0 {
-		m.v4MapFD = openPinnedMap("kube_ovn_eip_v4_map")
-	}
-	if m.v6MapFD < 0 {
-		m.v6MapFD = openPinnedMap("kube_ovn_eip_v6_map")
-	}
+func (m *linuxTCManager) Detach(linkName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cleanupFilters(linkName)
 }
 
-// openPinnedMap 遍历 Linux 标准 BPF 文件系统路径，检索并打开固化的 BPF Map FD
-func openPinnedMap(name string) int {
-	candidates := []string{
-		filepath.Join("/sys/fs/bpf", name),
-		filepath.Join("/sys/fs/bpf/tc/globals", name),
-		filepath.Join("/sys/fs/bpf/kube-ovn", name),
+func eipMapKey(ip net.IP) ([]byte, error) {
+	if v4 := ip.To4(); v4 != nil {
+		return []byte(v4), nil
 	}
+	if v6 := ip.To16(); v6 != nil {
+		return []byte(v6), nil
+	}
+	return nil, fmt.Errorf("invalid EIP %q", ip)
+}
 
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			fd, err := bpfObjGet(p)
-			if err == nil {
-				klog.Infof("已从路径 %s 打开 Pinned BPF Map %s (fd: %d)", p, name, fd)
-				return fd
-			}
-			klog.V(3).Infof("打开 Pinned BPF Map %s 失败: %v", p, err)
+func validTarget(info TargetInfo) bool {
+	return info.ParentIfindex > 0 && uint64(info.ParentIfindex) <= uint64(^uint32(0)) && info.TargetIfindex > 0 && uint64(info.TargetIfindex) <= uint64(^uint32(0)) &&
+		len(info.TargetMAC) == 6 && info.TargetMAC[0]&1 == 0 && !bytes.Equal(info.TargetMAC, make([]byte, 6))
+}
+
+func (m *linuxTCManager) mapFor(key []byte) (*ebpf.Map, error) {
+	if m.closed {
+		return nil, errors.New("TC manager is closed")
+	}
+	target := m.v6Map
+	if len(key) == 4 {
+		target = m.v4Map
+	}
+	if target == nil {
+		return nil, errors.New("EIP BPF maps are not loaded")
+	}
+	return target, nil
+}
+
+func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
+	if !validTarget(info) {
+		return fmt.Errorf("invalid TC target for %s: ifindex=%d mac=%s", ip, info.TargetIfindex, info.TargetMAC)
+	}
+	key, err := eipMapKey(ip)
+	if err != nil {
+		return err
+	}
+	targetMap, err := m.mapFor(key)
+	if err != nil {
+		return err
+	}
+	// #nosec G115 -- validTarget checks both indices are positive and fit uint32.
+	target := bpfEipTarget{Ifindex: uint32(info.TargetIfindex), ParentIfindex: uint32(info.ParentIfindex)}
+	copy(target.TargetMAC[:], info.TargetMAC)
+	var old bpfEipTarget
+	if err = targetMap.Lookup(key, &old); err == nil {
+		// Do not reset live packet counters during periodic reconciliation.
+		if old.Ifindex == target.Ifindex && old.ParentIfindex == target.ParentIfindex && old.TargetMAC == target.TargetMAC {
+			return nil
 		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
 	}
-	return -1
+	return targetMap.Update(key, &target, ebpf.UpdateAny)
 }
 
-// AddEIP 向内核 BPF Map 写入 EIP ➔ 本地网关 Pod 网卡的直通映射条目
-func (m *linuxTCManager) AddEIP(eip net.IP, info TargetInfo) error {
+func (m *linuxTCManager) AddEIP(ip net.IP, info TargetInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ensureMapFDs()
-
-	target := bpfEipTarget{
-		Ifindex: uint32(info.TargetIfindex),
-	}
-	if len(info.TargetMAC) == 6 {
-		copy(target.TargetMAC[:], info.TargetMAC)
-	}
-
-	if ipv4 := eip.To4(); ipv4 != nil {
-		if m.v4MapFD < 0 {
-			klog.V(3).Infof("BPF IPv4 Map 文件描述符不可用，暂跳过写入 EIP %s", eip)
-			return nil
-		}
-		// 转换为大端网络字节序 (__u32)
-		key := binary.BigEndian.Uint32(ipv4)
-		if err := bpfMapUpdateElem(m.v4MapFD, unsafe.Pointer(&key), unsafe.Pointer(&target), unix.BPF_ANY); err != nil {
-			return fmt.Errorf("更新 BPF IPv4 Map 失败 (EIP: %s): %w", eip, err)
-		}
-		klog.Infof("TC BPF Map: 成功写入 IPv4 %s ➔ 网卡 ifindex %d (mac: %s)", eip, info.TargetIfindex, info.TargetMAC)
-		return nil
-	}
-
-	if m.v6MapFD < 0 {
-		klog.V(3).Infof("BPF IPv6 Map 文件描述符不可用，暂跳过写入 EIP %s", eip)
-		return nil
-	}
-	var key [16]byte
-	copy(key[:], eip.To16())
-	if err := bpfMapUpdateElem(m.v6MapFD, unsafe.Pointer(&key[0]), unsafe.Pointer(&target), unix.BPF_ANY); err != nil {
-		return fmt.Errorf("更新 BPF IPv6 Map 失败 (EIP: %s): %w", eip, err)
-	}
-	klog.Infof("TC BPF Map: 成功写入 IPv6 %s ➔ 网卡 ifindex %d (mac: %s)", eip, info.TargetIfindex, info.TargetMAC)
-	return nil
+	return m.addEIP(ip, info)
 }
 
-// DeleteEIP 从内核 BPF Map 中删除已撤销或漂移走的 EIP 映射条目
-func (m *linuxTCManager) DeleteEIP(eip net.IP) error {
+func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ensureMapFDs()
-
-	if ipv4 := eip.To4(); ipv4 != nil {
-		if m.v4MapFD < 0 {
-			return nil
-		}
-		key := binary.BigEndian.Uint32(ipv4)
-		if err := bpfMapDeleteElem(m.v4MapFD, unsafe.Pointer(&key)); err != nil {
-			if !errors.Is(err, syscall.ENOENT) {
-				return fmt.Errorf("从 BPF IPv4 Map 剔除条目失败 (EIP: %s): %w", eip, err)
-			}
-		} else {
-			klog.Infof("TC BPF Map: 成功剔除 IPv4 %s", eip)
-		}
+	key, err := eipMapKey(ip)
+	if err != nil {
+		return err
+	}
+	targetMap, err := m.mapFor(key)
+	if err != nil {
+		return err
+	}
+	if err = targetMap.Delete(key); errors.Is(err, ebpf.ErrKeyNotExist) {
 		return nil
 	}
-
-	if m.v6MapFD < 0 {
-		return nil
-	}
-	var key [16]byte
-	copy(key[:], eip.To16())
-	if err := bpfMapDeleteElem(m.v6MapFD, unsafe.Pointer(&key[0])); err != nil {
-		if !errors.Is(err, syscall.ENOENT) {
-			return fmt.Errorf("从 BPF IPv6 Map 剔除条目失败 (EIP: %s): %w", eip, err)
-		}
-	} else {
-		klog.Infof("TC BPF Map: 成功剔除 IPv6 %s", eip)
-	}
-	return nil
+	return err
 }
 
-// SyncEIPs 对账同步当前所有活跃 EIP 集合，确保内核 BPF Map 与集群期望状态严格一致
 func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-
-	for ipStr, info := range expected {
-		ip := net.ParseIP(ipStr)
-		if ip != nil {
-			_ = m.AddEIP(ip, info)
+	wanted := make(map[string]bool, len(expected))
+	var errs []error
+	for address, info := range expected {
+		ip := net.ParseIP(address)
+		if err := m.addEIP(ip, info); err != nil {
+			errs = append(errs, err)
+			continue
 		}
+		key, err := eipMapKey(ip)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		wanted[string(key)] = true
+	}
+	for _, targetMap := range []*ebpf.Map{m.v4Map, m.v6Map} {
+		if targetMap == nil {
+			errs = append(errs, errors.New("EIP BPF maps are not loaded"))
+			continue
+		}
+		if err := pruneEIPMap(targetMap, wanted); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func pruneEIPMap(targetMap *ebpf.Map, wanted map[string]bool) error {
+	// Collect keys before deleting: deleting the iteration cursor restarts a BPF
+	// hash-map walk, potentially looping forever when some entries are retained.
+	var stale [][]byte
+	var key any
+	for {
+		next, err := targetMap.NextKeyBytes(key)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			break
+		}
+		if !wanted[string(next)] {
+			stale = append(stale, next)
+		}
+		key = next
+	}
+	var errs []error
+	for _, key := range stale {
+		if err := targetMap.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func removePin(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }
 
-// Close 关闭并重置已打开的 BPF 文件描述符
+// Close also cleans up a previous process's attachments when the feature is
+// disabled. Closing the userspace FD alone never detaches a TC program.
 func (m *linuxTCManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if m.v4MapFD >= 0 {
-		_ = unix.Close(m.v4MapFD)
-		m.v4MapFD = -1
+	m.closed = true
+	if err := m.cleanupFilters(""); err != nil {
+		return err
 	}
-	if m.v6MapFD >= 0 {
-		_ = unix.Close(m.v6MapFD)
-		m.v6MapFD = -1
+	if m.collection != nil {
+		m.collection.Close()
+		m.collection = nil
+		m.v4Map = nil
+		m.v6Map = nil
 	}
-	return nil
-}
-
-// 以下为底层纯 Go 原生调用的 Linux BPF 系统调用封装（避免依赖额外的重量级 CGO 外部库）
-
-// bpfObjGet 通过 BPF_OBJ_GET 系统调用打开位于 /sys/fs/bpf 下固化的 Map
-func bpfObjGet(pathname string) (int, error) {
-	pathBytes, err := unix.BytePtrFromString(pathname)
-	if err != nil {
-		return -1, err
-	}
-
-	attr := struct {
-		pathname uint64
-		bpfFd    uint32
-		pad      uint32
-		flags    uint32
-	}{
-		pathname: uint64(uintptr(unsafe.Pointer(pathBytes))),
-	}
-
-	r1, _, errNo := unix.Syscall(unix.SYS_BPF, uintptr(unix.BPF_OBJ_GET), uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
-	if errNo != 0 {
-		return -1, errNo
-	}
-	return int(r1), nil
-}
-
-// bpfMapUpdateElem 通过 BPF_MAP_UPDATE_ELEM 系统调用写入或更新 Key-Value 条目
-func bpfMapUpdateElem(fd int, key, value unsafe.Pointer, flags uint64) error {
-	attr := struct {
-		mapFd uint32
-		pad   uint32
-		key   uint64
-		value uint64
-		flags uint64
-	}{
-		mapFd: uint32(fd),
-		key:   uint64(uintptr(key)),
-		value: uint64(uintptr(value)),
-		flags: flags,
-	}
-
-	_, _, errNo := unix.Syscall(unix.SYS_BPF, uintptr(unix.BPF_MAP_UPDATE_ELEM), uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
-	if errNo != 0 {
-		return errNo
-	}
-	return nil
-}
-
-// bpfMapDeleteElem 通过 BPF_MAP_DELETE_ELEM 系统调用删除指定的 Key 条目
-func bpfMapDeleteElem(fd int, key unsafe.Pointer) error {
-	attr := struct {
-		mapFd uint32
-		pad   uint32
-		key   uint64
-	}{
-		mapFd: uint32(fd),
-		key:   uint64(uintptr(key)),
-	}
-
-	_, _, errNo := unix.Syscall(unix.SYS_BPF, uintptr(unix.BPF_MAP_DELETE_ELEM), uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
-	if errNo != 0 {
-		return errNo
-	}
-	return nil
+	v4, v6 := m.mapPaths()
+	return errors.Join(removePin(v4), removePin(v6))
 }

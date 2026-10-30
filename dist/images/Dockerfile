@@ -26,6 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     apt-get purge -y --auto-remove curl && \
     rm -rf /var/lib/apt/lists/*
 
+FROM ubuntu:24.04 AS eip-bpf
+RUN apt-get update && apt-get install -y --no-install-recommends clang libbpf-dev linux-libc-dev make && \
+    rm -rf /var/lib/apt/lists/*
+COPY bpf /src/bpf
+RUN make -C /src/bpf clean all
+
 FROM kubeovn/kube-ovn-base:$BASE_TAG AS setcap
 
 COPY *.sh /kube-ovn/
@@ -53,6 +59,7 @@ COPY grace_stop_ovn_controller /usr/share/ovn/scripts/grace_stop_ovn_controller
 
 COPY --from=setcap /kube-ovn /kube-ovn
 COPY --from=qiniu /usr/bin/gobgp /usr/bin/gobgp
+COPY --from=eip-bpf /src/bpf/tc_eip.o /etc/kube-ovn/tc_eip.o
 RUN /kube-ovn/iptables-wrapper-installer.sh --no-sanity-check
 
 WORKDIR /kube-ovn
