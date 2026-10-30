@@ -285,3 +285,19 @@ func (c *Controller) getTProxyConditionPod(needSort bool) ([]*v1.Pod, error) {
 
 	return filteredPods, nil
 }
+
+// getTunnelPort returns the UDP port of the active overlay tunnel protocol.
+// Returns 0 for non-UDP tunnel protocols (e.g. VLAN or STT).
+func (c *Controller) getTunnelPort() int {
+	if c.config == nil {
+		return 0
+	}
+	switch c.config.NetworkType {
+	case util.NetworkTypeGeneve:
+		return 6081
+	case util.NetworkTypeVxlan:
+		return 4789
+	default:
+		return 0
+	}
+}

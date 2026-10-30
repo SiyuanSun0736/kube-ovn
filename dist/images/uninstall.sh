@@ -32,6 +32,8 @@ for port in 6081 4789 8472; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
       "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -m set --match-set ovn40other-node src -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -m set --match-set ovn40other-node dst -j NOTRACK 2>/dev/null || true
     fi
   done
 done
@@ -82,6 +84,8 @@ for port in 6081 4789 8472; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
       "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -m set --match-set ovn60other-node src -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -m set --match-set ovn60other-node dst -j NOTRACK 2>/dev/null || true
     fi
   done
 done

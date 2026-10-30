@@ -47,35 +47,6 @@ iptables -V
 set +e
 iptables -P FORWARD ACCEPT
 iptables-nft -P FORWARD ACCEPT
-
-# Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-for port in 6081 4789 8472; do
-  for cmd in iptables iptables-nft; do
-    if command -v "${cmd}" >/dev/null 2>&1; then
-      "${cmd}" -w 5 -t raw -C PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || \
-        "${cmd}" -w 5 -t raw -A PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null
-      "${cmd}" -w 5 -t raw -C OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || \
-        "${cmd}" -w 5 -t raw -A OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null
-    fi
-  done
-
-  for cmd in ip6tables ip6tables-nft; do
-    if command -v "${cmd}" >/dev/null 2>&1; then
-      "${cmd}" -w 5 -t raw -C PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || \
-        "${cmd}" -w 5 -t raw -A PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null
-      "${cmd}" -w 5 -t raw -C OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || \
-        "${cmd}" -w 5 -t raw -A OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null
-    fi
-  done
-
-  # Flush existing orphan conntrack entries for tunnel traffic
-  if command -v conntrack >/dev/null 2>&1; then
-    conntrack -D -p udp --dport "${port}" 2>/dev/null || true
-    conntrack -D -p udp --sport "${port}" 2>/dev/null || true
-    conntrack -D -f ipv6 -p udp --dport "${port}" 2>/dev/null || true
-    conntrack -D -f ipv6 -p udp --sport "${port}" 2>/dev/null || true
-  fi
-done
 set -e
 
 ./kube-ovn-daemon --ovs-socket=${OVS_SOCK} --bind-socket=${CNI_SOCK} "$@"
