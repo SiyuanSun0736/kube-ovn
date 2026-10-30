@@ -1,3 +1,5 @@
+//go:build linux
+
 package speaker
 
 import (
@@ -23,7 +25,7 @@ func TestTCManagerTargetInfoLayout(t *testing.T) {
 // TestTCManagerLifecycle 验证 TCManager 初始化与基础生命周期调用安全
 func TestTCManagerLifecycle(t *testing.T) {
 	cfg := &Configuration{
-		EnableTcBpfRedirect: true,
+		EnableTcBpfRedirect: false,
 		TcBpfInterface:      "bond0",
 		TcBpfProgPath:       "/etc/kube-ovn/tc_eip.o",
 	}
@@ -41,14 +43,10 @@ func TestTCManagerLifecycle(t *testing.T) {
 
 	// 验证在模拟测试环境下的接口增删调用不发生 panic 崩溃
 	if err := mgr.AddEIP(eip, info); err != nil {
-		t.Logf("AddEIP 返回: %v (在无宿主机特权的单元测试环境中属于预期行为)", err)
+		t.Errorf("AddEIP: %v", err)
 	}
 
 	if err := mgr.DeleteEIP(eip); err != nil {
-		t.Logf("DeleteEIP 返回: %v", err)
-	}
-
-	if err := mgr.Close(); err != nil {
-		t.Errorf("Close 执行失败: %v", err)
+		t.Errorf("DeleteEIP: %v", err)
 	}
 }

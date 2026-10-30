@@ -14,25 +14,8 @@
 // limitations under the License.
 
 /*
- * Kube-OVN BGP 动态联动 eBPF TC 旁路路由加速与宿主机 conntrack 抗穿透过滤器
- *
- * 【背景与痛点】
- * 在机房 BGP 架构中，外部公网对租户 EIP 的流量首先进入物理宿主机网卡（如 bond0）。
- * 由于物理网卡位于宿主机根网络空间（init_net），默认开启 Netfilter conntrack 跟踪。
- * 当遭遇公网高并发或 SYN 洪峰（如常山2故障暴露的 400W+ 僵尸连接）时，宿主机全局 conntrack
- * 表瞬间耗尽，导致同物理机上的其它 Pod、K8s 管理网络以及 SSH 运维彻底失联瘫痪。
- *
- * 【本程序核心设计与机制】
- * 1. 本 eBPF TC 分类器挂载在物理宿主机网卡的 clsact ingress 队列上，设置最高优先级 priority 1，
- *    以 direct-action (da) 模式运行。
- * 2. 外部报文在驱动收包最前端即被本程序捕获：
- *    - 提取目的 IP 地址并在内核 BPF Hash Map (kube_ovn_eip_v4_map / kube_ovn_eip_v6_map) 中检索；
- *    - 若命中 EIP：表明该流量目的为本地承载的 vpc-nat-gw 网关 Pod，直接调用内核短路原语
- *      bpf_redirect(target_ifindex, 0)，以 TC_ACT_REDIRECT 动作直接推入网关 Pod 网卡；
- *      【核心价值】：数据包 100% 绕过宿主机整个 Netfilter 与 conntrack 模块，宿主机表项增量为 0！
- *    - 若未命中 EIP：表明为集群节点间管理通信、NodePort、宿主机自身 SSH 或普通 Pod 流量，
- *      返回 TC_ACT_OK，报文原样穿透给后面的 Cilium TC 探针及原生 Linux 内核网络协议栈，
- *      与 Cilium NetworkPolicy、Hubble 监控完全共生且互不影响。
+ * 功能：Kube-OVN 公网 EIP eBPF TC Ingress 旁路直通分类器。
+ * 作用：在物理网卡驱动层命中 EIP 时直接短路重定向推入本地网关 Pod，绕过宿主机 Netfilter conntrack 规避连接表被击穿；非 EIP 流量正常放行。
  */
 
 #include <linux/bpf.h>
@@ -52,7 +35,7 @@ struct eip_target {
     __u32 ifindex;          // 本地网关 Pod 对应的宿主机接口设备索引（macvlan 或 veth）
     __u8  target_mac[6];    // 目标网卡硬件 MAC 地址（若非 0 则执行二层 MAC 重写）
     __u8  pad[2];           // 2 字节填充，对齐到 4 字节
-    __u32 pad2;             // 4 字节显式填充，使后方的 64 位整型严格按 8 字节边界对齐
+    __u32 parent_ifindex;             // macvlan master ifindex; also aligns the following counters
     __u64 packets;          // 命中直通的累计数据包计数
     __u64 bytes;            // 命中直通的累计字节统计
 };
@@ -75,19 +58,36 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } kube_ovn_eip_v6_map SEC(".maps");
 
+// macvlan bridge egress reinjects local traffic through the master's ingress.
+// Once the destination MAC is rewritten, let its RX handler deliver to the Pod
+// instead of redirecting the same packet back through the macvlan indefinitely.
+static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
+                                             struct eip_target *target) {
+    struct ethhdr *eth = data;
+    return skb->ifindex == target->parent_ifindex &&
+           __builtin_memcmp(eth->h_dest, target->target_mac, ETH_ALEN) == 0;
+}
+
+// In direct-action mode TC_ACT_OK ends classification; it does not continue
+// to a lower-priority Cilium filter. Unhandled packets must return UNSPEC.
+// OK is reserved below for matched EIPs already on the local delivery path.
 // 处理 IPv4 报文逻辑
 static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end) {
     struct iphdr *iph = data + sizeof(struct ethhdr);
     // 边界检查，防止越界访问引发内核校验器拒绝
     if ((void *)(iph + 1) > data_end) {
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     __u32 daddr = iph->daddr;
     // 检索 BPF Map
     struct eip_target *target = bpf_map_lookup_elem(&kube_ovn_eip_v4_map, &daddr);
-    if (!target) {
+    if (!target || !target->ifindex) {
         // 未命中本节点承载的 EIP：原样放行给后续的 Cilium 探针及宿主机内核协议栈
+        return TC_ACT_UNSPEC;
+    }
+
+    if (is_local_delivery(skb, data, target)) {
         return TC_ACT_OK;
     }
 
@@ -103,7 +103,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
         }
     }
 
-    // 内核短路直通转发：直接推入网关 Pod 网卡的 Ingress 队列（flags=0）
+    // 内核短路直通转发：从宿主机 macvlan 的 Egress 发出（flags=0），由目标 Pod MAC 选择接收端
     // 彻底避开宿主机根空间 Netfilter 与 conntrack 表
     return bpf_redirect(target->ifindex, 0);
 }
@@ -112,12 +112,16 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
 static __always_inline int process_ipv6(struct __sk_buff *skb, void *data, void *data_end) {
     struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
     if ((void *)(ip6h + 1) > data_end) {
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     struct in6_addr daddr = ip6h->daddr;
     struct eip_target *target = bpf_map_lookup_elem(&kube_ovn_eip_v6_map, &daddr);
-    if (!target) {
+    if (!target || !target->ifindex) {
+        return TC_ACT_UNSPEC;
+    }
+
+    if (is_local_delivery(skb, data, target)) {
         return TC_ACT_OK;
     }
 
@@ -143,14 +147,14 @@ int tc_eip_ingress(struct __sk_buff *skb) {
     // 解析以太网头
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     __u16 h_proto = bpf_ntohs(eth->h_proto);
 
     // 遇到 VLAN Tag 流量时放行，保持与底层网络封装兼容
     if (h_proto == ETH_P_8021Q || h_proto == ETH_P_8021AD) {
-        return TC_ACT_OK;
+        return TC_ACT_UNSPEC;
     }
 
     if (h_proto == ETH_P_IP) {
@@ -160,7 +164,7 @@ int tc_eip_ingress(struct __sk_buff *skb) {
     }
 
     // 其它未知协议报文默认放行
-    return TC_ACT_OK;
+    return TC_ACT_UNSPEC;
 }
 
 char _license[] SEC("license") = "Apache-2.0";

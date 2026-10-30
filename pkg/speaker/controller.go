@@ -54,7 +54,8 @@ type Controller struct {
 	natgatewaySynced cache.InformerSynced
 
 	// tcManager 负责管理物理宿主机网卡的 eBPF TC Ingress 过滤器生命周期与 BPF Map 路由表同步
-	tcManager TCManager
+	tcManager        TCManager
+	tcCleanupPending bool
 
 	// eipQueue is used in node-route-eip-mode for processing EIP events
 	eipQueue workqueue.TypedRateLimitingInterface[string]
@@ -160,6 +161,7 @@ func NewController(config *Configuration) *Controller {
 		natgatewayLister: natgatewayInformer.Lister(),
 		natgatewaySynced: natgatewayInformer.Informer().HasSynced,
 		tcManager:        NewTCManager(config),
+		tcCleanupPending: config.NodeRouteEIPMode && !config.EnableTcBpfRedirect,
 
 		informerFactory:        informerFactory,
 		nodeInformerFactory:    nodeInformerFactory,
@@ -213,13 +215,11 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	klog.Info("Started workers")
 
-	// 若开启了 eBPF TC 旁路直通加速，则在物理宿主机主网卡上初始化挂载 TC clsact 队列与 BPF Ingress 过滤器
-	if c.config.EnableTcBpfRedirect {
-		if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
-			klog.Errorf("初始化挂载 TC BPF 过滤器失败: %v", err)
-		}
+	if c.config.NodeRouteEIPMode {
 		defer func() {
-			_ = c.tcManager.Close()
+			if err := c.tcManager.Close(); err != nil {
+				klog.Errorf("failed to close TC EIP manager: %v", err)
+			}
 		}()
 	}
 
@@ -264,6 +264,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 //	    nat-gw-mode does not participate in Service VIP announcement; it only
 //	    announces NAT gateway EIPs from inside the gateway pod.
 func (c *Controller) Reconcile() {
+	if c.tcCleanupPending {
+		if err := c.tcManager.Close(); err != nil {
+			klog.Errorf("failed to clean up disabled TC EIP redirection: %v", err)
+			return
+		}
+		c.tcCleanupPending = false
+	}
+
 	switch {
 	case c.config.NatGwMode:
 		// EIP plane (nat-gw-mode): speaker runs inside the NAT gateway pod and
