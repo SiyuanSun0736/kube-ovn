@@ -241,14 +241,16 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 		if err != nil {
-			return err
-		}
-		targetInfo, err = c.getNatGwTargetInfo(pod, eip)
-		if err != nil {
-			return err
-		}
-		if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
-			return err
+			klog.Warningf("failed to get NAT GW pod %s for TC BPF: %v", podName, err)
+		} else {
+			targetInfo, err = c.getNatGwTargetInfo(pod, eip)
+			if err != nil {
+				klog.Warningf("failed to resolve TC target info for EIP %s: %v", eipName, err)
+			} else {
+				if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
+					klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
+				}
+			}
 		}
 	}
 
@@ -258,10 +260,10 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		if ip == "" {
 			continue
 		}
-		if c.config.EnableTcBpfRedirect {
+		if c.config.EnableTcBpfRedirect && validTarget(targetInfo) {
 			if err := c.tcManager.AddEIP(net.ParseIP(ip), targetInfo); err != nil {
+				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
-				continue
 			}
 		}
 		if c.isRouteAnnounced(ip) {

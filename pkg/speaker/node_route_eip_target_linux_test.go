@@ -26,15 +26,15 @@ func TestNatGwTargetUsesExternalNetworkAndPodMAC(t *testing.T) {
 		require.Equal(t, name, actual)
 		return &netlink.Macvlan{LinkAttrs: netlink.LinkAttrs{Index: 12, ParentIndex: 8, HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 3}}, Mode: netlink.MACVLAN_MODE_BRIDGE}, nil
 	}
-	info, err := natGwTargetInfo(pod, subnet, lookup)
+	info, err := natGwTargetInfo(pod, subnet, "", lookup)
 	require.NoError(t, err)
 	require.Equal(t, 12, info.TargetIfindex)
 	require.Equal(t, net.HardwareAddr{2, 0, 0, 0, 0, 2}, info.TargetMAC)
 	for _, status := range []string{"", `[]`, `[{"name":"kube-system/wan","mac":""}]`, `[{"name":"kube-system/wan","mac":"00:00:00:00:00:00"}]`, `[{"name":"kube-system/lan","mac":"02:00:00:00:00:01"}]`} {
 		pod.Annotations[nadv1.NetworkStatusAnnot] = status
-		_, err := natGwTargetInfo(pod, subnet, lookup)
+		_, err := natGwTargetInfo(pod, subnet, "", lookup)
 		require.Error(t, err, "status %q", status)
 	}
-	_, err = natGwTargetInfo(pod, subnet, func(string) (netlink.Link, error) { return nil, errors.New("link missing") })
+	_, err = natGwTargetInfo(pod, subnet, "", func(string) (netlink.Link, error) { return nil, errors.New("link missing") })
 	require.Error(t, err)
 }
