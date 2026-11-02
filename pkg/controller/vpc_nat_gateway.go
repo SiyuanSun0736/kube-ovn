@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +55,8 @@ const (
 	natGwSubnetRouteAdd   = "subnet-route-add"
 	natGwSubnetRouteDel   = "subnet-route-del"
 	natGwHairpinSNATSet   = "hairpin-snat-set"
+	natGwTcpConnLimitSet  = "tcp-connlimit-set"
+	natGwTcpSynLimitSet   = "tcp-syn-limit-set"
 
 	// The two states of the lanIP fallback the gateway script accepts, also the values recorded
 	// in VpcNatGatewayStatus.HairpinSNAT.
@@ -318,6 +321,140 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 	return c.patchNatGwHairpinSNATStatus(gw.Name, mode)
 }
 
+func (c *Controller) getVpcNatGwDefaultTcpConnLimit(gw *kubeovnv1.VpcNatGateway) int {
+	for _, key := range []string{"ovn.kubernetes.io/cpu", "las.qiniu.io/cpu", "cpu"} {
+		if val, ok := gw.Annotations[key]; ok {
+			if cpu, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+				if cpu >= 2 {
+					return util.DefaultNatGwTcpConnLimit2C
+				}
+				if cpu == 1 {
+					return util.DefaultNatGwTcpConnLimit1C
+				}
+			}
+		}
+	}
+	return util.DefaultNatGwTcpConnLimit1C
+}
+
+func (c *Controller) getVpcNatGwDesiredTcpConnLimit(gw *kubeovnv1.VpcNatGateway) int {
+	// 1. Explicit spec field
+	if gw.Spec.TcpConnLimit != nil {
+		return *gw.Spec.TcpConnLimit
+	}
+	// 2. Annotations
+	for _, key := range []string{util.VpcNatTcpConnLimitAnnotation, util.VpcNatTcpConnLimitLegacyAnnotation} {
+		if val, ok := gw.Annotations[key]; ok {
+			if limit, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && limit >= 0 {
+				return limit
+			}
+		}
+	}
+	// 3. Flavor specifications default: 1C -> 10,000, 2C -> 20,000 (#4794)
+	return c.getVpcNatGwDefaultTcpConnLimit(gw)
+}
+
+func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
+	srcRate := util.DefaultNatGwSynSrcRate
+	srcBurst := util.DefaultNatGwSynSrcBurst
+	dstRate := util.DefaultNatGwSynDstRate1C
+	dstBurst := util.DefaultNatGwSynDstBurst1C
+	htableMax := util.DefaultNatGwSynHtableMax
+	htableExpire := util.DefaultNatGwSynHtableExpire
+
+	if c.getVpcNatGwDefaultTcpConnLimit(gw) >= util.DefaultNatGwTcpConnLimit2C {
+		dstRate = util.DefaultNatGwSynDstRate2C
+		dstBurst = util.DefaultNatGwSynDstBurst2C
+	}
+
+	if gw.Spec.TcpSynRateLimit != "" {
+		srcRate = gw.Spec.TcpSynRateLimit
+	}
+	if gw.Spec.TcpSynBurstLimit != "" {
+		srcBurst = gw.Spec.TcpSynBurstLimit
+	}
+
+	if val, ok := gw.Annotations[util.VpcNatSynRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcRate = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcBurst = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynSrcRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcRate = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynSrcBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcBurst = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		dstRate = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		dstBurst = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynHashlimitEntriesAnnotation]; ok && strings.TrimSpace(val) != "" {
+		htableMax = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatSynHashlimitExpireAnnotation]; ok && strings.TrimSpace(val) != "" {
+		htableExpire = strings.TrimSpace(val)
+	}
+
+	return []string{srcRate, srcBurst, dstRate, dstBurst, htableMax, htableExpire}
+}
+
+func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
+	if gw.Annotations != nil {
+		if mode, ok := gw.Annotations[util.NatGatewayDataplaneModeAnnotation]; ok {
+			return mode
+		}
+	}
+	return "stateful"
+}
+
+func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
+	desiredLimit := c.getVpcNatGwDesiredTcpConnLimit(gw)
+	if gw.Status.TcpConnLimit != nil && *gw.Status.TcpConnLimit == desiredLimit {
+		return nil
+	}
+	dataplaneMode := c.getNatGwDataplaneMode(gw)
+	args := []string{strconv.Itoa(desiredLimit), dataplaneMode}
+	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTcpConnLimitSet, args); err != nil {
+		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", desiredLimit, gw.Name, err)
+		return err
+	}
+	return c.patchNatGwTcpConnLimitStatus(gw.Name, desiredLimit)
+}
+
+func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
+	args := c.getVpcNatGwSynRateLimitArgs(gw)
+	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTcpSynLimitSet, args); err != nil {
+		klog.Errorf("failed to set tcp syn limit for nat gw %s, %v", gw.Name, err)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) patchNatGwTcpConnLimitStatus(key string, limit int) error {
+	oriGw, err := c.vpcNatGatewayLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
+		return err
+	}
+	if oriGw.Status.TcpConnLimit != nil && *oriGw.Status.TcpConnLimit == limit {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"status": map[string]int{"tcpConnLimit": limit}})
+	if err != nil {
+		return err
+	}
+	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
+		patch, metav1.PatchOptions{}, "status")
+	return err
+}
+
 func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	gw, err := c.vpcNatGatewayLister.Get(key)
 	if err != nil {
@@ -466,11 +603,17 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		}
 	}
 
-	// Hairpin SNAT is hot-applied like QoS: the gateway script rewrites the chain in place.
+	// Hairpin SNAT and TCP connlimit/synlimit are hot-applied like QoS: the gateway script rewrites the chain in place.
 	// getNatGwPod only returns a running pod, and only an initialized one holds the chains.
 	if pod != nil {
 		if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
 			if err = c.syncNatGwHairpinSNAT(gw, pod); err != nil {
+				return err
+			}
+			if err = c.syncNatGwTcpConnLimit(gw, pod); err != nil {
+				return err
+			}
+			if err = c.syncNatGwSynRateLimit(gw, pod); err != nil {
 				return err
 			}
 		}
@@ -615,6 +758,13 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	if err = c.patchNatGwHairpinSNATStatus(key, mode); err != nil {
 		klog.Errorf("failed to patch hairpin snat status for nat gw %s, %v", key, err)
 		return err
+	}
+
+	if err = c.syncNatGwTcpConnLimit(gw, pod); err != nil {
+		klog.Warningf("failed to set tcp connlimit during init for nat gw %s: %v", key, err)
+	}
+	if err = c.syncNatGwSynRateLimit(gw, pod); err != nil {
+		klog.Warningf("failed to set tcp syn limit during init for nat gw %s: %v", key, err)
 	}
 
 	if gw.Spec.QoSPolicy != "" {
@@ -1326,7 +1476,7 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 							Lifecycle: &corev1.Lifecycle{
 								PostStart: &corev1.LifecycleHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1"},
+										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1 && sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true"},
 									},
 								},
 							},

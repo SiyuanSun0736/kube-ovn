@@ -86,6 +86,18 @@ type VpcNatGatewaySpec struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default=true
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
+	// TcpConnLimit configures the maximum concurrent TCP connections for the NAT gateway.
+	// If unset, defaults according to gateway specifications (1C -> 10,000, 2C -> 20,000).
+	// Set to positive integer for custom threshold; set to 0 to disable connlimit without affecting pre-routing SYN rate limiting.
+	// Applied dynamically without Pod recreation.
+	// +kubebuilder:validation:Optional
+	TcpConnLimit *int `json:"tcpConnLimit,omitempty"`
+	// TcpSynRateLimit configures the raw PREROUTING SYN rate limit (e.g., "100/s", "5000/s").
+	// +kubebuilder:validation:Optional
+	TcpSynRateLimit string `json:"tcpSynRateLimit,omitempty"`
+	// TcpSynBurstLimit configures the raw PREROUTING SYN burst limit (e.g., "200", "10000").
+	// +kubebuilder:validation:Optional
+	TcpSynBurstLimit string `json:"tcpSynBurstLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -117,6 +129,8 @@ type VpcNatGatewayStatus struct {
 	Selector        []string            `json:"selector" patchStrategy:"merge"`
 	Tolerations     []corev1.Toleration `json:"tolerations" patchStrategy:"merge"`
 	Affinity        corev1.Affinity     `json:"affinity" patchStrategy:"merge"`
+	// TcpConnLimit is the current active TCP connlimit value applied to the NAT gateway.
+	TcpConnLimit *int `json:"tcpConnLimit,omitempty" patchStrategy:"merge"`
 }
 
 type Route struct {
