@@ -35,7 +35,7 @@ struct eip_target {
     __u32 ifindex;          // 本地网关 Pod 对应的宿主机接口设备索引（macvlan 或 veth）
     __u8  target_mac[6];    // 目标网卡硬件 MAC 地址（若非 0 则执行二层 MAC 重写）
     __u8  pad[2];           // 2 字节填充，对齐到 4 字节
-    __u32 parent_ifindex;             // macvlan master ifindex; also aligns the following counters
+    __u32 parent_ifindex;   // macvlan 父设备接口索引（Master ifindex）；同时使后续计数器严格对齐到 8 字节边界
     __u64 packets;          // 命中直通的累计数据包计数
     __u64 bytes;            // 命中直通的累计字节统计
 };
@@ -68,9 +68,9 @@ static __always_inline int mac_eq(const __u8 *a, const __u8 *b) {
     return 1;
 }
 
-// macvlan bridge egress reinjects local traffic through the master's ingress.
-// Once the destination MAC is rewritten, let its RX handler deliver to the Pod
-// instead of redirecting the same packet back through the macvlan indefinitely.
+// macvlan bridge 模式下，Egress 本地流量可能会重新注入父设备的 Ingress 接收队列。
+// 一旦目的 MAC 已经被改写为目标 Pod MAC，直接放行交由内核驱动 RX 处理并交付给 Pod，
+// 避免相同数据包在 macvlan 与物理网卡之间发生无限死循环重定向。
 static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
                                              struct eip_target *target) {
     struct ethhdr *eth = data;
@@ -78,9 +78,9 @@ static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
            mac_eq(eth->h_dest, target->target_mac);
 }
 
-// In direct-action mode TC_ACT_OK ends classification; it does not continue
-// to a lower-priority Cilium filter. Unhandled packets must return UNSPEC.
-// OK is reserved below for matched EIPs already on the local delivery path.
+// 在 direct-action 模式下，TC_ACT_OK 会直接终止分类并放行进入内核协议栈，不再继续传递给低优先级的 Cilium 过滤器；
+// 因此未命中或未处理的报文必须严格返回 TC_ACT_UNSPEC，以便后续过滤器（如 Cilium）继续接管处理。
+// TC_ACT_OK 仅在此处专门留给“已命中 EIP 且正处于本地交付链路”的报文。
 // 处理 IPv4 报文逻辑
 static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end) {
     struct iphdr *iph = data + sizeof(struct ethhdr);
