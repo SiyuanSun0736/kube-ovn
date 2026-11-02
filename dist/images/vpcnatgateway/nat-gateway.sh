@@ -564,13 +564,13 @@ function tcp_connlimit_set() {
 }
 
 function tcp_syn_limit_set() {
-    local src_rate=${1:-"100/s"}
-    local src_burst=${2:-"200"}
-    local dst_rate=${3:-"5000/s"}
-    local dst_burst=${4:-"10000"}
-    local htable_max=${5:-"262144"}
-    local htable_expire=${6:-"10000"}
-    local dst_htable_max=${7:-"2048"}
+    local src_rate=${1:-${SYN_SRC_RATE:-"500/s"}}
+    local src_burst=${2:-${SYN_SRC_BURST:-"1000"}}
+    local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
+    local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
+    local htable_max=${5:-${SYN_HTABLE_MAX:-"262144"}}
+    local htable_expire=${6:-${SYN_HTABLE_EXPIRE:-"10000"}}
+    local dst_htable_max=${7:-${SYN_DST_HTABLE_MAX:-"2048"}}
 
     check_inited
 
