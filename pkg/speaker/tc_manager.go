@@ -8,9 +8,9 @@ import (
 type TargetInfo struct {
 	// TargetIfindex 是目标网关 Pod 在物理宿主机根网络空间所对应的接口设备索引（如 macvlan 子接口或 veth 宿主机端）
 	TargetIfindex int
-	// ParentIfindex identifies the macvlan master, where locally redirected packets re-enter ingress.
+	// ParentIfindex 标识 macvlan 父设备接口索引（Master ifindex），本地重定向的数据包会在此重新进入 Ingress 接收队列
 	ParentIfindex int
-	// TargetMAC is the external interface MAC inside the gateway Pod.
+	// TargetMAC 是目标网关 Pod 内部外部网卡的真实硬件 MAC 地址
 	TargetMAC net.HardwareAddr
 }
 
