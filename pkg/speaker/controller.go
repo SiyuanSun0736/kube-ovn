@@ -266,8 +266,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 func (c *Controller) Reconcile() {
 	if c.tcCleanupPending {
 		if err := c.tcManager.Close(); err != nil {
-			klog.Errorf("failed to clean up disabled TC EIP redirection: %v", err)
-			return
+			klog.Warningf("failed to clean up disabled TC EIP redirection: %v", err)
 		}
 		c.tcCleanupPending = false
 	}

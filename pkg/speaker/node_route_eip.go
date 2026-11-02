@@ -336,6 +336,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 
 		var targetInfo TargetInfo
+		var tcResolved bool
 		if c.config.EnableTcBpfRedirect {
 			podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 			pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
@@ -344,14 +345,15 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			}
 			if err != nil {
 				targetErrors = append(targetErrors, err)
-				continue
+			} else {
+				tcResolved = true
 			}
 		}
 
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if c.config.EnableTcBpfRedirect {
+				if tcResolved {
 					expectedTcMap[ip] = targetInfo
 				}
 			}

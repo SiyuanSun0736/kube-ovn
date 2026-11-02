@@ -18,9 +18,18 @@ import (
 )
 
 func (c *Controller) getNatGwTargetInfo(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TargetInfo, error) {
-	subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
+	attachmentSubnet := eip.Spec.ExternalSubnet
+	if c.natgatewayLister != nil && eip.Spec.NatGwDp != "" {
+		if gw, err := c.natgatewayLister.Get(eip.Spec.NatGwDp); err == nil && len(gw.Spec.ExternalSubnets) > 0 {
+			attachmentSubnet = util.GetNatGwExternalNetwork(gw.Spec.ExternalSubnets)
+		}
+	}
+	subnet, err := c.subnetsLister.Get(attachmentSubnet)
 	if err != nil {
-		return TargetInfo{}, err
+		subnet, err = c.subnetsLister.Get(eip.Spec.ExternalSubnet)
+		if err != nil {
+			return TargetInfo{}, err
+		}
 	}
 	return natGwTargetInfo(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
 }
@@ -94,16 +103,29 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 			if err != nil || len(routes) == 0 {
 				return TargetInfo{}, fmt.Errorf("failed to get route for pod IP %s: %v", podIP, err)
 			}
+			// 拒绝经由外部网关的路由（例如默认路由或间接路由）。
+			// 本地 Pod 的直连 veth 路由必须是直连路由，不能携带下一跳网关。
+			if len(routes[0].Gw) > 0 && !routes[0].Gw.IsUnspecified() {
+				return TargetInfo{}, fmt.Errorf("route for pod IP %s is not a direct route (has gateway %s)", podIP, routes[0].Gw)
+			}
 			targetLinkIndex := routes[0].LinkIndex
 			mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
 				return TargetInfo{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
 			}
 			parentIndex := 0
+			if defaultParent == "" {
+				if iface, err := detectDefaultInterface(); err == nil {
+					defaultParent = iface
+				}
+			}
 			if defaultParent != "" {
 				if plink, err := lookup(defaultParent); err == nil {
 					parentIndex = plink.Attrs().Index
 				}
+			}
+			if parentIndex > 0 && targetLinkIndex == parentIndex {
+				return TargetInfo{}, fmt.Errorf("route for pod IP %s points to ingress/parent interface %d, not a local pod veth", podIP, parentIndex)
 			}
 			info := TargetInfo{TargetIfindex: targetLinkIndex, ParentIfindex: parentIndex, TargetMAC: mac}
 			if !validTarget(info) {

@@ -243,7 +243,7 @@ func eipMapKey(ip net.IP) ([]byte, error) {
 }
 
 func validTarget(info TargetInfo) bool {
-	return info.ParentIfindex > 0 && uint64(info.ParentIfindex) <= uint64(^uint32(0)) && info.TargetIfindex > 0 && uint64(info.TargetIfindex) <= uint64(^uint32(0)) &&
+	return info.ParentIfindex >= 0 && uint64(info.ParentIfindex) <= uint64(^uint32(0)) && info.TargetIfindex > 0 && uint64(info.TargetIfindex) <= uint64(^uint32(0)) &&
 		len(info.TargetMAC) == 6 && info.TargetMAC[0]&1 == 0 && !bytes.Equal(info.TargetMAC, make([]byte, 6))
 }
 
@@ -273,7 +273,7 @@ func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
 	if err != nil {
 		return err
 	}
-	// #nosec G115 -- validTarget 已校验两处 ifindex 均为正整数且符合 uint32 范围
+	// #nosec G115 -- validTarget 已校验 ifindex 均为非负数且符合 uint32 范围
 	target := bpfEipTarget{Ifindex: uint32(info.TargetIfindex), ParentIfindex: uint32(info.ParentIfindex)}
 	copy(target.TargetMAC[:], info.TargetMAC)
 	var old bpfEipTarget

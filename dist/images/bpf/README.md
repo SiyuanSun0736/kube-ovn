@@ -24,7 +24,7 @@ TC 过滤器挂载在 Ingress 方向，设置优先级 priority 1、handle 1，�
 命中 EIP 的公网报文会通过宿主机 macvlan 直通转发，且目的 MAC 被改写为网关 Pod 的实际 MAC。
 在 macvlan bridge 本地交付模式下，报文会重新进入 Master 的 Ingress；在 Master 上已寻址到 Pod MAC 的报文将直接返回 `TC_ACT_OK` 进入 macvlan RX 处理，避免重定向死循环，且彻底规避穿越宿主机 Netfilter 与 conntrack 跟踪表。
 
-启动时会用全新的空 Map 替换旧的 EIP 挂载，并在宣告 BGP 路由前完成当前资源的全局对账。
+启动时会用全新代际的空 Map 替换旧的 EIP 挂载，并通过最佳努力（Best-effort）机制在宣布 BGP 路由的同时异步建立与核对 TC BPF 直通映射；若 TC 挂载或映射同步发生失败，系统将自动回退到宿主机内核协议栈转发以保障 BGP 路由与服务的连续性。
 周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
 正常退出时会清理自己拥有的过滤器和固化的 Pinned Map。
 若需停用本特性，请保持 node-route 模式开启并以 `--enable-tc-bpf-redirect=false` 重启；下一个 Speaker 实例也会主动清理非正常退出留下的挂载痕迹。

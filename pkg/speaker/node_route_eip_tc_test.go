@@ -49,3 +49,33 @@ func TestTCFailureDoesNotBlockServiceReconciliation(t *testing.T) {
 		require.True(t, services.listed, "TC errors must not prevent the independent Service VIP reconciliation")
 	}
 }
+
+type trackingTCManager struct {
+	TCManager
+	closeErr error
+	closed   bool
+}
+
+func (m *trackingTCManager) Close() error {
+	m.closed = true
+	return m.closeErr
+}
+
+func TestTCCloseFailureDoesNotBlockReconciliation(t *testing.T) {
+	mgr := &trackingTCManager{closeErr: errors.New("permission denied")}
+	services := &trackingServicesLister{}
+	nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, nodes.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: map[string]string{util.BgpSpeakLbVipLabel: "true"}}}))
+	c := &Controller{
+		config:           &Configuration{NodeName: "node1", NodeRouteEIPMode: true, EnableTcBpfRedirect: false, EnableLbSvcAnnounce: true},
+		tcManager:        mgr,
+		tcCleanupPending: true,
+		eipLister:        kubeovnlister.NewIptablesEIPLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		servicesLister:   services,
+		nodesLister:      listerv1.NewNodeLister(nodes),
+	}
+	c.Reconcile()
+	require.True(t, mgr.closed, "tcManager.Close must be called")
+	require.False(t, c.tcCleanupPending, "tcCleanupPending must be cleared even on Close failure")
+	require.True(t, services.listed, "Reconciliation must proceed even if TC cleanup fails")
+}
