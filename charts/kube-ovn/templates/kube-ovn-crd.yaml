@@ -218,6 +218,9 @@ spec:
                 hairpinSnat:
                   type: string
                   description: State of the lanIP fallback hairpin SNAT programmed on the NAT gateway (enable, disable, or unsupported when the running gateway image cannot switch it)
+                tcpConnLimit:
+                  type: integer
+                  description: Active TCP connlimit threshold configured on the NAT gateway
                 tolerations:
                   type: array
                   items:
@@ -573,6 +576,16 @@ spec:
                     traffic dialed at a FIP from inside the VPC is always SNAT'd to that FIP, and an
                     external client dialing it stays visible to its owner. Applied without Pod
                     recreation.
+                tcpConnLimit:
+                  type: integer
+                  minimum: 0
+                  description: Maximum concurrent TCP connections allowed on the NAT gateway. Set to 0 to disable.
+                tcpSynRateLimit:
+                  type: string
+                  description: TCP SYN raw PREROUTING rate limit (e.g. 100/s)
+                tcpSynBurstLimit:
+                  type: string
+                  description: TCP SYN raw PREROUTING burst limit
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration
