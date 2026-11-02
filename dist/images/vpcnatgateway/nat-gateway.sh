@@ -213,7 +213,7 @@ function init() {
 
     # Apply TCP SYN pre-routing rate limit and TCP connlimit
     tcp_syn_limit_set
-    tcp_connlimit_set "${CONNLIMIT:-10000}"
+    tcp_connlimit_set "${CONNLIMIT:-50000}"
 
     # Load IFB kernel module for ingress QoS traffic shaping
     # IFB (Intermediate Functional Block) is required for ingress rate limiting using HTB
