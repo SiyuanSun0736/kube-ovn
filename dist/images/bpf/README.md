@@ -17,8 +17,8 @@ Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF
 IPv6 沿用该路径，将其中的 `_v4_map` 替换为 `_v6_map`（若无此后缀则直接追加 `_v6_map`）。
 Speaker 仅加载并固化（Pin）当前附加程序实际使用的 Map，不会按名称随意探测其它已存在的 Pinned Map。
 
-TC 过滤器挂载在 Ingress 方向，设置优先级 priority 1、handle 1，名称为 `kube-ovn-eip`。
-若 priority 1 已被非本程序过滤器占用，系统将报错拒绝挂载以避免覆盖冲突。
+TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `--tc-bpf-priority` 自定义，默认 5；预留 1-4 给更高优先级防护，优于常规 CNI）、handle 1，名称为 `kube-ovn-eip`。
+若当前 priority 已被非本程序过滤器占用，系统将报错拒绝挂载以避免覆盖冲突。
 非 EIP 报文返回 `TC_ACT_UNSPEC` (-1)，以确保后续链上的低优先级 TC 过滤器（如 Cilium）能够继续处理。
 在 direct-action 模式下，`TC_ACT_OK` (0) 代表直接放行并终止后续 TC 过滤；不会流向低优先级的 Cilium 规则。
 命中 EIP 的公网报文会通过宿主机 macvlan 直通转发，且目的 MAC 被改写为网关 Pod 的实际 MAC。

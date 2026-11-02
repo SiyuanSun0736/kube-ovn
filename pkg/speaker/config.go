@@ -76,6 +76,7 @@ type Configuration struct {
 	TcBpfInterface      string // 挂载 TC 的宿主机物理网卡（如 bond0），若为空则自动探测默认出向网卡
 	TcBpfProgPath       string // 编译后的 eBPF TC 分类器二进制目标文件路径（默认为 /etc/kube-ovn/tc_eip.o）
 	TcBpfMapPath        string // 固化的 BPF Map 基础路径（默认为 /sys/fs/bpf/kube_ovn_eip_v4_map）
+	TcBpfPriority       uint16 // TC BPF 过滤器的挂载优先级 priority/pref (默认 5，数值越小优先级越高，预留 1-4 给更高优先级防护，优于常规 CNI)
 
 	// BFD (Bidirectional Forwarding Detection) configuration
 	EnableBFD              bool
@@ -126,6 +127,7 @@ func ParseFlags() (*Configuration, error) {
 		argTcBpfInterface              = pflag.String("tc-bpf-interface", "", "指定挂载 TC BPF 过滤器的物理宿主机网卡（如 bond0），若为空则自动探测宿主机主路由物理网卡")
 		argTcBpfProgPath               = pflag.String("tc-bpf-prog-path", "/etc/kube-ovn/tc_eip.o", "编译生成的 eBPF TC 分类器目标二进制文件路径")
 		argTcBpfMapPath                = pflag.String("tc-bpf-map-path", "/sys/fs/bpf/kube_ovn_eip_v4_map", "Pinned BPF Map 的固化挂载基础路径")
+		argTcBpfPriority               = pflag.Uint16("tc-bpf-priority", 5, "TC BPF 过滤器的挂载优先级 priority/pref (默认 5，数值越小优先级越高，预留 1-4 给更高优先级防护，优于常规 CNI)")
 		argEnableBFD                   = pflag.BoolP("enable-bfd", "", false, "Enable BFD (Bidirectional Forwarding Detection) for fast failure detection")
 		argBFDMinTX                    = pflag.Uint32("bfd-min-tx", 1000, "BFD minimum transmit interval in milliseconds (default 1000, max 4294967)")
 		argBFDMinRX                    = pflag.Uint32("bfd-min-rx", 1000, "BFD minimum receive interval in milliseconds (default 1000, max 4294967)")
@@ -209,6 +211,7 @@ func ParseFlags() (*Configuration, error) {
 		TcBpfInterface:              *argTcBpfInterface,
 		TcBpfProgPath:               *argTcBpfProgPath,
 		TcBpfMapPath:                *argTcBpfMapPath,
+		TcBpfPriority:               *argTcBpfPriority,
 		EnableBFD:                   *argEnableBFD,
 		BFDMinTX:                    *argBFDMinTX,
 		BFDMinRX:                    *argBFDMinRX,

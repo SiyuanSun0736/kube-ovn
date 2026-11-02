@@ -50,3 +50,22 @@ func TestTCManagerLifecycle(t *testing.T) {
 		t.Errorf("DeleteEIP: %v", err)
 	}
 }
+
+// TestTCManagerPriority 验证 TC 过滤器优先级默认值及自定义配置
+func TestTCManagerPriority(t *testing.T) {
+	// 默认优先级应为 5，预留 1-4 给更高优先级防护探针
+	mgrDefault := NewTCManager(&Configuration{})
+	if lm, ok := mgrDefault.(*linuxTCManager); ok {
+		if p := lm.priority(); p != 5 {
+			t.Fatalf("期望默认 priority 5，实际为 %d", p)
+		}
+	}
+
+	// 自定义优先级覆盖生效
+	mgrCustom := NewTCManager(&Configuration{TcBpfPriority: 7})
+	if lm, ok := mgrCustom.(*linuxTCManager); ok {
+		if p := lm.priority(); p != 7 {
+			t.Fatalf("期望自定义 priority 7，实际为 %d", p)
+		}
+	}
+}

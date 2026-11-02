@@ -108,14 +108,15 @@ func (m *linuxTCManager) Attach(linkName string) error {
 		return err
 	}
 	id, _ := info.ID()
+	prio := m.priority()
 	for _, filter := range filters {
 		attrs := filter.Attrs()
-		if attrs.Priority != 1 {
+		if attrs.Priority != prio {
 			continue
 		}
 		bpf, ok := filter.(*netlink.BpfFilter)
-		if !ok || !isEIPFilter(bpf) {
-			return fmt.Errorf("TC priority 1 on %s is already owned by another filter", linkName)
+		if !ok || !m.isEIPFilter(bpf) {
+			return fmt.Errorf("TC priority %d on %s is already owned by another filter", prio, linkName)
 		}
 		if bpf.Id == int(id) && bpf.DirectAction {
 			return nil
@@ -124,7 +125,7 @@ func (m *linuxTCManager) Attach(linkName string) error {
 	return netlink.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
-			Handle: 1, Priority: 1, Protocol: unix.ETH_P_ALL,
+			Handle: 1, Priority: prio, Protocol: unix.ETH_P_ALL,
 		},
 		Fd: prog.FD(), Name: tcEIPFilterName, DirectAction: true,
 	})
@@ -193,10 +194,22 @@ func detectDefaultInterface() (string, error) {
 	return "", errors.New("no default IPv4 interface found; specify --tc-bpf-interface")
 }
 
+const defaultTcBpfPriority uint16 = 5
+
+func (m *linuxTCManager) priority() uint16 {
+	if m != nil && m.cfg != nil && m.cfg.TcBpfPriority > 0 {
+		return m.cfg.TcBpfPriority
+	}
+	return defaultTcBpfPriority
+}
+
 // 严格仅匹配本程序的 TC 过滤器（包括原始 tc loader 生成的名字）。
 // 绝不删除与其他 CNI 共享的整个 priority 规则或 clsact qdisc 队列。
-func isEIPFilter(filter *netlink.BpfFilter) bool {
-	return filter.Handle == 1 && filter.Priority == 1 &&
+// 同时匹配当前配置的 priority 以及历史默认 priority 1，确保升级平滑过渡与清理。
+func (m *linuxTCManager) isEIPFilter(filter *netlink.BpfFilter) bool {
+	prio := m.priority()
+	matchPriority := filter.Priority == prio || filter.Priority == 1
+	return filter.Handle == 1 && matchPriority &&
 		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
 }
 
@@ -216,7 +229,7 @@ func (m *linuxTCManager) cleanupFilters(linkName string) error {
 			continue
 		}
 		for _, filter := range filters {
-			if bpf, ok := filter.(*netlink.BpfFilter); ok && isEIPFilter(bpf) {
+			if bpf, ok := filter.(*netlink.BpfFilter); ok && m.isEIPFilter(bpf) {
 				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
 					errs = append(errs, err)
 				}
