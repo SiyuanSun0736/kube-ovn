@@ -1059,7 +1059,21 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
 
-	// 3. Custom rate limits via annotations and spec
+	// 3. Default rate limits scaled for 4C
+	calls = nil
+	gw.Annotations = map[string]string{"ovn.kubernetes.io/cpu": "4"}
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
+	require.Equal(t, [][]string{{
+		natGwTcpSynLimitSet,
+		util.DefaultNatGwSynSrcRate,
+		util.DefaultNatGwSynSrcBurst,
+		util.DefaultNatGwSynDstRate4C,
+		util.DefaultNatGwSynDstBurst4C,
+		util.DefaultNatGwSynHtableMax,
+		util.DefaultNatGwSynHtableExpire,
+	}}, calls)
+
+	// 4. Custom rate limits via annotations and spec
 	calls = nil
 	gw.Spec.TcpSynRateLimit = "300/s"
 	gw.Spec.TcpSynBurstLimit = "600"
@@ -1072,6 +1086,23 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		"600",
 		"8000/s",
 		"16000",
+		util.DefaultNatGwSynHtableMax,
+		util.DefaultNatGwSynHtableExpire,
+	}}, calls)
+
+	// 5. Legacy annotations support
+	calls = nil
+	gw.Annotations = map[string]string{
+		util.VpcNatSynDstRateLimitLegacyAnnotation:  "25000/s",
+		util.VpcNatSynDstBurstLimitLegacyAnnotation: "50000",
+	}
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
+	require.Equal(t, [][]string{{
+		natGwTcpSynLimitSet,
+		"300/s",
+		"600",
+		"25000/s",
+		"50000",
 		util.DefaultNatGwSynHtableMax,
 		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
