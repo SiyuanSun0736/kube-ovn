@@ -231,12 +231,12 @@ const (
 
 	DefaultNatGwTcpConnLimit1C = 10000
 	DefaultNatGwTcpConnLimit2C = 20000
-	DefaultNatGwSynSrcRate     = "100/s"
-	DefaultNatGwSynSrcBurst    = "200"
-	DefaultNatGwSynDstRate1C   = "5000/s"
-	DefaultNatGwSynDstRate2C   = "10000/s"
-	DefaultNatGwSynDstBurst1C  = "10000"
-	DefaultNatGwSynDstBurst2C  = "20000"
+	DefaultNatGwSynSrcRate     = "500/s"
+	DefaultNatGwSynSrcBurst    = "1000"
+	DefaultNatGwSynDstRate1C   = "20000/s"
+	DefaultNatGwSynDstRate2C   = "30000/s"
+	DefaultNatGwSynDstBurst1C  = "40000"
+	DefaultNatGwSynDstBurst2C  = "60000"
 	DefaultNatGwSynHtableMax   = "262144"
 	DefaultNatGwSynDstHtableMax = "2048"
 	DefaultNatGwSynHtableExpire = "10000"
