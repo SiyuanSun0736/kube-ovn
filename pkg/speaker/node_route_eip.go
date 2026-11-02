@@ -364,7 +364,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			err = c.tcManager.SyncEIPs(expectedTcMap)
 		}
 		if err != nil {
-			// TC eBPF failure should not withdraw BGP routes; fallback to kernel datapath to ensure service continuity
+			// TC eBPF 挂载或同步失败时不应撤销 BGP 路由；降级回退到宿主机内核协议栈以优先保障服务连续性
 			klog.Errorf("failed to sync TC BPF redirection, falling back to kernel datapath: %v", err)
 			targetErrors = append(targetErrors, err)
 		}

@@ -24,7 +24,7 @@ const (
 	tcEIPv6MapName  = "kube_ovn_eip_v6_map"
 )
 
-// Keep this layout in sync with struct eip_target in tc_eip.c.
+// 结构体内存布局必须与 tc_eip.c 中的 struct eip_target 保持完全一致（总计 32 字节，严格 64 位对齐）
 type bpfEipTarget struct {
 	Ifindex       uint32
 	TargetMAC     [6]byte
@@ -55,7 +55,7 @@ func ensureClsactQdisc(link netlink.Link) error {
 	return nil
 }
 
-// mapPaths honors the configured IPv4 pin path; the IPv6 pin is its sibling.
+// mapPaths 根据配置的 IPv4 Pinned Map 路径推导，IPv6 Map 为其同级同名映射文件
 func (m *linuxTCManager) mapPaths() (string, string) {
 	v4 := m.cfg.TcBpfMapPath
 	if v4 == "" {
@@ -65,8 +65,8 @@ func (m *linuxTCManager) mapPaths() (string, string) {
 	return v4, v6
 }
 
-// Attach is idempotent, including recovery after a link or filter was recreated.
-// A failed attempt leaves no successful attachment marker and can be retried.
+// Attach 具备幂等性，支持网卡设备或过滤器重建后的自动恢复。
+// 失败的尝试不会留下成功挂载标记，可安全重试。
 func (m *linuxTCManager) Attach(linkName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -142,8 +142,8 @@ func (m *linuxTCManager) load() error {
 	if spec.Programs["tc_eip_ingress"] == nil || spec.Maps[tcEIPv4MapName] == nil || spec.Maps[tcEIPv6MapName] == nil {
 		return errors.New("TC object is missing its EIP classifier or maps")
 	}
-	// Start from an empty generation. Old pins must not resurrect stale ifindices
-	// after a speaker restart; periodic reconciliation repopulates current targets.
+	// 启动时使用全新代际的 Map。Speaker 重启后旧的 Pin 绝不能带入过期的 ifindex；
+	// 周期性对账逻辑会自动重新填充当前有效的目标网关信息。
 	for _, ms := range spec.Maps {
 		ms.Pinning = ebpf.PinNone
 	}
@@ -193,8 +193,8 @@ func detectDefaultInterface() (string, error) {
 	return "", errors.New("no default IPv4 interface found; specify --tc-bpf-interface")
 }
 
-// Match only our filter, including the name emitted by the original tc loader.
-// Never delete an entire priority or clsact qdisc shared with another CNI.
+// 严格仅匹配本程序的 TC 过滤器（包括原始 tc loader 生成的名字）。
+// 绝不删除与其他 CNI 共享的整个 priority 规则或 clsact qdisc 队列。
 func isEIPFilter(filter *netlink.BpfFilter) bool {
 	return filter.Handle == 1 && filter.Priority == 1 &&
 		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
@@ -273,12 +273,12 @@ func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
 	if err != nil {
 		return err
 	}
-	// #nosec G115 -- validTarget checks both indices are positive and fit uint32.
+	// #nosec G115 -- validTarget 已校验两处 ifindex 均为正整数且符合 uint32 范围
 	target := bpfEipTarget{Ifindex: uint32(info.TargetIfindex), ParentIfindex: uint32(info.ParentIfindex)}
 	copy(target.TargetMAC[:], info.TargetMAC)
 	var old bpfEipTarget
 	if err = targetMap.Lookup(key, &old); err == nil {
-		// Do not reset live packet counters during periodic reconciliation.
+		// 周期性全量对账过程中，若目标参数未发生变化，则不重置运行时的报文和字节统计计数器
 		if old.Ifindex == target.Ifindex && old.ParentIfindex == target.ParentIfindex && old.TargetMAC == target.TargetMAC {
 			return nil
 		}
@@ -351,8 +351,7 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo) error {
 }
 
 func pruneEIPMap(targetMap *ebpf.Map, wanted map[string]bool) error {
-	// Collect keys before deleting: deleting the iteration cursor restarts a BPF
-	// hash-map walk, potentially looping forever when some entries are retained.
+	// 必须在删除前先完整收集过期 Key：直接在遍历游标处删除可能导致 BPF Hash Map 遍历重置，当保留部分条目时可能发生死循环。
 	var stale [][]byte
 	var key any
 	for {
@@ -384,8 +383,7 @@ func removePin(path string) error {
 	return nil
 }
 
-// Close also cleans up a previous process's attachments when the feature is
-// disabled. Closing the userspace FD alone never detaches a TC program.
+// Close 会在功能停用时主动清理前代进程遗留的 TC 挂载。仅关闭用户态 FD 绝不会自动卸载内核 TC 程序。
 func (m *linuxTCManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

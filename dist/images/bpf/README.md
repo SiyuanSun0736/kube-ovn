@@ -1,53 +1,39 @@
-# EIP TC bypass
+# EIP TC 旁路直通加速与抗 conntrack 击穿防护
 
-The main Kube-OVN Dockerfile compiles `tc_eip.c` in a separate build stage
-and installs `/etc/kube-ovn/tc_eip.o` for both amd64 and arm64 images.
-The standalone build is `make -C dist/images/bpf` on Linux with clang,
-libbpf headers and Linux UAPI headers installed.
+Kube-OVN 主 Dockerfile 在独立构建阶段编译 `tc_eip.c`，并将 `/etc/kube-ovn/tc_eip.o` 同时打包进 amd64 与 arm64 镜像中。
+在安装有 clang、libbpf 头文件及 Linux UAPI 头文件的 Linux 环境下，可直接执行 `make -C dist/images/bpf` 进行独立编译。
 
-Enable the speaker with `--node-route-eip-mode --enable-tc-bpf-redirect`.
-It must run in the host network namespace with permission to load BPF programs,
-manage TC filters, and write a mounted bpffs at `/sys/fs/bpf` (normally a
-privileged speaker container with a host bpffs mount).
+通过启动参数 `--node-route-eip-mode --enable-tc-bpf-redirect` 启用 Speaker 的 TC BPF 直通功能。
+Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF 程序、管理 TC 过滤器的权限，
+并能够向挂载在 `/sys/fs/bpf` 的 bpffs 写入文件（通常为挂载宿主机 bpffs 的 privileged 容器）。
 
-`--tc-bpf-interface` selects the physical ingress device; if omitted, the IPv4
-default-route device is used. The gateway's external subnet independently selects
-the macvlan master through its `ovn.kubernetes.io/nad-macvlan-master` annotation.
-The host macvlan must use bridge mode. The gateway Pod's Multus network-status
-must contain the external NAD and its actual MAC. Unresolved or invalid targets
-are rejected, removed from the bypass map during reconciliation, and retried.
-Inline VLAN headers are passed through without bypass.
+`--tc-bpf-interface` 指定物理 Ingress 接收网卡；若未指定，则自动探测默认 IPv4 出向网卡。
+网关 Pod 的外网子网通过其 `ovn.kubernetes.io/nad-macvlan-master` 注解独立指定 macvlan 主设备（Master）。
+宿主机 macvlan 必须以 bridge 模式运行。网关 Pod 的 Multus network-status 必须包含该外网 NAD 及其真实硬件 MAC 地址。
+未解析或非法的目标会被拒绝，并在全量对账过程中从旁路 Map 中剔除并按需重试。
+带有内联 VLAN Tag 的报文将直接放行，不走旁路直通。
 
-`--tc-bpf-map-path` is the IPv4 pin filename, defaulting to
-`/sys/fs/bpf/kube_ovn_eip_v4_map`. IPv6 uses the same filename with `_v4_map`
-replaced by `_v6_map` (or `_v6_map` appended if that suffix is absent).
-The speaker loads the object and pins the exact maps used by the attached program;
-it does not discover arbitrary pinned maps by name.
+`--tc-bpf-map-path` 指定 IPv4 Pinned Map 挂载路径，默认为 `/sys/fs/bpf/kube_ovn_eip_v4_map`。
+IPv6 沿用该路径，将其中的 `_v4_map` 替换为 `_v6_map`（若无此后缀则直接追加 `_v6_map`）。
+Speaker 仅加载并固化（Pin）当前附加程序实际使用的 Map，不会按名称随意探测其它已存在的 Pinned Map。
 
-The filter uses ingress priority 1, handle 1, and the name `kube-ovn-eip`.
-An unrelated filter at priority 1 is an error, not something to overwrite.
-Non-EIP traffic returns `TC_ACT_UNSPEC` (-1) so subsequent TC filters still run.
-In direct-action mode, `TC_ACT_OK` (0) accepts the packet and ends TC
-classification; it does not continue to lower-priority Cilium filters.
-EIP packets are redirected through the host macvlan with the gateway Pod's MAC.
-Local macvlan bridge delivery re-enters the master ingress; packets already
-addressed to the Pod on that master return `TC_ACT_OK` to reach its macvlan RX
-handler without a redirect loop or host IP-stack traversal.
+TC 过滤器挂载在 Ingress 方向，设置优先级 priority 1、handle 1，名称为 `kube-ovn-eip`。
+若 priority 1 已被非本程序过滤器占用，系统将报错拒绝挂载以避免覆盖冲突。
+非 EIP 报文返回 `TC_ACT_UNSPEC` (-1)，以确保后续链上的低优先级 TC 过滤器（如 Cilium）能够继续处理。
+在 direct-action 模式下，`TC_ACT_OK` (0) 代表直接放行并终止后续 TC 过滤；不会流向低优先级的 Cilium 规则。
+命中 EIP 的公网报文会通过宿主机 macvlan 直通转发，且目的 MAC 被改写为网关 Pod 的实际 MAC。
+在 macvlan bridge 本地交付模式下，报文会重新进入 Master 的 Ingress；在 Master 上已寻址到 Pod MAC 的报文将直接返回 `TC_ACT_OK` 进入 macvlan RX 处理，避免重定向死循环，且彻底规避穿越宿主机 Netfilter 与 conntrack 跟踪表。
 
-Startup replaces old EIP attachments with empty maps and reconciles current
-resources before announcing their BGP routes. Reconciliation retries loading or
-attachment failures, updates changed targets, and deletes stale entries, including
-entries whose EIPs moved to another node. Normal shutdown removes owned filters
-and pins. To disable, keep node-route mode enabled and restart with
-`--enable-tc-bpf-redirect=false`; the next speaker also cleans up attachments left
-by an unclean exit. Do not run multiple node-route speakers on the same node.
+启动时会用全新的空 Map 替换旧的 EIP 挂载，并在宣告 BGP 路由前完成当前资源的全局对账。
+周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
+正常退出时会清理自己拥有的过滤器和固化的 Pinned Map。
+若需停用本特性，请保持 node-route 模式开启并以 `--enable-tc-bpf-redirect=false` 重启；下一个 Speaker 实例也会主动清理非正常退出留下的挂载痕迹。
+严禁在同一物理节点上同时运行多个 node-route speaker。
 
-## Kernel regression tests
+## 内核回归测试
 
-Run these tests only inside a disposable privileged Linux container/network
-namespace with bpffs, `ip`, and `ping` available. They create private interfaces
-and namespaces, exercise actual BPF maps and program execution, and verify
-macvlan delivery without a host route to the EIP.
+此类测试必须在具备 bpffs、`ip` 和 `ping` 工具的专用隔离特权 Linux 容器或独立 Network Namespace 中运行。
+测试会创建私有虚拟接口和网络命名空间，真实执行 BPF Map 增删与程序校验，并验证在宿主机故意不配置 EIP 路由的情况下通过 TC 旁路实现 macvlan 连通性。
 
 ```sh
 make -C dist/images/bpf
@@ -56,4 +42,4 @@ KUBE_OVN_BPF_OBJECT="$PWD/dist/images/bpf/tc_eip.o" \
 go test ./pkg/speaker -run 'Test(TC|NatGwTarget)' -count=1 -v
 ```
 
-Without `KUBE_OVN_BPF_TEST=1`, tests requiring kernel privileges are skipped.
+若未设置 `KUBE_OVN_BPF_TEST=1`，需要内核特权的测试用例将被自动跳过。

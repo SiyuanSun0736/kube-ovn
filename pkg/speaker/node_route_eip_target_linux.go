@@ -25,8 +25,8 @@ func (c *Controller) getNatGwTargetInfo(pod *corev1.Pod, eip *kubeovnv1.Iptables
 	return natGwTargetInfo(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
 }
 
-// The TC ingress device and the external subnet's macvlan master need not be
-// the same device. Route through the latter and address the Pod's actual MAC.
+// TC Ingress 接收网卡与外网子网的 macvlan 父设备可以不是同一个设备。
+// 通过后者进行直通路由并精准重定向到 Pod 的真实硬件 MAC 地址。
 func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup func(string) (netlink.Link, error)) (TargetInfo, error) {
 	if pod == nil {
 		return TargetInfo{}, errors.New("NAT gateway pod is missing")
@@ -73,8 +73,8 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 			return info, nil
 		}
 	} else {
-		// Non-macvlan mode (e.g. ptp / veth-pair mode):
-		// Lookup the target veth device via the Pod's external IP route.
+		// 非 macvlan 模式（例如 ptp / veth-pair 模式）：
+		// 通过查询 Pod 外部 IP 的宿主机路由反查目标宿主机端 veth 设备。
 		for _, status := range statuses {
 			networkName := status.Name
 			if !strings.Contains(networkName, "/") {

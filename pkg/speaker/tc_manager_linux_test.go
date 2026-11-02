@@ -17,8 +17,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// These tests use real kernel maps and private interfaces. Run in an isolated,
-// privileged network namespace, never against a node's existing TC programs.
+// 本集成测试使用真实内核 Map 与私有测试接口。必须在隔离且具备特权的 Network Namespace 中运行，
+// 严禁直接作用于宿主机生产节点已有的 TC 程序。
 func requireBPFIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
@@ -123,7 +123,7 @@ func TestTCNonEIPContinuesClassification(t *testing.T) {
 func testTCPinPath(t *testing.T) string {
 	t.Helper()
 	requireBPFIntegration(t)
-	// bpffs is local to the disposable container's mount namespace.
+	// bpffs 作用域限定在此一次性测试容器的挂载命名空间内
 	if err := unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
 		require.ErrorIs(t, err, unix.EBUSY)
 	}
@@ -146,8 +146,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	require.NoError(t, m.Attach(link.Name), "attachment must be idempotent")
 	ip := net.ParseIP("2001:db8::1")
 	require.NoError(t, m.AddEIP(ip, TargetInfo{TargetIfindex: link.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
-	// Simulate a process restart without clean shutdown. The old program remains
-	// attached; a new instance must discard its stale maps.
+	// 模拟进程未优雅退出即重启。旧 TC 分类器程序保持挂载，新实例必须丢弃旧的陈旧 Map
 	restarted := NewTCManager(cfg)
 	require.NoError(t, restarted.Attach(link.Name))
 	require.NoError(t, restarted.SyncEIPs(map[string]TargetInfo{}))
@@ -156,7 +155,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	var value bpfEipTarget
 	require.ErrorIs(t, v6.Lookup(ip.To16(), &value), ebpf.ErrKeyNotExist)
 	require.NoError(t, v6.Close())
-	// Keep an unrelated filter at another priority while disabling EIP bypass.
+	// 停用 EIP 旁路时，必须保留挂载在其他 priority 上的无关过滤器
 	foreign := &netlink.MatchAll{FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Index, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 2, Priority: 10, Protocol: unix.ETH_P_ALL}}
 	require.NoError(t, netlink.FilterAdd(foreign))
 	disabled := NewTCManager(&Configuration{TcBpfMapPath: pin})
@@ -186,7 +185,7 @@ func TestTCSyncPreservesExpectedAndCounters(t *testing.T) {
 	require.NoError(t, v4.Lookup(ip.To4(), &value))
 	require.Equal(t, uint64(42), value.Packets)
 	require.ErrorIs(t, v4.Lookup([]byte{1, 2, 3, 4}, &value), ebpf.ErrKeyNotExist)
-	// An invalid replacement must not retain the old forwarding entry.
+	// 非法的替换目标绝不能保留旧的转发条目
 	require.Error(t, m.SyncEIPs(map[string]TargetInfo{ip.String(): {}}))
 	require.ErrorIs(t, v4.Lookup(ip.To4(), &value), ebpf.ErrKeyNotExist)
 }
@@ -198,8 +197,8 @@ func TestTCMacvlanDelivery(t *testing.T) {
 		output, err := exec.Command("sh", "-ec", command).CombinedOutput()
 		require.NoError(t, err, "%s: %s", command, output)
 	}
-	// Both the outside sender and gateway are in separate namespaces. The host
-	// deliberately has no route to the EIP; successful ping requires TC bypass.
+	// 外部发送方与网关 Pod 分别处于独立的网络命名空间。
+	// 宿主机网络故意不配置到 EIP 的路由；ping 连通必须依赖 TC 旁路直通转发生效。
 	t.Cleanup(func() {
 		run("ip netns del eip-outside 2>/dev/null || true; ip netns del eip-gateway 2>/dev/null || true; ip link del eip-uplink 2>/dev/null || true")
 	})
