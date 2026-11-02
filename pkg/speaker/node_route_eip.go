@@ -364,9 +364,8 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			err = c.tcManager.SyncEIPs(expectedTcMap)
 		}
 		if err != nil {
-			// Do not announce an unprotected EIP, but still withdraw stale routes
-			// and reconcile the independent Service VIP plane below.
-			expectedPrefixes = make(prefixMap)
+			// TC eBPF failure should not withdraw BGP routes; fallback to kernel datapath to ensure service continuity
+			klog.Errorf("failed to sync TC BPF redirection, falling back to kernel datapath: %v", err)
 			targetErrors = append(targetErrors, err)
 		}
 	}
