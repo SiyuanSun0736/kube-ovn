@@ -354,18 +354,39 @@ func (c *Controller) getVpcNatGwDesiredTcpConnLimit(gw *kubeovnv1.VpcNatGateway)
 	return c.getVpcNatGwDefaultTcpConnLimit(gw)
 }
 
+func (c *Controller) getVpcNatGwDefaultSynDstLimits(gw *kubeovnv1.VpcNatGateway) (string, string) {
+	cores := 1
+	for _, key := range []string{"ovn.kubernetes.io/cpu", "las.qiniu.io/cpu", "cpu"} {
+		if val, ok := gw.Annotations[key]; ok {
+			if cpu, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && cpu > 0 {
+				cores = cpu
+				break
+			}
+		}
+	}
+
+	switch {
+	case cores <= 1:
+		return util.DefaultNatGwSynDstRate1C, util.DefaultNatGwSynDstBurst1C
+	case cores <= 2:
+		return util.DefaultNatGwSynDstRate2C, util.DefaultNatGwSynDstBurst2C
+	case cores <= 4:
+		return util.DefaultNatGwSynDstRate4C, util.DefaultNatGwSynDstBurst4C
+	case cores <= 8:
+		return util.DefaultNatGwSynDstRate8C, util.DefaultNatGwSynDstBurst8C
+	case cores <= 16:
+		return util.DefaultNatGwSynDstRate16C, util.DefaultNatGwSynDstBurst16C
+	default:
+		return util.DefaultNatGwSynDstRate32C, util.DefaultNatGwSynDstBurst32C
+	}
+}
+
 func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
 	srcRate := util.DefaultNatGwSynSrcRate
 	srcBurst := util.DefaultNatGwSynSrcBurst
-	dstRate := util.DefaultNatGwSynDstRate1C
-	dstBurst := util.DefaultNatGwSynDstBurst1C
+	dstRate, dstBurst := c.getVpcNatGwDefaultSynDstLimits(gw)
 	htableMax := util.DefaultNatGwSynHtableMax
 	htableExpire := util.DefaultNatGwSynHtableExpire
-
-	if c.getVpcNatGwDefaultTcpConnLimit(gw) >= util.DefaultNatGwTcpConnLimit2C {
-		dstRate = util.DefaultNatGwSynDstRate2C
-		dstBurst = util.DefaultNatGwSynDstBurst2C
-	}
 
 	if gw.Spec.TcpSynRateLimit != "" {
 		srcRate = gw.Spec.TcpSynRateLimit
@@ -374,23 +395,29 @@ func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 		srcBurst = gw.Spec.TcpSynBurstLimit
 	}
 
-	if val, ok := gw.Annotations[util.VpcNatSynRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcRate = strings.TrimSpace(val)
+	for _, key := range []string{util.VpcNatSynRateLimitAnnotation, util.VpcNatSynSrcRateLimitAnnotation} {
+		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
+			srcRate = strings.TrimSpace(val)
+			break
+		}
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcBurst = strings.TrimSpace(val)
+	for _, key := range []string{util.VpcNatSynBurstLimitAnnotation, util.VpcNatSynSrcBurstLimitAnnotation} {
+		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
+			srcBurst = strings.TrimSpace(val)
+			break
+		}
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynSrcRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcRate = strings.TrimSpace(val)
+	for _, key := range []string{util.VpcNatSynDstRateLimitAnnotation, util.VpcNatSynDstRateLimitLegacyAnnotation} {
+		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
+			dstRate = strings.TrimSpace(val)
+			break
+		}
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynSrcBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcBurst = strings.TrimSpace(val)
-	}
-	if val, ok := gw.Annotations[util.VpcNatSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		dstRate = strings.TrimSpace(val)
-	}
-	if val, ok := gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		dstBurst = strings.TrimSpace(val)
+	for _, key := range []string{util.VpcNatSynDstBurstLimitAnnotation, util.VpcNatSynDstBurstLimitLegacyAnnotation} {
+		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
+			dstBurst = strings.TrimSpace(val)
+			break
+		}
 	}
 	if val, ok := gw.Annotations[util.VpcNatSynHashlimitEntriesAnnotation]; ok && strings.TrimSpace(val) != "" {
 		htableMax = strings.TrimSpace(val)
