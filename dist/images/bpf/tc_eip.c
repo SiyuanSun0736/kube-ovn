@@ -15,7 +15,11 @@
 
 /*
  * 功能：Kube-OVN 公网 EIP eBPF TC Ingress 旁路直通分类器。
- * 作用：在物理网卡驱动层命中 EIP 时直接短路重定向推入本地网关 Pod，绕过宿主机 Netfilter conntrack 规避连接表被击穿；非 EIP 流量正常放行。
+ * 拓扑架构与分工：
+ *   - Kube-OVN TC：只占用 macbond1（对外发布公网 BGP EIP 路由的接口），专职负责公网 EIP 短路直通与防 conntrack 击穿；
+ *   - Cilium TC：只占用 bond0（集群管理通信）+ 各个 Pod 虚拟网卡 *_h（容器侧安全策略）。
+ *   两者在网络接口上严格物理隔离、各司其职，互不干扰。
+ * 作用：在 macbond1 Ingress 命中 EIP 时直接短路重定向推入本地网关 Pod，绕过宿主机 Netfilter conntrack 规避连接表被击穿；非 EIP 流量正常放行。
  */
 
 #include <linux/bpf.h>
@@ -78,9 +82,11 @@ static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
            mac_eq(eth->h_dest, target->target_mac);
 }
 
-// 在 direct-action 模式下，TC_ACT_OK 会直接终止分类并放行进入内核协议栈，不再继续传递给低优先级的 Cilium 过滤器；
-// 因此未命中或未处理的报文必须严格返回 TC_ACT_UNSPEC，以便后续过滤器（如 Cilium）继续接管处理。
-// TC_ACT_OK 仅在此处专门留给“已命中 EIP 且正处于本地交付链路”的报文。
+// 返回值与动作说明：
+// - Kube-OVN TC 只挂载在 macbond1，Cilium TC 只挂载在 bond0 及各个 Pod 虚拟网卡 *_h；
+// - TC_ACT_UNSPEC (-1)：未命中 EIP 的常规网络流量（如节点管理、BGP 协商）原样放行，交付宿主机 Linux 内核协议栈正常处理；
+// - TC_ACT_OK (0)：专用于“已命中 EIP 且正处于 macvlan 本地交付链路”的报文，直接终止 TC 处理交由内核驱动 RX 处理，规避重定向死循环；
+// - TC_ACT_SHOT (2)：仅在底层严重异常（如 bpf_skb_store_bytes 越界失败）时安全丢包。
 // 处理 IPv4 报文逻辑
 static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end) {
     struct iphdr *iph = data + sizeof(struct ethhdr);
@@ -93,7 +99,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
     // 检索 BPF Map
     struct eip_target *target = bpf_map_lookup_elem(&kube_ovn_eip_v4_map, &daddr);
     if (!target || !target->ifindex) {
-        // 未命中本节点承载的 EIP：原样放行给后续的 Cilium 探针及宿主机内核协议栈
+        // 未命中本节点承载的 EIP：原样放行交付宿主机内核协议栈正常处理
         return TC_ACT_UNSPEC;
     }
 

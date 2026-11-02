@@ -17,10 +17,14 @@ Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF
 IPv6 沿用该路径，将其中的 `_v4_map` 替换为 `_v6_map`（若无此后缀则直接追加 `_v6_map`）。
 Speaker 仅加载并固化（Pin）当前附加程序实际使用的 Map，不会按名称随意探测其它已存在的 Pinned Map。
 
-TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `--tc-bpf-priority` 自定义，默认 5；预留 1-4 给更高优先级防护，优于常规 CNI）、handle 1，名称为 `kube-ovn-eip`。
+TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `--tc-bpf-priority` 自定义，默认 5；预留 1-4 给更高优先级防护）、handle 1，名称为 `kube-ovn-eip`。
+网络分工与架构设计：
+- **Kube-OVN TC**：只占用外网出口网卡（如 `macbond1`），专职负责公网 EIP 的 eBPF 短路直通与防 conntrack 击穿；
+- **Cilium TC**：只占用内网出口网卡（`bond0`，负责集群管理通信）以及各个 Pod 虚拟网卡 `*_h`（容器侧安全策略）。
+两者在网络接口上严格物理隔离、各司其职，互不干扰。
 若当前 priority 已被非本程序过滤器占用，系统将报错拒绝挂载以避免覆盖冲突。
-非 EIP 报文返回 `TC_ACT_UNSPEC` (-1)，以确保后续链上的低优先级 TC 过滤器（如 Cilium）能够继续处理。
-在 direct-action 模式下，`TC_ACT_OK` (0) 代表直接放行并终止后续 TC 过滤；不会流向低优先级的 Cilium 规则。
+非 EIP 报文返回 `TC_ACT_UNSPEC` (-1)，正常放行进入宿主机 Linux 网络协议栈。
+在 direct-action 模式下，`TC_ACT_OK` (0) 专用于 macvlan bridge 本地交付链路（报文已改写为 Pod MAC 再次进入 Ingress 时），直接终止后续 TC 过滤并交由驱动将报文交付给目标 Pod RX 处理，彻底避开重定向死循环与宿主机 Netfilter / conntrack 跟踪表。
 命中 EIP 的公网报文会通过宿主机 macvlan 直通转发，且目的 MAC 被改写为网关 Pod 的实际 MAC。
 在 macvlan bridge 本地交付模式下，报文会重新进入 Master 的 Ingress；在 Master 上已寻址到 Pod MAC 的报文将直接返回 `TC_ACT_OK` 进入 macvlan RX 处理，避免重定向死循环，且彻底规避穿越宿主机 Netfilter 与 conntrack 跟踪表。
 
