@@ -688,8 +688,8 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			wantOps: [][]string{
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATDisable},
-				{natGwTcpConnLimitSet, "10000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate1C, util.DefaultNatGwSynDstBurst1C, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
+				{natGwTcpConnLimitSet, "50000", "stateful"},
+				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
 			},
 			wantStat: hairpinSNATDisable,
 		},
@@ -699,8 +699,8 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			wantOps: [][]string{
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATEnable},
-				{natGwTcpConnLimitSet, "10000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate1C, util.DefaultNatGwSynDstBurst1C, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
+				{natGwTcpConnLimitSet, "50000", "stateful"},
+				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
 			},
 			wantStat: hairpinSNATEnable,
 		},
@@ -930,39 +930,31 @@ func TestVpcNatGwDesiredTcpConnLimit(t *testing.T) {
 	require.NoError(t, err)
 	ctrl := fc.fakeController
 
-	// 1. Default when unset: 1C -> 10,000
+	// 1. Default when unset: 50,000
 	gw := fakeGw("gw")
-	assert.Equal(t, util.DefaultNatGwTcpConnLimit1C, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	assert.Equal(t, util.DefaultNatGwTcpConnLimit, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 2. Default when 2C annotation set -> 20,000
-	gw.Annotations = map[string]string{"ovn.kubernetes.io/cpu": "2"}
-	assert.Equal(t, util.DefaultNatGwTcpConnLimit2C, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
-
-	// 3. Default when legacy cpu annotation set -> 20,000
-	gw.Annotations = map[string]string{"las.qiniu.io/cpu": "2"}
-	assert.Equal(t, util.DefaultNatGwTcpConnLimit2C, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
-
-	// 4. Custom annotation tcp-connlimit
-	gw.Annotations[util.VpcNatTcpConnLimitAnnotation] = "15000"
+	// 2. Custom annotation tcp-connlimit
+	gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "15000"}
 	assert.Equal(t, 15000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 5. Legacy annotation tcp-connlimit
+	// 3. Legacy annotation tcp-connlimit
 	delete(gw.Annotations, util.VpcNatTcpConnLimitAnnotation)
 	gw.Annotations[util.VpcNatTcpConnLimitLegacyAnnotation] = "25000"
 	assert.Equal(t, 25000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 6. Spec field overrides annotation
+	// 4. Spec field overrides annotation
 	gw.Spec.TcpConnLimit = ptr.To(30000)
 	assert.Equal(t, 30000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 7. Spec field 0 disables connlimit
+	// 5. Spec field 0 disables connlimit
 	gw.Spec.TcpConnLimit = ptr.To(0)
 	assert.Equal(t, 0, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 8. Removing spec field restores default (20000 since cpu=2)
+	// 6. Removing spec field restores default (50000)
 	gw.Spec.TcpConnLimit = nil
 	delete(gw.Annotations, util.VpcNatTcpConnLimitLegacyAnnotation)
-	assert.Equal(t, 20000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	assert.Equal(t, util.DefaultNatGwTcpConnLimit, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 }
 
 func TestSyncNatGwTcpConnLimit(t *testing.T) {
@@ -981,18 +973,18 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 
 	pod := fakeNatGwPod("gw", true)
 
-	// 1. Initial sync programs default (10000, stateful)
+	// 1. Initial sync programs default (50000, stateful)
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateful"}}, calls)
+	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "50000", "stateful"}}, calls)
 
 	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, patched.Status.TcpConnLimit)
-	require.Equal(t, 10000, *patched.Status.TcpConnLimit)
+	require.Equal(t, 50000, *patched.Status.TcpConnLimit)
 
 	// 2. Converged: status matches desired, no re-exec
 	calls = nil
-	gw.Status.TcpConnLimit = ptr.To(10000)
+	gw.Status.TcpConnLimit = ptr.To(50000)
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
 	require.Empty(t, calls)
 
@@ -1033,52 +1025,26 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 
 	pod := fakeNatGwPod("gw", true)
 
-	// 1. Default rate limits for 1C
+	// 1. Default rate limits
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
 	require.Equal(t, [][]string{{
 		natGwTcpSynLimitSet,
 		util.DefaultNatGwSynSrcRate,
 		util.DefaultNatGwSynSrcBurst,
-		util.DefaultNatGwSynDstRate1C,
-		util.DefaultNatGwSynDstBurst1C,
+		util.DefaultNatGwSynDstRate,
+		util.DefaultNatGwSynDstBurst,
 		util.DefaultNatGwSynHtableMax,
 		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
 
-	// 2. Default rate limits scaled for 2C
-	calls = nil
-	gw.Annotations = map[string]string{"ovn.kubernetes.io/cpu": "2"}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
-	require.Equal(t, [][]string{{
-		natGwTcpSynLimitSet,
-		util.DefaultNatGwSynSrcRate,
-		util.DefaultNatGwSynSrcBurst,
-		util.DefaultNatGwSynDstRate2C,
-		util.DefaultNatGwSynDstBurst2C,
-		util.DefaultNatGwSynHtableMax,
-		util.DefaultNatGwSynHtableExpire,
-	}}, calls)
-
-	// 3. Default rate limits scaled for 4C
-	calls = nil
-	gw.Annotations = map[string]string{"ovn.kubernetes.io/cpu": "4"}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
-	require.Equal(t, [][]string{{
-		natGwTcpSynLimitSet,
-		util.DefaultNatGwSynSrcRate,
-		util.DefaultNatGwSynSrcBurst,
-		util.DefaultNatGwSynDstRate4C,
-		util.DefaultNatGwSynDstBurst4C,
-		util.DefaultNatGwSynHtableMax,
-		util.DefaultNatGwSynHtableExpire,
-	}}, calls)
-
-	// 4. Custom rate limits via annotations and spec
+	// 2. Custom rate limits via annotations and spec
 	calls = nil
 	gw.Spec.TcpSynRateLimit = "300/s"
 	gw.Spec.TcpSynBurstLimit = "600"
-	gw.Annotations[util.VpcNatSynDstRateLimitAnnotation] = "8000/s"
-	gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation] = "16000"
+	gw.Annotations = map[string]string{
+		util.VpcNatSynDstRateLimitAnnotation:  "8000/s",
+		util.VpcNatSynDstBurstLimitAnnotation: "16000",
+	}
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
 	require.Equal(t, [][]string{{
 		natGwTcpSynLimitSet,
@@ -1090,7 +1056,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
 
-	// 5. Legacy annotations support
+	// 3. Legacy annotations support
 	calls = nil
 	gw.Annotations = map[string]string{
 		util.VpcNatSynDstRateLimitLegacyAnnotation:  "25000/s",

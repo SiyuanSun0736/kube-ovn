@@ -321,28 +321,12 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 	return c.patchNatGwHairpinSNATStatus(gw.Name, mode)
 }
 
-func (c *Controller) getVpcNatGwDefaultTcpConnLimit(gw *kubeovnv1.VpcNatGateway) int {
-	for _, key := range []string{"ovn.kubernetes.io/cpu", "las.qiniu.io/cpu", "cpu"} {
-		if val, ok := gw.Annotations[key]; ok {
-			if cpu, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
-				if cpu >= 2 {
-					return util.DefaultNatGwTcpConnLimit2C
-				}
-				if cpu == 1 {
-					return util.DefaultNatGwTcpConnLimit1C
-				}
-			}
-		}
-	}
-	return util.DefaultNatGwTcpConnLimit1C
-}
-
 func (c *Controller) getVpcNatGwDesiredTcpConnLimit(gw *kubeovnv1.VpcNatGateway) int {
 	// 1. Explicit spec field
 	if gw.Spec.TcpConnLimit != nil {
 		return *gw.Spec.TcpConnLimit
 	}
-	// 2. Annotations
+	// 2. Annotations (supports standard and las legacy annotations)
 	for _, key := range []string{util.VpcNatTcpConnLimitAnnotation, util.VpcNatTcpConnLimitLegacyAnnotation} {
 		if val, ok := gw.Annotations[key]; ok {
 			if limit, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && limit >= 0 {
@@ -350,41 +334,15 @@ func (c *Controller) getVpcNatGwDesiredTcpConnLimit(gw *kubeovnv1.VpcNatGateway)
 			}
 		}
 	}
-	// 3. Flavor specifications default: 1C -> 10,000, 2C -> 20,000 (#4794)
-	return c.getVpcNatGwDefaultTcpConnLimit(gw)
-}
-
-func (c *Controller) getVpcNatGwDefaultSynDstLimits(gw *kubeovnv1.VpcNatGateway) (string, string) {
-	cores := 1
-	for _, key := range []string{"ovn.kubernetes.io/cpu", "las.qiniu.io/cpu", "cpu"} {
-		if val, ok := gw.Annotations[key]; ok {
-			if cpu, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && cpu > 0 {
-				cores = cpu
-				break
-			}
-		}
-	}
-
-	switch {
-	case cores <= 1:
-		return util.DefaultNatGwSynDstRate1C, util.DefaultNatGwSynDstBurst1C
-	case cores <= 2:
-		return util.DefaultNatGwSynDstRate2C, util.DefaultNatGwSynDstBurst2C
-	case cores <= 4:
-		return util.DefaultNatGwSynDstRate4C, util.DefaultNatGwSynDstBurst4C
-	case cores <= 8:
-		return util.DefaultNatGwSynDstRate8C, util.DefaultNatGwSynDstBurst8C
-	case cores <= 16:
-		return util.DefaultNatGwSynDstRate16C, util.DefaultNatGwSynDstBurst16C
-	default:
-		return util.DefaultNatGwSynDstRate32C, util.DefaultNatGwSynDstBurst32C
-	}
+	// 3. Standalone default connlimit fallback (50,000 / 5w)
+	return util.DefaultNatGwTcpConnLimit
 }
 
 func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
 	srcRate := util.DefaultNatGwSynSrcRate
 	srcBurst := util.DefaultNatGwSynSrcBurst
-	dstRate, dstBurst := c.getVpcNatGwDefaultSynDstLimits(gw)
+	dstRate := util.DefaultNatGwSynDstRate
+	dstBurst := util.DefaultNatGwSynDstBurst
 	htableMax := util.DefaultNatGwSynHtableMax
 	htableExpire := util.DefaultNatGwSynHtableExpire
 
