@@ -476,12 +476,15 @@ function is_stateless_active() {
     if [ "$mode" = "stateless" ] || [ "$mode" = "stateless-nft" ]; then
         return 0
     fi
-    # Check if full-link notrack is actively programmed in data plane.
-    # Note: Cannot rely solely on nft table existence, must check for active notrack rules!
-    if [ -n "$nft_cmd" ] && $nft_cmd list ruleset 2>/dev/null | grep -E -q "notrack"; then
+    if [ "$mode" = "stateful" ]; then
+        return 1
+    fi
+    # Check if full-link TCP notrack is actively programmed in raw PREROUTING table.
+    # We must match full TCP bypass or broad notrack in PREROUTING, not narrow port/protocol exemptions (like UDP DNS).
+    if [ -n "$nft_cmd" ] && $nft_cmd list chain ip "$NFT_TABLE" notrack 2>/dev/null | grep -E -q "notrack"; then
         return 0
     fi
-    if [ -n "$iptables_save_cmd" ] && $iptables_save_cmd -t raw 2>/dev/null | grep -E -q -- "-j NOTRACK|-j CT --notrack"; then
+    if [ -n "$iptables_save_cmd" ] && $iptables_save_cmd -t raw 2>/dev/null | grep -E -q -- "-A PREROUTING .*-p tcp .*-j (NOTRACK|CT --notrack)|-A PREROUTING .*-j (NOTRACK|CT --notrack)"; then
         return 0
     fi
     return 1
@@ -508,6 +511,12 @@ function tcp_connlimit_set() {
     local mode=$2
 
     check_inited
+
+    # Validate limit: must be a non-negative decimal integer
+    if [ -n "$limit" ] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid tcp connlimit value '$limit': must be an integer" >&2
+        return 1
+    fi
 
     # 1. Stateless NAT (full-link notrack): bypass conntrack entirely, skip & clean connlimit
     if is_stateless_active "$mode"; then
@@ -541,13 +550,20 @@ function tcp_connlimit_set() {
     if [ -n "$iptables_cmd" ]; then
         ensure_tcp_connlimit
 
-        $iptables_cmd -t mangle -F VPC_CONNLIMIT
-        # Bypass loopback and BGP (port 179)
-        $iptables_cmd -t mangle -A VPC_CONNLIMIT -i lo -j RETURN
-        $iptables_cmd -t mangle -A VPC_CONNLIMIT -p tcp --dport 179 -j RETURN
-        $iptables_cmd -t mangle -A VPC_CONNLIMIT -p tcp --sport 179 -j RETURN
-        # Drop incoming TCP SYN exceeding connection limit
-        $iptables_cmd -t mangle -A VPC_CONNLIMIT -p tcp --syn -m connlimit --connlimit-above "$limit" --connlimit-mask 0 -j DROP 2>/dev/null || true
+        # If already configured with identical limit, avoid flushing to preserve connection accounting (Item 8)
+        if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -q -- "--connlimit-above $limit "; then
+            echo "TCP connlimit $limit is already installed, keeping existing accounting match"
+        else
+            $iptables_cmd -t mangle -F VPC_CONNLIMIT
+            # Bypass loopback and BGP (dport 179 for incoming BGP sessions to local speaker; remove sport 179 bypass - Item 6)
+            $iptables_cmd -t mangle -A VPC_CONNLIMIT -i lo -j RETURN
+            $iptables_cmd -t mangle -A VPC_CONNLIMIT -p tcp --dport 179 -j RETURN
+            # Drop incoming TCP SYN exceeding connection limit (Propagate errors - Item 5)
+            if ! $iptables_cmd -t mangle -A VPC_CONNLIMIT -p tcp --syn -m connlimit --connlimit-above "$limit" --connlimit-mask 0 -j DROP; then
+                echo "Failed to install iptables VPC_CONNLIMIT rule" >&2
+                return 1
+            fi
+        fi
     fi
 
     # 4. Nftables implementation in mangle PREROUTING (priority -150)
@@ -557,9 +573,13 @@ function tcp_connlimit_set() {
             "add chain ip $NFT_TABLE connlimit { type filter hook prerouting priority -150; policy accept; }" \
             "flush chain ip $NFT_TABLE connlimit" \
             "add rule ip $NFT_TABLE connlimit iifname \"lo\" return" \
-            "add rule ip $NFT_TABLE connlimit tcp dport 179 return" \
-            "add rule ip $NFT_TABLE connlimit tcp sport 179 return" \
-            "add rule ip $NFT_TABLE connlimit tcp flags & (syn|ack) == syn ct count over $limit drop"
+            "add rule ip $NFT_TABLE connlimit tcp dport 179 return"
+
+        # Propagate error if adding the ct count rule fails (Item 5)
+        if ! $nft_cmd add rule ip "$NFT_TABLE" connlimit tcp flags \& \(syn\|ack\) == syn ct count over "$limit" drop; then
+            echo "Failed to install nftables connlimit rule" >&2
+            return 1
+        fi
     fi
 }
 
@@ -578,6 +598,40 @@ function tcp_syn_limit_set() {
     [[ "$src_rate" =~ ^[0-9]+$ ]] && src_rate="${src_rate}/s"
     [[ "$dst_rate" =~ ^[0-9]+$ ]] && dst_rate="${dst_rate}/s"
 
+    # [P1] Validate every parameter against safe numeric/rate grammar (Items 1 & 2)
+    local rate_pattern="^[0-9]+/(s|sec|second|m|min|minute|h|hour)$"
+    local num_pattern="^[0-9]+$"
+
+    if ! [[ "$src_rate" =~ $rate_pattern ]]; then
+        echo "Error: invalid SYN src_rate '$src_rate'" >&2
+        return 1
+    fi
+    if ! [[ "$dst_rate" =~ $rate_pattern ]]; then
+        echo "Error: invalid SYN dst_rate '$dst_rate'" >&2
+        return 1
+    fi
+    if ! [[ "$src_burst" =~ $num_pattern ]] || [ "$src_burst" -le 0 ]; then
+        echo "Error: invalid SYN src_burst '$src_burst'" >&2
+        return 1
+    fi
+    if ! [[ "$dst_burst" =~ $num_pattern ]] || [ "$dst_burst" -le 0 ]; then
+        echo "Error: invalid SYN dst_burst '$dst_burst'" >&2
+        return 1
+    fi
+    if ! [[ "$htable_max" =~ $num_pattern ]] || [ "$htable_max" -le 0 ]; then
+        echo "Error: invalid SYN htable_max '$htable_max'" >&2
+        return 1
+    fi
+    if ! [[ "$dst_htable_max" =~ $num_pattern ]] || [ "$dst_htable_max" -le 0 ]; then
+        echo "Error: invalid SYN dst_htable_max '$dst_htable_max'" >&2
+        return 1
+    fi
+    # [P1] Bounded decimal integer validation before Bash arithmetic evaluation (Item 1)
+    if ! [[ "$htable_expire" =~ $num_pattern ]] || [ "$htable_expire" -lt 1000 ] || [ "$htable_expire" -gt 86400000 ]; then
+        echo "Warning: invalid or out-of-range SYN htable_expire '$htable_expire', falling back to 10000" >&2
+        htable_expire=10000
+    fi
+
     echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate, src_burst=$src_burst, dst_rate=$dst_rate, dst_burst=$dst_burst, htable_max=$htable_max, htable_expire=$htable_expire"
 
     # 1. Iptables implementation in raw PREROUTING
@@ -586,36 +640,48 @@ function tcp_syn_limit_set() {
 
         $iptables_cmd -t raw -F VPC_SYN_LIMIT
         $iptables_cmd -t raw -A VPC_SYN_LIMIT -i lo -j RETURN
+        # Restrict BGP exemption to dport 179 (Item 6)
         $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --dport 179 -j RETURN
-        $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --sport 179 -j RETURN
 
-        # Layer 1: per-source-IP rate limit
-        $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --syn \
+        # Layer 1: per-source-IP rate limit (Propagate errors - Item 5)
+        if ! $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --syn \
             -m hashlimit --hashlimit-above "$src_rate" \
             --hashlimit-burst "$src_burst" \
             --hashlimit-mode srcip \
             --hashlimit-name vpc_syn_src \
             --hashlimit-htable-max "$htable_max" \
             --hashlimit-htable-expire "$htable_expire" \
-            -j DROP 2>/dev/null || true
+            -j DROP; then
+            echo "Failed to install iptables VPC_SYN_LIMIT source rate limit rule" >&2
+            return 1
+        fi
 
-        # Layer 2: per-destination-EIP rate limit
-        $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --syn \
+        # Layer 2: per-destination-EIP rate limit (Propagate errors - Item 5)
+        if ! $iptables_cmd -t raw -A VPC_SYN_LIMIT -p tcp --syn \
             -m hashlimit --hashlimit-above "$dst_rate" \
             --hashlimit-burst "$dst_burst" \
             --hashlimit-mode dstip \
             --hashlimit-name vpc_syn_dst \
             --hashlimit-htable-max "$dst_htable_max" \
             --hashlimit-htable-expire "$htable_expire" \
-            -j DROP 2>/dev/null || true
+            -j DROP; then
+            echo "Failed to install iptables VPC_SYN_LIMIT destination rate limit rule" >&2
+            return 1
+        fi
     fi
 
     # 2. Nftables implementation in raw PREROUTING (priority -300)
     if [ -n "$nft_cmd" ]; then
         local nft_src_rate=${src_rate/s/second}
         local nft_dst_rate=${dst_rate/s/second}
+        # Safe decimal integer arithmetic after validation (Item 1)
         local expire_sec=$(( htable_expire / 1000 ))
         [ "$expire_sec" -le 0 ] && expire_sec=10
+
+        # [P2] Flush dynamic meters so existing elements do not retain stale rate/burst (Item 7)
+        nft_transaction_ignore_errors \
+            "flush set ip $NFT_TABLE syn_src_meter" \
+            "flush set ip $NFT_TABLE syn_dst_meter"
 
         nft_transaction_ignore_errors \
             "add table ip $NFT_TABLE" \
@@ -625,10 +691,17 @@ function tcp_syn_limit_set() {
             "flush chain ip $NFT_TABLE syn-limit" \
             "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return" \
             "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return" \
-            "add rule ip $NFT_TABLE syn-limit tcp dport 179 return" \
-            "add rule ip $NFT_TABLE syn-limit tcp sport 179 return" \
-            "add rule ip $NFT_TABLE syn-limit tcp flags & (syn|ack) == syn update @syn_src_meter { ip saddr limit rate over $nft_src_rate burst $src_burst packets } drop" \
-            "add rule ip $NFT_TABLE syn-limit tcp flags & (syn|ack) == syn update @syn_dst_meter { ip daddr limit rate over $nft_dst_rate burst $dst_burst packets } drop"
+            "add rule ip $NFT_TABLE syn-limit tcp dport 179 return"
+
+        # Propagate error if adding nft rules fails (Item 5)
+        if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(syn\|ack\) == syn update @syn_src_meter \{ ip saddr limit rate over "$nft_src_rate" burst "$src_burst" packets \} drop; then
+            echo "Failed to install nftables syn_src_meter rule" >&2
+            return 1
+        fi
+        if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(syn\|ack\) == syn update @syn_dst_meter \{ ip daddr limit rate over "$nft_dst_rate" burst "$dst_burst" packets \} drop; then
+            echo "Failed to install nftables syn_dst_meter rule" >&2
+            return 1
+        fi
     fi
 }
 

@@ -959,8 +959,10 @@ func TestVpcNatGwDesiredTcpConnLimit(t *testing.T) {
 
 func TestSyncNatGwTcpConnLimit(t *testing.T) {
 	gw := fakeGw("gw")
+	pod := fakeNatGwPod("gw", true)
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
 	})
 	require.NoError(t, err)
 	ctrl := fc.fakeController
@@ -971,10 +973,8 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 		return nil
 	}
 
-	pod := fakeNatGwPod("gw", true)
-
 	// 1. Initial sync programs default (50000, stateful)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, true))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "50000", "stateful"}}, calls)
 
 	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
@@ -985,19 +985,24 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 	// 2. Converged: status matches desired, no re-exec
 	calls = nil
 	gw.Status.TcpConnLimit = ptr.To(50000)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[util.VpcNatTcpConnLimitAnnotation] = "50000"
+	pod.Annotations[util.NatGatewayDataplaneModeAnnotation] = "stateful"
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Empty(t, calls)
 
 	// 3. Dynamic modification: spec changed to 20000
 	gw.Spec.TcpConnLimit = ptr.To(20000)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "20000", "stateful"}}, calls)
 
 	// 4. Disable: spec set to 0
 	calls = nil
 	gw.Status.TcpConnLimit = ptr.To(20000)
 	gw.Spec.TcpConnLimit = ptr.To(0)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "0", "stateful"}}, calls)
 
 	// 5. Stateless mode: pass dataplane mode to script
@@ -1005,14 +1010,55 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 	gw.Status.TcpConnLimit = ptr.To(0)
 	gw.Spec.TcpConnLimit = ptr.To(15000)
 	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "15000", "stateless"}}, calls)
+}
+
+func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
+	gw := fakeGw("gw")
+	gw.Status.TcpConnLimit = ptr.To(10000)
+	gw.Spec.TcpConnLimit = ptr.To(10000)
+
+	newPod := fakeNatGwPod("gw", true)
+	skewPod := fakeNatGwPod("gw-skew", true)
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{newPod, skewPod},
+	})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+
+	var calls [][]string
+	ctrl.execRulesInPod = func(pod *corev1.Pod, operation string, rules []string) error {
+		calls = append(calls, append([]string{operation}, rules...))
+		return nil
+	}
+
+	// Case 1: Replaced pod during init has force=true, must program even though status.tcpConnLimit == desired
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, newPod, true))
+	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateful"}}, calls)
+
+	// Case 2: Dataplane mode change without threshold change triggers convergence
+	calls = nil
+	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, newPod, false))
+	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateless"}}, calls)
+
+	// Case 3: Unsupported older image returns unknown command error -> handled gracefully (Item 9)
+	calls = nil
+	ctrl.execRulesInPod = func(pod *corev1.Pod, operation string, rules []string) error {
+		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
+	}
+	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, skewPod, false))
 }
 
 func TestSyncNatGwSynRateLimit(t *testing.T) {
 	gw := fakeGw("gw")
+	pod := fakeNatGwPod("gw", true)
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
 	})
 	require.NoError(t, err)
 	ctrl := fc.fakeController
@@ -1022,8 +1068,6 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		calls = append(calls, append([]string{operation}, rules...))
 		return nil
 	}
-
-	pod := fakeNatGwPod("gw", true)
 
 	// 1. Default rate limits
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
