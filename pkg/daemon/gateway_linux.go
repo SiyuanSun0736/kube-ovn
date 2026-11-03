@@ -732,6 +732,9 @@ func (c *Controller) setIptables() error {
 		if ipt == nil {
 			continue
 		}
+		if err = c.deleteObsoleteTunnelNotrackRules(ipt, protocol); err != nil {
+			return err
+		}
 
 		var kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet, tunnelMatchSet string
 		var obsoleteRules, iptablesRules []util.IPTableRule
@@ -1298,20 +1301,6 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 		}
 	}
 
-	if c.config != nil {
-		tunnelIface := c.config.GetTunnelIface()
-		if tunnelIface != "" {
-			tunnelMatchSet := "ovn40" + TunnelNodeSet
-			if protocol == kubeovnv1.ProtocolIPv6 {
-				tunnelMatchSet = "ovn60" + TunnelNodeSet
-			}
-			for _, port := range []int{6081, 4789, 8472} {
-				_ = deleteIptablesRule(ipt, util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-i %s -p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, tunnelIface, port, tunnelMatchSet))})
-				_ = deleteIptablesRule(ipt, util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-o %s -p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, tunnelIface, port, tunnelMatchSet))})
-			}
-		}
-	}
-
 	forwardRules, err := ipt.List("filter", "FORWARD")
 	if err != nil {
 		klog.Errorf(`failed to list legacy iptables rule in "FORWARD" chain "filter" table: %v`, err)
@@ -1786,6 +1775,43 @@ func getNatPolicySubnetChainUID(chainName string) string {
 
 func formatIPsetUnPrefix(ipsetName string) string {
 	return ipsetName[len("ovn40"):]
+}
+
+// deleteObsoleteTunnelNotrackRules removes rules created by all previous NOTRACK implementations.
+func (c *Controller) deleteObsoleteTunnelNotrackRules(ipt *iptables.IPTables, protocol string) error {
+	for _, chain := range []string{Prerouting, Output} {
+		rules, err := ipt.List(RAW, chain)
+		if err != nil {
+			return fmt.Errorf("failed to list raw %s rules: %w", chain, err)
+		}
+		for _, rule := range rules {
+			fields := util.DoubleQuotedFields(rule)
+			if len(fields) < 3 || !isTunnelNotrackRule(fields) {
+				continue
+			}
+			if err := ipt.Delete(RAW, chain, fields[2:]...); err != nil {
+				return fmt.Errorf("failed to delete obsolete %s %s NOTRACK rule: %w", protocol, chain, err)
+			}
+		}
+	}
+	return nil
+}
+
+func isTunnelNotrackRule(fields []string) bool {
+	var udp, notrack, tunnelPort bool
+	for i, field := range fields {
+		switch field {
+		case "-p":
+			udp = i+1 < len(fields) && fields[i+1] == "udp"
+		case "--dport":
+			if i+1 < len(fields) {
+				tunnelPort = slices.Contains([]string{"6081", "4789", "8472"}, fields[i+1])
+			}
+		case "-j":
+			notrack = i+1 < len(fields) && fields[i+1] == "NOTRACK"
+		}
+	}
+	return udp && tunnelPort && notrack
 }
 
 // getTunnelIptablesRules generates active NOTRACK rules and obsolete rules for overlay tunnels.
