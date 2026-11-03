@@ -35,8 +35,7 @@ type TCManager interface {
 	Close() error
 }
 
-// NewTCManager 根据当前 Speaker 配置构造对应平台的 TCManager 实例
-// 在 Linux 平台下返回具备实际 Netlink 挂载与 BPF Syscall 能力的实例；在非 Linux 平台下返回空实现供跨平台编译
+// NewTCManager 根据当前 Speaker 配置构造 TCManager 实例
 func NewTCManager(cfg *Configuration) TCManager {
 	return newPlatformTCManager(cfg)
 }
