@@ -489,20 +489,23 @@ func ListQosQueueIDs() (map[string]string, error) {
 	return result, nil
 }
 
-// FindTunnelRemoteIPs finds all remote_ip values of tunnel interfaces of the given type
-func FindTunnelRemoteIPs(tunnelType string) ([]string, error) {
-	output, err := Exec("--format=csv", "--no-headings", "--columns=options", "find", "interface", fmt.Sprintf("type=%s", tunnelType))
-	if err != nil {
-		return nil, err
-	}
-
+func parseTunnelRemoteIPs(output string) []string {
 	var ips []string
-	re := regexp.MustCompile(`remote_ip="?([a-fA-F0-9:.]+)"?`)
+	re := regexp.MustCompile(`remote_ip=["']*([a-fA-F0-9:.]+)`)
 	matches := re.FindAllStringSubmatch(output, -1)
 	for _, m := range matches {
 		if len(m) > 1 && net.ParseIP(m[1]) != nil {
 			ips = append(ips, m[1])
 		}
 	}
-	return ips, nil
+	return ips
+}
+
+// FindTunnelRemoteIPs finds all remote_ip values of tunnel interfaces of the given type
+func FindTunnelRemoteIPs(tunnelType string) ([]string, error) {
+	output, err := Exec("--data=bare", "--format=csv", "--no-heading", "--columns=options", "find", "interface", fmt.Sprintf("type=%s", tunnelType))
+	if err != nil {
+		return nil, err
+	}
+	return parseTunnelRemoteIPs(output), nil
 }

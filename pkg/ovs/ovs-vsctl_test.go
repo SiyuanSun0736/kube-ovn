@@ -2,6 +2,7 @@ package ovs
 
 import (
 	"fmt"
+	"testing"
 
 	"github.com/stretchr/testify/require"
 )
@@ -243,4 +244,47 @@ func (suite *OvnClientTestSuite) testListQosQueueIDs() {
 	// ovs-vsctl cmd is not available in the test environment
 	require.Error(t, err)
 	require.Empty(t, ret)
+}
+
+func TestParseTunnelRemoteIPs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		output   string
+		expected []string
+	}{
+		{
+			name:     "bare format",
+			output:   "csum=true key=flow local_ip=10.210.10.24 remote_ip=10.210.10.25\ncsum=true key=flow local_ip=10.210.10.24 remote_ip=10.210.10.26\n",
+			expected: []string{"10.210.10.25", "10.210.10.26"},
+		},
+		{
+			name:     "csv escaped quotes format",
+			output:   "\"{csum=\"\"true\"\", key=flow, local_ip=\"\"10.210.10.24\"\", remote_ip=\"\"10.210.10.25\"\"}\"\n\"{csum=\"\"true\"\", key=flow, local_ip=\"\"10.210.10.24\"\", remote_ip=\"\"10.210.10.26\"\"}\"\n",
+			expected: []string{"10.210.10.25", "10.210.10.26"},
+		},
+		{
+			name:     "standard quotes format",
+			output:   "{csum=\"true\", key=flow, local_ip=\"10.210.10.24\", remote_ip=\"10.210.10.25\"}\n",
+			expected: []string{"10.210.10.25"},
+		},
+		{
+			name:     "ipv6 format",
+			output:   "csum=true key=flow local_ip=fd00::24 remote_ip=fd00::25\n",
+			expected: []string{"fd00::25"},
+		},
+		{
+			name:     "invalid remote_ip",
+			output:   "key=flow remote_ip=flow remote_ip=\"\"\n",
+			expected: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ips := parseTunnelRemoteIPs(tc.output)
+			require.Equal(t, tc.expected, ips)
+		})
+	}
 }
