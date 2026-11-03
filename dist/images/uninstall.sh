@@ -28,7 +28,7 @@ iptables -t filter -D FORWARD -m set --match-set ovn40services src -j ACCEPT
 iptables -t filter -D OUTPUT -p udp -m udp --dport 6081 -j MARK --set-xmark 0x0
 iptables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
-  for cmd in iptables iptables-nft; do
+  for cmd in iptables iptables-legacy iptables-nft; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       for chain in PREROUTING OUTPUT; do
         while "${cmd}" -w 5 -t raw -S "${chain}" 2>/dev/null | grep -E -- "-p udp .*--dport ${port} .*-j NOTRACK" | head -n 1 | sed 's/^-A/-D/' | xargs "${cmd}" -w 5 -t raw 2>/dev/null; do
@@ -82,7 +82,7 @@ ip6tables -t filter -D FORWARD -m set --match-set ovn60services src -j ACCEPT
 ip6tables -t filter -D OUTPUT -p udp -m udp --dport 6081 -j MARK --set-xmark 0x0
 ip6tables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
-  for cmd in ip6tables ip6tables-nft; do
+  for cmd in ip6tables ip6tables-legacy ip6tables-nft; do
     if command -v "${cmd}" >/dev/null 2>&1; then
       for chain in PREROUTING OUTPUT; do
         while "${cmd}" -w 5 -t raw -S "${chain}" 2>/dev/null | grep -E -- "-p udp .*--dport ${port} .*-j NOTRACK" | head -n 1 | sed 's/^-A/-D/' | xargs "${cmd}" -w 5 -t raw 2>/dev/null; do
