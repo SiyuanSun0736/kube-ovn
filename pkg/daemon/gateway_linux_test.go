@@ -93,4 +93,20 @@ func TestGetTunnelIptablesRules(t *testing.T) {
 		require.Empty(t, active)
 		require.NotEmpty(t, obsolete)
 	})
+
+	t.Run("geneve with ipv6 match-set", func(t *testing.T) {
+		cfg := &Configuration{
+			NetworkType:         util.NetworkTypeGeneve,
+			EnableTunnelNotrack: true,
+		}
+		cfg.SetTunnelIface("bond0")
+
+		c := &Controller{config: cfg}
+		v6MatchSet := "ovn60tunnel-nodes"
+		active, _ := c.getTunnelIptablesRules(v6MatchSet)
+
+		require.Len(t, active, 2)
+		require.Equal(t, strings.Fields("-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-nodes src -j NOTRACK"), active[0].Rule)
+		require.Equal(t, strings.Fields("-o bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-nodes dst -j NOTRACK"), active[1].Rule)
+	})
 }
