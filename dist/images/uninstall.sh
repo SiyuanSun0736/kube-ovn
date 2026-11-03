@@ -30,8 +30,8 @@ iptables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
   for cmd in iptables iptables-nft; do
     if command -v "${cmd}" >/dev/null 2>&1; then
-      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
-      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -m set --match-set ovn40other-node src -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -m set --match-set ovn40other-node dst -j NOTRACK 2>/dev/null || true
     fi
   done
 done
@@ -80,8 +80,8 @@ ip6tables -t filter -D OUTPUT -p udp -m udp --dport 4789 -j MARK --set-xmark 0x0
 for port in 6081 4789 8472; do
   for cmd in ip6tables ip6tables-nft; do
     if command -v "${cmd}" >/dev/null 2>&1; then
-      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
-      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D PREROUTING -p udp -m udp --dport "${port}" -m set --match-set ovn60other-node src -j NOTRACK 2>/dev/null || true
+      "${cmd}" -w 5 -t raw -D OUTPUT -p udp -m udp --dport "${port}" -m set --match-set ovn60other-node dst -j NOTRACK 2>/dev/null || true
     fi
   done
 done

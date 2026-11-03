@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 func TestGetCidrByProtocol(t *testing.T) {
@@ -58,4 +59,54 @@ func TestGetCidrByProtocol(t *testing.T) {
 			require.Equal(t, c.expetced, got)
 		})
 	}
+}
+
+func TestGetTunnelPort(t *testing.T) {
+	cases := []struct {
+		name        string
+		networkType string
+		expected    int
+	}{
+		{
+			name:        "geneve network type",
+			networkType: util.NetworkTypeGeneve,
+			expected:    6081,
+		},
+		{
+			name:        "vxlan network type",
+			networkType: util.NetworkTypeVxlan,
+			expected:    4789,
+		},
+		{
+			name:        "vlan network type",
+			networkType: util.NetworkTypeVlan,
+			expected:    0,
+		},
+		{
+			name:        "stt network type",
+			networkType: util.NetworkTypeStt,
+			expected:    0,
+		},
+		{
+			name:        "empty network type defaults to 0",
+			networkType: "",
+			expected:    0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Controller{
+				config: &Configuration{
+					NetworkType: tc.networkType,
+				},
+			}
+			require.Equal(t, tc.expected, c.getTunnelPort())
+		})
+	}
+
+	t.Run("nil config returns 0", func(t *testing.T) {
+		c := &Controller{}
+		require.Equal(t, 0, c.getTunnelPort())
+	})
 }

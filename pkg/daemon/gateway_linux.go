@@ -665,13 +665,6 @@ func (c *Controller) setIptables() error {
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 			// Drop invalid rst
 			{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(`-p tcp -m set --match-set ovn40subnets src -m tcp --tcp-flags RST RST -m state --state INVALID -j DROP`)},
 		}
@@ -712,13 +705,6 @@ func (c *Controller) setIptables() error {
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 			// Drop invalid rst
 			{Table: MANGLE, Chain: OvnPostrouting, Rule: strings.Fields(`-p tcp -m set --match-set ovn60subnets src -m tcp --tcp-flags RST RST -m state --state INVALID -j DROP`)},
 		}
@@ -739,11 +725,27 @@ func (c *Controller) setIptables() error {
 		var kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet string
 		var obsoleteRules, iptablesRules []util.IPTableRule
 		if protocol == kubeovnv1.ProtocolIPv4 {
-			iptablesRules = v4Rules
+			iptablesRules = slices.Clone(v4Rules)
 			matchset, svcMatchset, nodeMatchSet = "ovn40subnets", "ovn40services", "ovn40"+OtherNodeSet
 		} else {
-			iptablesRules = v6Rules
+			iptablesRules = slices.Clone(v6Rules)
 			kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet = "6-", "ovn60subnets", "ovn60services", "ovn60"+OtherNodeSet
+		}
+
+		tunnelPort := c.getTunnelPort()
+		if tunnelPort != 0 {
+			iptablesRules = append(iptablesRules,
+				util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, tunnelPort, nodeMatchSet))},
+				util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, tunnelPort, nodeMatchSet))},
+			)
+		}
+		for _, port := range []int{6081, 4789, 8472} {
+			if port != tunnelPort {
+				obsoleteRules = append(obsoleteRules,
+					util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, port, nodeMatchSet))},
+					util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, port, nodeMatchSet))},
+				)
+			}
 		}
 
 		ipset := fmt.Sprintf("KUBE-%sCLUSTER-IP", kubeProxyIpsetProtocol)
@@ -1234,13 +1236,6 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 		}
 		v6ObsoleteRules = []util.IPTableRule{
 			{Table: NAT, Chain: Postrouting, Rule: strings.Fields(`-m mark --mark 0x40000/0x40000 -j MASQUERADE`)},
@@ -1275,13 +1270,6 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 			// Output unmark to bypass kernel nat checksum issue https://github.com/flannel-io/flannel/issues/1279
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 6081 -j MARK --set-xmark 0x0`)},
 			{Table: "filter", Chain: "OUTPUT", Rule: strings.Fields(`-p udp -m udp --dport 4789 -j MARK --set-xmark 0x0`)},
-			// Bypass conntrack for cross-node tunnel traffic (Geneve 6081 / VXLAN 4789, 8472)
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Prerouting, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 6081 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 4789 -j NOTRACK`)},
-			{Table: RAW, Chain: Output, Rule: strings.Fields(`-p udp -m udp --dport 8472 -j NOTRACK`)},
 		}
 	)
 
