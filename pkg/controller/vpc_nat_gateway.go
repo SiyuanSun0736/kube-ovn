@@ -65,6 +65,8 @@ const (
 	// Recorded instead when the Pod runs a gateway script that has no hairpin-snat-set: the
 	// field cannot be honoured until that Pod is replaced by the gateway image that has it.
 	hairpinSNATUnsupported = "unsupported"
+	connlimitUnsupported   = "unsupported"
+	synLimitUnsupported    = "unsupported"
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
@@ -396,23 +398,86 @@ func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	return "stateful"
 }
 
-func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
-	desiredLimit := c.getVpcNatGwDesiredTcpConnLimit(gw)
-	if gw.Status.TcpConnLimit != nil && *gw.Status.TcpConnLimit == desiredLimit {
+func isUnsupportedCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown command") ||
+		strings.Contains(msg, "unknown subcommand") ||
+		strings.Contains(msg, "unrecognized option") ||
+		strings.Contains(msg, "invalid command")
+}
+
+func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
+	// If the Pod was already marked as running an image without tcp-connlimit-set, check whether to skip
+	if pod.Annotations != nil && pod.Annotations[util.VpcNatTcpConnLimitAnnotation] == connlimitUnsupported {
+		if gw.Spec.TcpConnLimit == nil && (gw.Annotations == nil || gw.Annotations[util.VpcNatTcpConnLimitAnnotation] == "") {
+			return nil
+		}
+		klog.Warningf("nat gw %s pod runs an image without %s: custom limit cannot take effect until pod is replaced", gw.Name, natGwTcpConnLimitSet)
 		return nil
 	}
+
+	desiredLimit := c.getVpcNatGwDesiredTcpConnLimit(gw)
 	dataplaneMode := c.getNatGwDataplaneMode(gw)
+
+	// Check convergence decision (Item 3):
+	// A new/restarted Pod (or force=true during init) must be programmed.
+	// Normal convergence checks that:
+	// 1. Status tcpConnLimit matches desiredLimit
+	// 2. Applied dataplaneMode on this Pod matches current dataplaneMode
+	// 3. Applied connlimit on this Pod matches desiredLimit
+	appliedMode := ""
+	appliedLimit := ""
+	if pod.Annotations != nil {
+		appliedMode = pod.Annotations[util.NatGatewayDataplaneModeAnnotation]
+		appliedLimit = pod.Annotations[util.VpcNatTcpConnLimitAnnotation]
+	}
+
+	if !force && gw.Status.TcpConnLimit != nil && *gw.Status.TcpConnLimit == desiredLimit &&
+		appliedMode == dataplaneMode && appliedLimit == strconv.Itoa(desiredLimit) {
+		return nil
+	}
+
 	args := []string{strconv.Itoa(desiredLimit), dataplaneMode}
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTcpConnLimitSet, args); err != nil {
+		if isUnsupportedCommandError(err) {
+			klog.Warningf("nat gw %s runs a script without %s: connlimit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTcpConnLimitSet, err)
+			_ = util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
+				util.VpcNatTcpConnLimitAnnotation: connlimitUnsupported,
+			})
+			return nil
+		}
 		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", desiredLimit, gw.Name, err)
 		return err
 	}
+
+	patch := util.KVPatch{
+		util.VpcNatTcpConnLimitAnnotation:       strconv.Itoa(desiredLimit),
+		util.NatGatewayDataplaneModeAnnotation: dataplaneMode,
+	}
+	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
+		klog.Warningf("failed to patch pod %s/%s annotations for tcp connlimit: %v", pod.Namespace, pod.Name, err)
+	}
+
 	return c.patchNatGwTcpConnLimitStatus(gw.Name, desiredLimit)
 }
 
 func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
+	if pod.Annotations != nil && pod.Annotations[util.VpcNatSynRateLimitAnnotation] == synLimitUnsupported {
+		return nil
+	}
+
 	args := c.getVpcNatGwSynRateLimitArgs(gw)
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTcpSynLimitSet, args); err != nil {
+		if isUnsupportedCommandError(err) {
+			klog.Warningf("nat gw %s runs a script without %s: SYN rate limit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTcpSynLimitSet, err)
+			_ = util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
+				util.VpcNatSynRateLimitAnnotation: synLimitUnsupported,
+			})
+			return nil
+		}
 		klog.Errorf("failed to set tcp syn limit for nat gw %s, %v", gw.Name, err)
 		return err
 	}
@@ -595,7 +660,7 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 			if err = c.syncNatGwHairpinSNAT(gw, pod); err != nil {
 				return err
 			}
-			if err = c.syncNatGwTcpConnLimit(gw, pod); err != nil {
+			if err = c.syncNatGwTcpConnLimit(gw, pod, false); err != nil {
 				return err
 			}
 			if err = c.syncNatGwSynRateLimit(gw, pod); err != nil {
@@ -745,7 +810,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return err
 	}
 
-	if err = c.syncNatGwTcpConnLimit(gw, pod); err != nil {
+	if err = c.syncNatGwTcpConnLimit(gw, pod, true); err != nil {
 		klog.Warningf("failed to set tcp connlimit during init for nat gw %s: %v", key, err)
 	}
 	if err = c.syncNatGwSynRateLimit(gw, pod); err != nil {
@@ -1168,7 +1233,7 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 			klog.Infof("NAT gateway command failed - stdout: %v", stdOutput)
 		}
 		klog.Errorf("NAT gateway command execution error: %v", err)
-		return err
+		return fmt.Errorf("%w: %s (stdout: %s)", err, strings.TrimSpace(errOutput), strings.TrimSpace(stdOutput))
 	}
 
 	if len(stdOutput) > 0 {
@@ -1461,7 +1526,7 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 							Lifecycle: &corev1.Lifecycle{
 								PostStart: &corev1.LifecycleHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1 && sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true"},
+										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1 && (sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true)"},
 									},
 								},
 							},
