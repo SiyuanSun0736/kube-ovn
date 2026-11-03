@@ -231,23 +231,12 @@ const (
 
 	DefaultMTU         = 1500
 
-	DefaultNatGwTcpConnLimit1C = 10000
-	DefaultNatGwTcpConnLimit2C = 20000
-	DefaultNatGwSynSrcRate     = "500/s"
-	DefaultNatGwSynSrcBurst    = "1000"
-	DefaultNatGwSynDstRate1C   = "20000/s"
-	DefaultNatGwSynDstRate2C   = "30000/s"
-	DefaultNatGwSynDstRate4C   = "50000/s"
-	DefaultNatGwSynDstRate8C   = "80000/s"
-	DefaultNatGwSynDstRate16C  = "150000/s"
-	DefaultNatGwSynDstRate32C  = "200000/s"
-	DefaultNatGwSynDstBurst1C  = "40000"
-	DefaultNatGwSynDstBurst2C  = "60000"
-	DefaultNatGwSynDstBurst4C  = "100000"
-	DefaultNatGwSynDstBurst8C  = "160000"
-	DefaultNatGwSynDstBurst16C = "300000"
-	DefaultNatGwSynDstBurst32C = "400000"
-	DefaultNatGwSynHtableMax   = "262144"
+	DefaultNatGwTcpConnLimit    = 50000
+	DefaultNatGwSynSrcRate      = "500/s"
+	DefaultNatGwSynSrcBurst     = "1000"
+	DefaultNatGwSynDstRate      = "20000/s"
+	DefaultNatGwSynDstBurst     = "40000"
+	DefaultNatGwSynHtableMax    = "262144"
 	DefaultNatGwSynDstHtableMax = "2048"
 	DefaultNatGwSynHtableExpire = "10000"
 	GeneveHeaderLength = 100
