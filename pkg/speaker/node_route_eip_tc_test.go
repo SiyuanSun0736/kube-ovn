@@ -61,7 +61,7 @@ func (m *trackingTCManager) Close() error {
 	return m.closeErr
 }
 
-func TestTCCloseFailureDoesNotBlockReconciliation(t *testing.T) {
+func TestTCCloseFailureRetriesUntilSuccess(t *testing.T) {
 	mgr := &trackingTCManager{closeErr: errors.New("permission denied")}
 	services := &trackingServicesLister{}
 	nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
@@ -74,8 +74,14 @@ func TestTCCloseFailureDoesNotBlockReconciliation(t *testing.T) {
 		servicesLister:   services,
 		nodesLister:      listerv1.NewNodeLister(nodes),
 	}
+	// 第一次 Reconcile：Close 失败，tcCleanupPending 必须保留为 true 以便下次重试，同时业务对账不被中断
 	c.Reconcile()
 	require.True(t, mgr.closed, "tcManager.Close must be called")
-	require.False(t, c.tcCleanupPending, "tcCleanupPending must be cleared even on Close failure")
+	require.True(t, c.tcCleanupPending, "tcCleanupPending must be retained on Close failure for retry")
 	require.True(t, services.listed, "Reconciliation must proceed even if TC cleanup fails")
+
+	// 第二次 Reconcile：故障恢复，Close 成功，tcCleanupPending 清除为 false
+	mgr.closeErr = nil
+	c.Reconcile()
+	require.False(t, c.tcCleanupPending, "tcCleanupPending must be cleared when Close succeeds")
 }

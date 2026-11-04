@@ -37,5 +37,5 @@ type TCManager interface {
 
 // NewTCManager 根据当前 Speaker 配置构造 TCManager 实例
 func NewTCManager(cfg *Configuration) TCManager {
-	return newPlatformTCManager(cfg)
+	return newTCManager(cfg)
 }

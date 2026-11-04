@@ -44,7 +44,7 @@ type linuxTCManager struct {
 	closed     bool
 }
 
-func newPlatformTCManager(cfg *Configuration) TCManager { return &linuxTCManager{cfg: cfg} }
+func newTCManager(cfg *Configuration) TCManager { return &linuxTCManager{cfg: cfg} }
 
 func ensureClsactQdisc(link netlink.Link) error {
 	qdisc := &netlink.GenericQdisc{QdiscAttrs: netlink.QdiscAttrs{
@@ -381,13 +381,13 @@ func removePin(path string) error {
 	return nil
 }
 
-// Close 会在功能停用时主动清理前代进程遗留的 TC 挂载。仅关闭用户态 FD 绝不会自动卸载内核 TC 程序。
+// Close 会在功能停用时尽力而为（Best-Effort）清理遗留的 TC 挂载、BPF Collection 与 Pinned Map，并聚合返回所有错误。
 func (m *linuxTCManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.closed = true
+	var errs []error
 	if err := m.cleanupFilters(""); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 	if m.collection != nil {
 		m.collection.Close()
@@ -396,5 +396,14 @@ func (m *linuxTCManager) Close() error {
 		m.v6Map = nil
 	}
 	v4, v6 := m.mapPaths()
-	return errors.Join(removePin(v4), removePin(v6))
+	if err := removePin(v4); err != nil {
+		errs = append(errs, err)
+	}
+	if err := removePin(v6); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		m.closed = true
+	}
+	return errors.Join(errs...)
 }

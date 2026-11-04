@@ -37,7 +37,7 @@ func newTestTCMaps(t *testing.T) (*linuxTCManager, *ebpf.Map, *ebpf.Map) {
 	v6, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 16, ValueSize: 32, MaxEntries: 64})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, v6.Close()) })
-	m := newPlatformTCManager(&Configuration{EnableTcBpfRedirect: true}).(*linuxTCManager)
+	m := newTCManager(&Configuration{EnableTcBpfRedirect: true}).(*linuxTCManager)
 	m.v4Map, m.v6Map = v4, v6
 	return m, v4, v6
 }
