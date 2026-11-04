@@ -205,11 +205,8 @@ func (m *linuxTCManager) priority() uint16 {
 
 // 严格仅匹配本程序的 TC 过滤器（包括原始 tc loader 生成的名字）。
 // 绝不删除与其他 CNI 共享的整个 priority 规则或 clsact qdisc 队列。
-// 同时匹配当前配置的 priority 以及历史默认 priority 1，确保升级平滑过渡与清理。
 func (m *linuxTCManager) isEIPFilter(filter *netlink.BpfFilter) bool {
-	prio := m.priority()
-	matchPriority := filter.Priority == prio || filter.Priority == 1
-	return filter.Handle == 1 && matchPriority &&
+	return filter.Handle == 1 && filter.Priority == m.priority() &&
 		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
 }
 

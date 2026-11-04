@@ -16,7 +16,7 @@ type TargetInfo struct {
 
 // TCManager 接口定义了宿主机物理网卡 eBPF TC 分类器生命周期管理与 BPF Map 路由状态同步能力
 type TCManager interface {
-	// Attach 在指定的物理网卡上附加 clsact qdisc 并在 Ingress 钩子上挂载优先级为 1 的 eBPF TC 分类器
+	// Attach 在指定的物理网卡上附加 clsact qdisc 并在 Ingress 钩子上挂载配置优先级的 eBPF TC 分类器
 	Attach(linkName string) error
 
 	// Detach 从指定网卡上卸载 eBPF TC 分类器
