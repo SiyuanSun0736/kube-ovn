@@ -101,7 +101,7 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 			}
 			routes, err := netlink.RouteGet(podIP)
 			if err != nil || len(routes) == 0 {
-				return TargetInfo{}, fmt.Errorf("failed to get route for pod IP %s: %v", podIP, err)
+				return TargetInfo{}, fmt.Errorf("failed to get route for pod IP %s: %w", podIP, err)
 			}
 			// 拒绝经由外部网关的路由（例如默认路由或间接路由）。
 			// 本地 Pod 的直连 veth 路由必须是直连路由，不能携带下一跳网关。
