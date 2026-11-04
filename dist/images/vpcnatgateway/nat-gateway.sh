@@ -57,8 +57,8 @@ QOS_DEBUG=${QOS_DEBUG:-"false"}
 # installed, the default must stay, because the nft share-DNAT maps and the hairpin/SNAT rules
 # below live in the same nftables backend -- pointing the iptables rules at the legacy backend
 # would run the gateway as a split data plane.
-iptables_cmd=$(which iptables)
-iptables_save_cmd=$(which iptables-save)
+iptables_cmd=$(which iptables 2>/dev/null || true)
+iptables_save_cmd=$(which iptables-save 2>/dev/null || true)
 nft_cmd=$(which nft 2>/dev/null || true)
 NFT_TABLE=${NFT_TABLE:-"kube-ovn"}
 
@@ -481,11 +481,36 @@ function is_stateless_active() {
     fi
     # Check if full-link TCP notrack is actively programmed in raw PREROUTING table.
     # We must match full TCP bypass or broad notrack in PREROUTING, not narrow port/protocol exemptions (like UDP DNS).
-    if [ -n "$nft_cmd" ] && $nft_cmd list chain ip "$NFT_TABLE" notrack 2>/dev/null | grep -E -q "notrack"; then
-        return 0
+    if [ -n "$nft_cmd" ]; then
+        # Exclude table/chain/hook declaration lines to avoid matching chain name "notrack"
+        local nft_notrack
+        nft_notrack=$($nft_cmd list chain ip "$NFT_TABLE" notrack 2>/dev/null | grep -E -v '^[[:space:]]*(table|chain|type filter hook|\{|\})' | grep -E -- '\bnotrack\b')
+        if [ -n "$nft_notrack" ]; then
+            while IFS= read -r rule; do
+                [ -z "$rule" ] && continue
+                if echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+tcp\b'; then
+                    return 0
+                fi
+                if ! echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+[a-zA-Z0-9_-]+'; then
+                    return 0
+                fi
+            done <<< "$nft_notrack"
+        fi
     fi
-    if [ -n "$iptables_save_cmd" ] && $iptables_save_cmd -t raw 2>/dev/null | grep -E -q -- "-A PREROUTING .*-p tcp .*-j (NOTRACK|CT --notrack)|-A PREROUTING .*-j (NOTRACK|CT --notrack)"; then
-        return 0
+    if [ -n "$iptables_save_cmd" ]; then
+        local raw_notrack
+        raw_notrack=$($iptables_save_cmd -t raw 2>/dev/null | grep -E -- '^-A PREROUTING .*-j (NOTRACK|CT --notrack)')
+        if [ -n "$raw_notrack" ]; then
+            while IFS= read -r rule; do
+                [ -z "$rule" ] && continue
+                if echo "$rule" | grep -E -q -- '-p tcp\b'; then
+                    return 0
+                fi
+                if ! echo "$rule" | grep -E -q -- '-p [a-zA-Z0-9_-]+'; then
+                    return 0
+                fi
+            done <<< "$raw_notrack"
+        fi
     fi
     return 1
 }
@@ -583,6 +608,19 @@ function tcp_connlimit_set() {
     fi
 }
 
+function to_nft_rate() {
+    local val=$1
+    local num="${val%/*}"
+    local unit="${val#*/}"
+    case "$unit" in
+        s|sec|second) echo "${num}/second" ;;
+        m|min|minute) echo "${num}/minute" ;;
+        h|hour)       echo "${num}/hour" ;;
+        d|day)        echo "${num}/day" ;;
+        *) return 1 ;;
+    esac
+}
+
 function tcp_syn_limit_set() {
     local src_rate=${1:-${SYN_SRC_RATE:-"500/s"}}
     local src_burst=${2:-${SYN_SRC_BURST:-"1000"}}
@@ -599,7 +637,7 @@ function tcp_syn_limit_set() {
     [[ "$dst_rate" =~ ^[0-9]+$ ]] && dst_rate="${dst_rate}/s"
 
     # [P1] Validate every parameter against safe numeric/rate grammar (Items 1 & 2)
-    local rate_pattern="^[0-9]+/(s|sec|second|m|min|minute|h|hour)$"
+    local rate_pattern="^[0-9]+/(s|sec|second|m|min|minute|h|hour|d|day)$"
     local num_pattern="^[0-9]+$"
 
     if ! [[ "$src_rate" =~ $rate_pattern ]]; then
@@ -608,6 +646,16 @@ function tcp_syn_limit_set() {
     fi
     if ! [[ "$dst_rate" =~ $rate_pattern ]]; then
         echo "Error: invalid SYN dst_rate '$dst_rate'" >&2
+        return 1
+    fi
+    local nft_src_rate
+    local nft_dst_rate
+    if ! nft_src_rate=$(to_nft_rate "$src_rate") || [ -z "$nft_src_rate" ]; then
+        echo "Error: invalid SYN src_rate unit in '$src_rate'" >&2
+        return 1
+    fi
+    if ! nft_dst_rate=$(to_nft_rate "$dst_rate") || [ -z "$nft_dst_rate" ]; then
+        echo "Error: invalid SYN dst_rate unit in '$dst_rate'" >&2
         return 1
     fi
     if ! [[ "$src_burst" =~ $num_pattern ]] || [ "$src_burst" -le 0 ]; then
@@ -672,8 +720,6 @@ function tcp_syn_limit_set() {
 
     # 2. Nftables implementation in raw PREROUTING (priority -300)
     if [ -n "$nft_cmd" ]; then
-        local nft_src_rate=${src_rate/s/second}
-        local nft_dst_rate=${dst_rate/s/second}
         # Safe decimal integer arithmetic after validation (Item 1)
         local expire_sec=$(( htable_expire / 1000 ))
         [ "$expire_sec" -le 0 ] && expire_sec=10
