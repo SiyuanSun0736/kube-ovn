@@ -21,8 +21,8 @@ type failingTCManager struct {
 	syncErr   error
 }
 
-func (m *failingTCManager) Attach(string) error                  { return m.attachErr }
-func (m *failingTCManager) SyncEIPs(map[string]TargetInfo) error { return m.syncErr }
+func (m *failingTCManager) Attach(string) error                              { return m.attachErr }
+func (m *failingTCManager) SyncEIPs(map[string]TargetInfo, ...string) error { return m.syncErr }
 
 type trackingServicesLister struct {
 	listerv1.ServiceLister

@@ -192,6 +192,33 @@ func TestTCSyncPreservesExpectedAndCounters(t *testing.T) {
 	require.ErrorIs(t, v4.Lookup(ip.To4(), &value), ebpf.ErrKeyNotExist)
 }
 
+func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
+	m, v4, _ := newTestTCMaps(t)
+	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-ret-%d", time.Now().UnixNano()%100000)}}
+	require.NoError(t, netlink.LinkAdd(dummy))
+	t.Cleanup(func() { _ = netlink.LinkDel(dummy) })
+
+	ipRetain := net.ParseIP("192.0.2.20")
+	ipStale := net.ParseIP("192.0.2.30")
+
+	// 1. 预先注入两个 EIP 条目
+	require.NoError(t, m.AddEIP(ipRetain, TargetInfo{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
+	require.NoError(t, m.AddEIP(ipStale, TargetInfo{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 2}}))
+
+	// 2. 模拟全量 Reconcile：
+	// expected 为空（假设两个 EIP 都未能解析出最新目标）
+	// 但 ipRetain 属于本地活跃 Pod 暂时抖动（传入 retainedIPs）
+	// ipStale 则已彻底删除（未传入 retainedIPs）
+	require.NoError(t, m.SyncEIPs(map[string]TargetInfo{}, ipRetain.String()))
+
+	// 3. 验证声明保留的 ipRetain 依然稳稳留在 BPF Map 中
+	var val bpfEipTarget
+	require.NoError(t, v4.Lookup(ipRetain.To4(), &val), "活跃声明保留的 EIP 必须留在 Map 中不被误清空")
+
+	// 4. 验证未声明保留的 ipStale 被干净清理
+	require.ErrorIs(t, v4.Lookup(ipStale.To4(), &val), ebpf.ErrKeyNotExist, "不再期望存在的 EIP 必须被 prune 清理")
+}
+
 func TestTCMacvlanDelivery(t *testing.T) {
 	pin := testTCPinPath(t)
 	run := func(command string) {

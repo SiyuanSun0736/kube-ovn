@@ -41,6 +41,8 @@ type linuxTCManager struct {
 	collection *ebpf.Collection
 	v4Map      *ebpf.Map
 	v6Map      *ebpf.Map
+	progID     uint32
+	progTag    string
 	closed     bool
 }
 
@@ -178,6 +180,13 @@ func (m *linuxTCManager) load() error {
 	}
 	m.collection = coll
 	m.v4Map, m.v6Map = coll.Maps[tcEIPv4MapName], coll.Maps[tcEIPv6MapName]
+	prog := coll.Programs["tc_eip_ingress"]
+	if info, err := prog.Info(); err == nil {
+		if id, ok := info.ID(); ok {
+			m.progID = uint32(id)
+		}
+		m.progTag = info.Tag
+	}
 	return nil
 }
 
@@ -190,12 +199,31 @@ func (m *linuxTCManager) priority() uint16 {
 	return defaultTcBpfPriority
 }
 
-// 严格仅匹配本程序的 TC 过滤器（包括原始 tc loader 生成的名字）。
-// 绝不删除与其他 CNI 共享的整个 priority 规则或 clsact qdisc 队列。
-// 基于 Handle=1 与唯一 Filter 名称识别，解耦 priority 以支持跨 priority 升级迁移与统一清理。
+// 严格仅匹配本程序的 TC 过滤器。
+// 基于 Filter 类型、Ingress parent、Handle=1、Protocol=ALL、DirectAction 快速转发通道
+// 以及 BPF Program ID / BPF 指令 Tag / 专属名称等多维特征进行精准交叉核验，
+// 绝不误删与其他 CNI (如 Cilium/Calico/QoS) 共享的规则。
 func (m *linuxTCManager) isEIPFilter(filter *netlink.BpfFilter) bool {
-	return filter != nil && filter.Handle == 1 &&
-		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
+	if filter == nil {
+		return false
+	}
+	attrs := filter.Attrs()
+	if attrs == nil || attrs.Parent != netlink.HANDLE_MIN_INGRESS || attrs.Handle != 1 || attrs.Protocol != unix.ETH_P_ALL {
+		return false
+	}
+	if !filter.DirectAction {
+		return false
+	}
+	// 强指纹 1：若当前加载了 BPF 实例，且程序运行时内核 ID 相同
+	if m.progID > 0 && filter.Id == int(m.progID) {
+		return true
+	}
+	// 强指纹 2：若 BPF 字节码指令 SHA Tag 匹配当前编译产物
+	if m.progTag != "" && filter.Tag != "" && strings.EqualFold(filter.Tag, m.progTag) {
+		return true
+	}
+	// 强指纹 3：专属 Filter 唯一名称标识
+	return filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]"
 }
 
 func (m *linuxTCManager) cleanupFilters(linkName string) error {
@@ -315,13 +343,13 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 	return err
 }
 
-func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo) error {
+func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo, retainedIPs ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-	wanted := make(map[string]bool, len(expected))
+	wanted := make(map[string]bool, len(expected)+len(retainedIPs))
 	var errs []error
 	for address, info := range expected {
 		ip := net.ParseIP(address)
@@ -336,6 +364,33 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo) error {
 		}
 		wanted[string(key)] = true
 	}
+
+	// 声明式保留逻辑：处理属于当前节点活跃范围、仅因 Pod 元数据短暂就绪延迟而需保留存量映射的 EIP
+	for _, address := range retainedIPs {
+		ip := net.ParseIP(address)
+		if ip == nil {
+			continue
+		}
+		key, err := eipMapKey(ip)
+		if err != nil {
+			continue
+		}
+		if wanted[string(key)] {
+			continue
+		}
+		targetMap, err := m.mapFor(key)
+		if err != nil {
+			continue
+		}
+		var old bpfEipTarget
+		if err := targetMap.Lookup(key, &old); err == nil && old.Ifindex > 0 {
+			// 严格核验宿主机上存量目标网卡设备的物理存活性，仅在设备存活时保留旧条目
+			if link, err := netlink.LinkByIndex(int(old.Ifindex)); err == nil && link != nil {
+				wanted[string(key)] = true
+			}
+		}
+	}
+
 	for _, targetMap := range []*ebpf.Map{m.v4Map, m.v6Map} {
 		if targetMap == nil {
 			errs = append(errs, errors.New("EIP BPF maps are not loaded"))
@@ -394,6 +449,8 @@ func (m *linuxTCManager) Close() error {
 		m.collection = nil
 		m.v4Map = nil
 		m.v6Map = nil
+		m.progID = 0
+		m.progTag = ""
 	}
 	v4, v6 := m.mapPaths()
 	if err := removePin(v4); err != nil {

@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // TestTCManagerTargetInfoLayout 严格断言内核 struct eip_target 与 Go 结构体 bpfEipTarget 在 64 位体系下的内存对齐
@@ -72,56 +73,80 @@ func TestTCManagerPriority(t *testing.T) {
 	}
 }
 
-// TestTCManagerIsEIPFilter 验证过滤器精准匹配逻辑（基于 Handle=1 与名称解耦 priority，支持跨 priority 迁移与清理）
+// TestTCManagerIsEIPFilter 验证过滤器多维交叉核验逻辑（多重属性 + BPF Tag / ID 校验）
 func TestTCManagerIsEIPFilter(t *testing.T) {
 	mgr := NewTCManager(&Configuration{TcBpfPriority: 5}).(*linuxTCManager)
+	mgr.progID = 42
+	mgr.progTag = "08218004caf6a189"
 
-	// 匹配配置 priority 5
-	fMatch := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			Handle:   1,
-			Priority: 5,
-		},
-		Name: tcEIPFilterName,
+	baseFilter := func() *netlink.BpfFilter {
+		return &netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				Handle:   1,
+				Parent:   netlink.HANDLE_MIN_INGRESS,
+				Protocol: unix.ETH_P_ALL,
+				Priority: 5,
+			},
+			DirectAction: true,
+			Name:         tcEIPFilterName,
+		}
 	}
+
+	// 1. 标准名字匹配
+	fMatch := baseFilter()
 	if !mgr.isEIPFilter(fMatch) {
-		t.Errorf("期望匹配 priority 5 的本程序过滤器，但匹配失败")
+		t.Errorf("标准 kube-ovn 过滤器应匹配成功")
 	}
 
-	// 历史或不同 priority（如 1、7）均能精准识别为本程序过滤器，以便跨 priority 升级驱逐与停用清理
-	fOtherPriority := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			Handle:   1,
-			Priority: 1,
-		},
-		Name: tcEIPFilterName,
-	}
+	// 2. 跨 priority 识别
+	fOtherPriority := baseFilter()
+	fOtherPriority.Priority = 7
 	if !mgr.isEIPFilter(fOtherPriority) {
-		t.Errorf("不同 priority 的本程序过滤器亦应被正确识别")
+		t.Errorf("跨 priority 过滤器应被识别")
 	}
 
-	// handle 不为 1 不匹配
-	fDiffHandle := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			Handle:   2,
-			Priority: 5,
-		},
-		Name: tcEIPFilterName,
+	// 3. 强指纹：通过 BPF Program ID 匹配
+	fIDMatch := baseFilter()
+	fIDMatch.Name = ""
+	fIDMatch.Id = 42
+	if !mgr.isEIPFilter(fIDMatch) {
+		t.Errorf("通过 Program ID 匹配的规则应被识别")
 	}
+
+	// 4. 强指纹：通过 BPF Tag 匹配
+	fTagMatch := baseFilter()
+	fTagMatch.Name = ""
+	fTagMatch.Tag = "08218004caf6a189"
+	if !mgr.isEIPFilter(fTagMatch) {
+		t.Errorf("通过 BPF Tag 匹配的规则应被识别")
+	}
+
+	// 5. Parent 不为 Ingress 拒绝
+	fEgress := baseFilter()
+	fEgress.Parent = netlink.HANDLE_MIN_EGRESS
+	if mgr.isEIPFilter(fEgress) {
+		t.Errorf("Egress 过滤器不应被匹配")
+	}
+
+	// 6. DirectAction 为 false 拒绝
+	fNoDA := baseFilter()
+	fNoDA.DirectAction = false
+	if mgr.isEIPFilter(fNoDA) {
+		t.Errorf("非 DirectAction 过滤器不应被匹配")
+	}
+
+	// 7. Handle!=1 拒绝
+	fDiffHandle := baseFilter()
+	fDiffHandle.Handle = 2
 	if mgr.isEIPFilter(fDiffHandle) {
-		t.Errorf("handle!=1 过滤器不应被匹配")
+		t.Errorf("Handle!=1 过滤器不应被匹配")
 	}
 
-	// 非本程序名字不匹配（即便 handle 为 1，如 Cilium）
-	fOtherName := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			Handle:   1,
-			Priority: 5,
-		},
-		Name: "cilium-netdev",
-	}
-	if mgr.isEIPFilter(fOtherName) {
-		t.Errorf("非 kube-ovn 过滤器不应被匹配")
+	// 8. 非本程序名字拒绝（如 Cilium 且无匹配 Tag/ID）
+	fCilium := baseFilter()
+	fCilium.Name = "cilium-netdev"
+	if mgr.isEIPFilter(fCilium) {
+		t.Errorf("非 kube-ovn 规则且无对应指纹时不应被匹配")
 	}
 }
 

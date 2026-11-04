@@ -28,8 +28,9 @@ type TCManager interface {
 	// DeleteEIP 从内核 BPF Map 中原子剔除已销毁或漂移走的 EIP 重定向条目
 	DeleteEIP(eip net.IP) error
 
-	// SyncEIPs 根据当前期望的本地活跃 EIP 集合全量同步 BPF Map，执行对账并清理可能残留的孤儿条目
-	SyncEIPs(expected map[string]TargetInfo) error
+	// SyncEIPs 根据当前期望的本地活跃 EIP 集合全量同步 BPF Map，执行对账并清理可能残留的孤儿条目。
+	// retainedIPs 可选指定当前属于本节点活跃范围、但因 Pod 元数据短暂就绪延迟而需声明式保留存量映射的 EIP 列表。
+	SyncEIPs(expected map[string]TargetInfo, retainedIPs ...string) error
 
 	// Close 关闭并释放已打开的 BPF 文件描述符与相关句柄
 	Close() error
