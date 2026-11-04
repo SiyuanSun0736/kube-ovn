@@ -1051,6 +1051,80 @@ func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
 		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
 	}
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, skewPod, false))
+	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	require.Nil(t, patchedGw.Status.TcpConnLimit, "status.tcpConnLimit must be cleared when pod image does not support the command")
+}
+
+func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		failOp    string
+		failErr   error
+		expectErr bool
+	}{
+		{
+			name:      "connlimit failure aborts initialization",
+			failOp:    natGwTcpConnLimitSet,
+			failErr:   errors.New("iptables rule installation failed"),
+			expectErr: true,
+		},
+		{
+			name:      "syn limit failure aborts initialization",
+			failOp:    natGwTcpSynLimitSet,
+			failErr:   errors.New("nftables rule installation failed"),
+			expectErr: true,
+		},
+		{
+			name:      "unsupported connlimit command tolerated during init",
+			failOp:    natGwTcpConnLimitSet,
+			failErr:   errors.New("exit status 1: Unknown command: tcp-connlimit-set"),
+			expectErr: false,
+		},
+		{
+			name:      "unsupported syn limit command tolerated during init",
+			failOp:    natGwTcpSynLimitSet,
+			failErr:   errors.New("exit status 1: Unknown command: tcp-syn-limit-set"),
+			expectErr: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := vpcNatEnabled
+			vpcNatEnabled = "true"
+			t.Cleanup(func() { vpcNatEnabled = old })
+
+			gw := fakeGw("gw-sec")
+			pod := fakeNatGwPod("gw-sec", false)
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+				Pods:           []*corev1.Pod{pod},
+			})
+			require.NoError(t, err)
+			ctrl := fc.fakeController
+			for _, q := range []*workqueue.TypedRateLimitingInterface[string]{
+				&ctrl.updateVpcFloatingIPQueue, &ctrl.updateVpcDnatQueue, &ctrl.updateVpcSnatQueue,
+				&ctrl.updateVpcSubnetQueue, &ctrl.updateVpcEipQueue,
+			} {
+				*q = newTypedRateLimitingQueue[string]("test", nil)
+				t.Cleanup((*q).ShutDown)
+			}
+			ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, _ []string) error {
+				if operation == tc.failOp {
+					return tc.failErr
+				}
+				return nil
+			}
+
+			err = ctrl.handleInitVpcNatGw("gw-sec")
+			if tc.expectErr {
+				require.Error(t, err)
+				initializedPod, _ := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
+				require.NotEqual(t, "true", initializedPod.Annotations[util.VpcNatGatewayInitAnnotation], "failed security rule must not allow pod to be marked initialized")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestSyncNatGwSynRateLimit(t *testing.T) {

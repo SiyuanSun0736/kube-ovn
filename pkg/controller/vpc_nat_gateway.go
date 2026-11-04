@@ -412,6 +412,12 @@ func isUnsupportedCommandError(err error) bool {
 func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
 	// If the Pod was already marked as running an image without tcp-connlimit-set, check whether to skip
 	if pod.Annotations != nil && pod.Annotations[util.VpcNatTcpConnLimitAnnotation] == connlimitUnsupported {
+		if gw.Status.TcpConnLimit != nil {
+			if err := c.clearNatGwTcpConnLimitStatus(gw.Name); err != nil {
+				klog.Errorf("failed to clear status.tcpConnLimit for unsupported nat gw %s, %v", gw.Name, err)
+				return err
+			}
+		}
 		if gw.Spec.TcpConnLimit == nil && (gw.Annotations == nil || gw.Annotations[util.VpcNatTcpConnLimitAnnotation] == "") {
 			return nil
 		}
@@ -447,6 +453,12 @@ func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 			_ = util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
 				util.VpcNatTcpConnLimitAnnotation: connlimitUnsupported,
 			})
+			if gw.Status.TcpConnLimit != nil {
+				if clearErr := c.clearNatGwTcpConnLimitStatus(gw.Name); clearErr != nil {
+					klog.Errorf("failed to clear status.tcpConnLimit for unsupported nat gw %s, %v", gw.Name, clearErr)
+					return clearErr
+				}
+			}
 			return nil
 		}
 		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", desiredLimit, gw.Name, err)
@@ -497,6 +509,27 @@ func (c *Controller) patchNatGwTcpConnLimitStatus(key string, limit int) error {
 		return nil
 	}
 	patch, err := json.Marshal(map[string]any{"status": map[string]int{"tcpConnLimit": limit}})
+	if err != nil {
+		return err
+	}
+	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
+		patch, metav1.PatchOptions{}, "status")
+	return err
+}
+
+func (c *Controller) clearNatGwTcpConnLimitStatus(key string) error {
+	oriGw, err := c.vpcNatGatewayLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
+		return err
+	}
+	if oriGw.Status.TcpConnLimit == nil {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"status": map[string]any{"tcpConnLimit": nil}})
 	if err != nil {
 		return err
 	}
@@ -811,10 +844,14 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	}
 
 	if err = c.syncNatGwTcpConnLimit(gw, pod, true); err != nil {
-		klog.Warningf("failed to set tcp connlimit during init for nat gw %s: %v", key, err)
+		err = fmt.Errorf("failed to set tcp connlimit during init for nat gw %s: %w", key, err)
+		klog.Error(err)
+		return err
 	}
 	if err = c.syncNatGwSynRateLimit(gw, pod); err != nil {
-		klog.Warningf("failed to set tcp syn limit during init for nat gw %s: %v", key, err)
+		err = fmt.Errorf("failed to set tcp syn limit during init for nat gw %s: %w", key, err)
+		klog.Error(err)
+		return err
 	}
 
 	if gw.Spec.QoSPolicy != "" {
