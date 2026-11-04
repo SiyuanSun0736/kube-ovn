@@ -1045,7 +1045,7 @@ func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, newPod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateless"}}, calls)
 
-	// Case 3: Unsupported older image returns unknown command error -> handled gracefully (Item 9)
+	// Case 3: Unsupported older image returns unknown command error -> handled gracefully
 	calls = nil
 	ctrl.execRulesInPod = func(pod *corev1.Pod, operation string, rules []string) error {
 		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
