@@ -10,7 +10,7 @@ import (
 )
 
 func TestGetTunnelIptablesRules(t *testing.T) {
-	tunnelMatchSet := "ovn40tunnel-nodes"
+	tunnelMatchSet := "ovn40tunnel-remote-ips"
 
 	t.Run("geneve with resolved tunnel interface and match-set", func(t *testing.T) {
 		cfg := &Configuration{
@@ -26,17 +26,17 @@ func TestGetTunnelIptablesRules(t *testing.T) {
 		require.Len(t, active, 2)
 		require.Equal(t, util.Raw, active[0].Table)
 		require.Equal(t, util.Prerouting, active[0].Chain)
-		require.Equal(t, strings.Fields("-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-nodes src -j NOTRACK"), active[0].Rule)
+		require.Equal(t, strings.Fields("-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-remote-ips src -j NOTRACK"), active[0].Rule)
 
 		require.Equal(t, util.Raw, active[1].Table)
 		require.Equal(t, util.Output, active[1].Chain)
-		require.Equal(t, strings.Fields("-o bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-nodes dst -j NOTRACK"), active[1].Rule)
+		require.Equal(t, strings.Fields("-o bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-remote-ips dst -j NOTRACK"), active[1].Rule)
 
 		// Obsolete rules should clean inactive port rules
 		var hasMatchSet4789Pre bool
 		for _, r := range obsolete {
 			ruleStr := strings.Join(r.Rule, " ")
-			if ruleStr == "-i bond0 -p udp -m udp --dport 4789 -m set --match-set ovn40tunnel-nodes src -j NOTRACK" && r.Chain == util.Prerouting {
+			if ruleStr == "-i bond0 -p udp -m udp --dport 4789 -m set --match-set ovn40tunnel-remote-ips src -j NOTRACK" && r.Chain == util.Prerouting {
 				hasMatchSet4789Pre = true
 			}
 		}
@@ -59,7 +59,7 @@ func TestGetTunnelIptablesRules(t *testing.T) {
 		var hasMatchSet6081Pre bool
 		for _, r := range obsolete {
 			ruleStr := strings.Join(r.Rule, " ")
-			if ruleStr == "-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-nodes src -j NOTRACK" && r.Chain == util.Prerouting {
+			if ruleStr == "-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn40tunnel-remote-ips src -j NOTRACK" && r.Chain == util.Prerouting {
 				hasMatchSet6081Pre = true
 			}
 		}
@@ -102,11 +102,11 @@ func TestGetTunnelIptablesRules(t *testing.T) {
 		cfg.SetTunnelIface("bond0")
 
 		c := &Controller{config: cfg}
-		v6MatchSet := "ovn60tunnel-nodes"
+		v6MatchSet := "ovn60tunnel-remote-ips"
 		active, _ := c.getTunnelIptablesRules(v6MatchSet)
 
 		require.Len(t, active, 2)
-		require.Equal(t, strings.Fields("-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-nodes src -j NOTRACK"), active[0].Rule)
-		require.Equal(t, strings.Fields("-o bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-nodes dst -j NOTRACK"), active[1].Rule)
+		require.Equal(t, strings.Fields("-i bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-remote-ips src -j NOTRACK"), active[0].Rule)
+		require.Equal(t, strings.Fields("-o bond0 -p udp -m udp --dport 6081 -m set --match-set ovn60tunnel-remote-ips dst -j NOTRACK"), active[1].Rule)
 	})
 }

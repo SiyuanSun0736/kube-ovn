@@ -34,7 +34,7 @@ const (
 	SubnetDistributedGwSet     = "subnets-distributed-gw"
 	LocalPodSet                = "local-pod-ip-nat"
 	OtherNodeSet               = "other-node"
-	TunnelNodeSet              = "tunnel-nodes"
+	TunnelRemoteIPSet          = "tunnel-remote-ips"
 	IPSetPrefix                = "ovn"
 	NatOutGoingPolicySubnetSet = "subnets-nat-policy"
 	NatOutGoingPolicyRuleSet   = "natpr-"
@@ -140,16 +140,16 @@ func (c *Controller) setIPSet() error {
 			SetID:   OtherNodeSet,
 			Type:    ipsets.IPSetTypeHashNet,
 		}, otherNode)
-		tunnelNodes, err := c.getTunnelNodes(protocol)
+		tunnelRemoteIPs, err := c.getTunnelRemoteIPs(protocol)
 		if err != nil {
-			klog.Errorf("failed to get tunnel nodes: %v", err)
+			klog.Errorf("failed to get tunnel remote IPs: %v", err)
 			return err
 		}
 		c.ipsets[protocol].AddOrReplaceIPSet(ipsets.IPSetMetadata{
 			MaxSize: 1048576,
-			SetID:   TunnelNodeSet,
+			SetID:   TunnelRemoteIPSet,
 			Type:    ipsets.IPSetTypeHashNet,
-		}, tunnelNodes)
+		}, tunnelRemoteIPs)
 		c.reconcileNatOutGoingPolicyIPset(protocol)
 		c.ipsets[protocol].ApplyUpdates()
 	}
@@ -740,10 +740,10 @@ func (c *Controller) setIptables() error {
 		var obsoleteRules, iptablesRules []util.IPTableRule
 		if protocol == kubeovnv1.ProtocolIPv4 {
 			iptablesRules = slices.Clone(v4Rules)
-			matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "ovn40subnets", "ovn40services", "ovn40"+OtherNodeSet, "ovn40"+TunnelNodeSet
+			matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "ovn40subnets", "ovn40services", "ovn40"+OtherNodeSet, "ovn40"+TunnelRemoteIPSet
 		} else {
 			iptablesRules = slices.Clone(v6Rules)
-			kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "6-", "ovn60subnets", "ovn60services", "ovn60"+OtherNodeSet, "ovn60"+TunnelNodeSet
+			kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "6-", "ovn60subnets", "ovn60services", "ovn60"+OtherNodeSet, "ovn60"+TunnelRemoteIPSet
 		}
 
 		activeTunnelRules, obsoleteTunnelRules := c.getTunnelIptablesRules(tunnelMatchSet)

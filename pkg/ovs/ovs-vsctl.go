@@ -2,6 +2,7 @@ package ovs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net"
@@ -489,23 +490,47 @@ func ListQosQueueIDs() (map[string]string, error) {
 	return result, nil
 }
 
-func parseTunnelRemoteIPs(output string) []string {
+type ovsdbFindResponse struct {
+	Data [][][]any `json:"data"`
+}
+
+func parseTunnelRemoteIPs(output string) ([]string, error) {
+	if strings.TrimSpace(output) == "" {
+		return nil, nil
+	}
+	var resp ovsdbFindResponse
+	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ovsdb json: %w", err)
+	}
+
 	var ips []string
-	re := regexp.MustCompile(`remote_ip=["']*([a-fA-F0-9:.]+)`)
-	matches := re.FindAllStringSubmatch(output, -1)
-	for _, m := range matches {
-		if len(m) > 1 && net.ParseIP(m[1]) != nil {
-			ips = append(ips, m[1])
+	for _, row := range resp.Data {
+		for _, col := range row {
+			if len(col) == 2 {
+				if tag, ok := col[0].(string); ok && tag == "map" {
+					if entries, ok := col[1].([]any); ok {
+						for _, item := range entries {
+							if pair, ok := item.([]any); ok && len(pair) == 2 {
+								if k, ok := pair[0].(string); ok && k == "remote_ip" {
+									if v, ok := pair[1].(string); ok && net.ParseIP(v) != nil {
+										ips = append(ips, v)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	}
-	return ips
+	return ips, nil
 }
 
 // FindTunnelRemoteIPs finds all remote_ip values of tunnel interfaces of the given type
 func FindTunnelRemoteIPs(tunnelType string) ([]string, error) {
-	output, err := Exec("--data=bare", "--format=csv", "--no-heading", "--columns=options", "find", "interface", fmt.Sprintf("type=%s", tunnelType))
+	output, err := Exec("--format=json", "--columns=options", "find", "interface", fmt.Sprintf("type=%s", tunnelType))
 	if err != nil {
 		return nil, err
 	}
-	return parseTunnelRemoteIPs(output), nil
+	return parseTunnelRemoteIPs(output)
 }

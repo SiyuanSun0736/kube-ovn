@@ -255,35 +255,31 @@ func TestParseTunnelRemoteIPs(t *testing.T) {
 		expected []string
 	}{
 		{
-			name:     "bare format",
-			output:   "csum=true key=flow local_ip=10.210.10.24 remote_ip=10.210.10.25\ncsum=true key=flow local_ip=10.210.10.24 remote_ip=10.210.10.26\n",
+			name: "standard ovsdb json format",
+			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.25"]]]],[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.26"]]]]],"headings":["options"]}`,
 			expected: []string{"10.210.10.25", "10.210.10.26"},
 		},
 		{
-			name:     "csv escaped quotes format",
-			output:   "\"{csum=\"\"true\"\", key=flow, local_ip=\"\"10.210.10.24\"\", remote_ip=\"\"10.210.10.25\"\"}\"\n\"{csum=\"\"true\"\", key=flow, local_ip=\"\"10.210.10.24\"\", remote_ip=\"\"10.210.10.26\"\"}\"\n",
-			expected: []string{"10.210.10.25", "10.210.10.26"},
-		},
-		{
-			name:     "standard quotes format",
-			output:   "{csum=\"true\", key=flow, local_ip=\"10.210.10.24\", remote_ip=\"10.210.10.25\"}\n",
-			expected: []string{"10.210.10.25"},
-		},
-		{
-			name:     "ipv6 format",
-			output:   "csum=true key=flow local_ip=fd00::24 remote_ip=fd00::25\n",
+			name: "ipv6 ovsdb json format",
+			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","fd00::24"],["remote_ip","fd00::25"]]]]],"headings":["options"]}`,
 			expected: []string{"fd00::25"},
 		},
 		{
-			name:     "invalid remote_ip",
-			output:   "key=flow remote_ip=flow remote_ip=\"\"\n",
+			name: "non-ip remote_ip ignored",
+			output: `{"data":[[["map",[["key","flow"],["remote_ip","flow"]]]],[["map",[["remote_ip",""]]]]],"headings":["options"]}`,
+			expected: nil,
+		},
+		{
+			name:     "empty output",
+			output:   "",
 			expected: nil,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ips := parseTunnelRemoteIPs(tc.output)
+			ips, err := parseTunnelRemoteIPs(tc.output)
+			require.NoError(t, err)
 			require.Equal(t, tc.expected, ips)
 		})
 	}

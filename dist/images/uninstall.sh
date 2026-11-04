@@ -56,7 +56,7 @@ ipset destroy ovn40subnets
 ipset destroy ovn40subnets-distributed-gw
 ipset destroy ovn40local-pod-ip-nat
 ipset destroy ovn40other-node
-ipset destroy ovn40tunnel-nodes
+ipset destroy ovn40tunnel-remote-ips
 ipset destroy ovn40services
 ipset destroy ovn40subnets-nat-policy
 
@@ -110,7 +110,7 @@ ipset destroy ovn60subnets
 ipset destroy ovn60subnets-distributed-gw
 ipset destroy ovn60local-pod-ip-nat
 ipset destroy ovn60other-node
-ipset destroy ovn60tunnel-nodes
+ipset destroy ovn60tunnel-remote-ips
 ipset destroy ovn60services
 ipset destroy ovn60subnets-nat-policy
 

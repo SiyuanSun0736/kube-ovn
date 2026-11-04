@@ -155,7 +155,7 @@ func ParseFlags() *Configuration {
 		// Node-local EIP access for VPC NAT Gateway
 		argEnableNodeLocalAccessVpcNatGwEIP = pflag.Bool("enable-node-local-access-vpc-nat-gw-eip", true, "Enable node local access to VPC NAT gateway iptables EIP addresses via macvlan sub-interface")
 		argNonPrimaryCNI                    = pflag.Bool("non-primary-cni-mode", false, "Use Kube-OVN in non primary cni mode. When true, skip setting NetworkUnavailable node condition")
-		argEnableTunnelNotrack              = pflag.Bool("enable-tunnel-notrack", true, "Enable NOTRACK for overlay tunnel traffic to avoid connection tracking overhead.")
+		argEnableTunnelNotrack              = pflag.Bool("enable-tunnel-notrack", true, "Enable NOTRACK for overlay tunnel traffic to avoid connection tracking overhead. Note: Must be set to false in NAT scenarios (e.g. VPC NAT Gateway) where overlay traffic requires conntrack.")
 	)
 
 	// mute info log for ipset lib

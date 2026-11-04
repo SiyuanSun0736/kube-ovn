@@ -204,10 +204,10 @@ func (c *Controller) getOtherNodes(protocol string) ([]string, error) {
 	return ret, nil
 }
 
-func (c *Controller) getTunnelNodes(protocol string) ([]string, error) {
+func (c *Controller) getTunnelRemoteIPs(protocol string) ([]string, error) {
 	nodeIPs := set.New[string]()
 
-	// 1. Fetch remote_ip from local OVS tunnel interfaces if available
+	// Fetch remote_ip directly from local OVS tunnel interfaces if available
 	if c.config != nil {
 		tunnelType := c.config.NetworkType
 		if tunnelType == util.NetworkTypeGeneve || tunnelType == util.NetworkTypeVxlan || tunnelType == util.NetworkTypeStt {
@@ -219,27 +219,6 @@ func (c *Controller) getTunnelNodes(protocol string) ([]string, error) {
 				}
 			} else {
 				klog.V(5).Infof("failed to get tunnel remote IPs from OVS: %v", err)
-			}
-		}
-	}
-
-	// 2. Fetch Encap IPs from NodeNetworks annotation if configured
-	nodes, err := c.nodesLister.List(labels.Everything())
-	if err != nil {
-		klog.Errorf("failed to list nodes: %v", err)
-		return nodeIPs.UnsortedList(), err
-	}
-
-	for _, node := range nodes {
-		if c.config != nil && node.Name == c.config.NodeName {
-			continue
-		}
-		// Parse node networks annotation
-		if networks, err := parseNodeNetworks(node); err == nil && len(networks) > 0 {
-			for _, ip := range networks {
-				if util.CheckProtocol(ip) == protocol {
-					nodeIPs.Insert(ip)
-				}
 			}
 		}
 	}
