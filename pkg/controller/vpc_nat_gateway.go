@@ -328,12 +328,10 @@ func (c *Controller) getVpcNatGwDesiredTcpConnLimit(gw *kubeovnv1.VpcNatGateway)
 	if gw.Spec.TcpConnLimit != nil {
 		return *gw.Spec.TcpConnLimit
 	}
-	// 2. Annotations (supports standard and las legacy annotations)
-	for _, key := range []string{util.VpcNatTcpConnLimitAnnotation, util.VpcNatTcpConnLimitLegacyAnnotation} {
-		if val, ok := gw.Annotations[key]; ok {
-			if limit, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && limit >= 0 {
-				return limit
-			}
+	// 2. Annotation
+	if val, ok := gw.Annotations[util.VpcNatTcpConnLimitAnnotation]; ok {
+		if limit, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && limit >= 0 {
+			return limit
 		}
 	}
 	// 3. Standalone default connlimit fallback (50,000 / 5w)
@@ -367,17 +365,11 @@ func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 			break
 		}
 	}
-	for _, key := range []string{util.VpcNatSynDstRateLimitAnnotation, util.VpcNatSynDstRateLimitLegacyAnnotation} {
-		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
-			dstRate = strings.TrimSpace(val)
-			break
-		}
+	if val, ok := gw.Annotations[util.VpcNatSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		dstRate = strings.TrimSpace(val)
 	}
-	for _, key := range []string{util.VpcNatSynDstBurstLimitAnnotation, util.VpcNatSynDstBurstLimitLegacyAnnotation} {
-		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
-			dstBurst = strings.TrimSpace(val)
-			break
-		}
+	if val, ok := gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		dstBurst = strings.TrimSpace(val)
 	}
 	if val, ok := gw.Annotations[util.VpcNatSynHashlimitEntriesAnnotation]; ok && strings.TrimSpace(val) != "" {
 		htableMax = strings.TrimSpace(val)
