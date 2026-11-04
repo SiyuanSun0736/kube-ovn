@@ -34,6 +34,7 @@ const (
 	SubnetDistributedGwSet     = "subnets-distributed-gw"
 	LocalPodSet                = "local-pod-ip-nat"
 	OtherNodeSet               = "other-node"
+	TunnelRemoteIPSet          = "tunnel-remote-ips"
 	IPSetPrefix                = "ovn"
 	NatOutGoingPolicySubnetSet = "subnets-nat-policy"
 	NatOutGoingPolicyRuleSet   = "natpr-"
@@ -139,6 +140,16 @@ func (c *Controller) setIPSet() error {
 			SetID:   OtherNodeSet,
 			Type:    ipsets.IPSetTypeHashNet,
 		}, otherNode)
+		tunnelRemoteIPs, err := c.getTunnelRemoteIPs(protocol)
+		if err != nil {
+			klog.Errorf("failed to get tunnel remote IPs: %v", err)
+			return err
+		}
+		c.ipsets[protocol].AddOrReplaceIPSet(ipsets.IPSetMetadata{
+			MaxSize: 1048576,
+			SetID:   TunnelRemoteIPSet,
+			Type:    ipsets.IPSetTypeHashNet,
+		}, tunnelRemoteIPs)
 		c.reconcileNatOutGoingPolicyIPset(protocol)
 		c.ipsets[protocol].ApplyUpdates()
 	}
@@ -721,32 +732,28 @@ func (c *Controller) setIptables() error {
 		if ipt == nil {
 			continue
 		}
+		if err = c.deleteObsoleteTunnelNotrackRules(ipt, protocol); err != nil {
+			return err
+		}
 
-		var kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet string
+		var kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet, tunnelMatchSet string
 		var obsoleteRules, iptablesRules []util.IPTableRule
 		if protocol == kubeovnv1.ProtocolIPv4 {
 			iptablesRules = slices.Clone(v4Rules)
-			matchset, svcMatchset, nodeMatchSet = "ovn40subnets", "ovn40services", "ovn40"+OtherNodeSet
+			matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "ovn40subnets", "ovn40services", "ovn40"+OtherNodeSet, "ovn40"+TunnelRemoteIPSet
 		} else {
 			iptablesRules = slices.Clone(v6Rules)
-			kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet = "6-", "ovn60subnets", "ovn60services", "ovn60"+OtherNodeSet
+			kubeProxyIpsetProtocol, matchset, svcMatchset, nodeMatchSet, tunnelMatchSet = "6-", "ovn60subnets", "ovn60services", "ovn60"+OtherNodeSet, "ovn60"+TunnelRemoteIPSet
 		}
 
-		tunnelPort := c.getTunnelPort()
-		if tunnelPort != 0 {
-			iptablesRules = append(iptablesRules,
-				util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, tunnelPort, nodeMatchSet))},
-				util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, tunnelPort, nodeMatchSet))},
-			)
-		}
-		for _, port := range []int{6081, 4789, 8472} {
-			if port != tunnelPort {
-				obsoleteRules = append(obsoleteRules,
-					util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, port, nodeMatchSet))},
-					util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, port, nodeMatchSet))},
-				)
+		activeTunnelRules, obsoleteTunnelRules := c.getTunnelIptablesRules(tunnelMatchSet)
+		for _, rule := range obsoleteTunnelRules {
+			if err = deleteIptablesRule(ipt, rule); err != nil {
+				klog.Errorf("failed to delete obsolete tunnel iptables rule %v: %v", rule, err)
+				return err
 			}
 		}
+		iptablesRules = append(iptablesRules, activeTunnelRules...)
 
 		ipset := fmt.Sprintf("KUBE-%sCLUSTER-IP", kubeProxyIpsetProtocol)
 		ipsetExists, err := c.ipsetExists(ipset)
@@ -775,11 +782,11 @@ func (c *Controller) setIptables() error {
 		}
 
 		if nodeIP := nodeIPs[protocol]; nodeIP != "" {
-			obsoleteRules = []util.IPTableRule{
-				{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m set --match-set %s dst -j MASQUERADE`, nodeIP, matchset))},
-				{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m mark --mark 0x4000/0x4000 -j MASQUERADE`, nodeIP))},
-				{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m set ! --match-set %s src -m set --match-set %s dst -j MASQUERADE`, nodeIP, matchset, matchset))},
-			}
+			obsoleteRules = append(obsoleteRules,
+				util.IPTableRule{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m set --match-set %s dst -j MASQUERADE`, nodeIP, matchset))},
+				util.IPTableRule{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m mark --mark 0x4000/0x4000 -j MASQUERADE`, nodeIP))},
+				util.IPTableRule{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m set ! --match-set %s src -m set --match-set %s dst -j MASQUERADE`, nodeIP, matchset, matchset))},
+			)
 
 			rules := make([]util.IPTableRule, len(iptablesRules)+1)
 			copy(rules, iptablesRules[:1])
@@ -1768,4 +1775,73 @@ func getNatPolicySubnetChainUID(chainName string) string {
 
 func formatIPsetUnPrefix(ipsetName string) string {
 	return ipsetName[len("ovn40"):]
+}
+
+// deleteObsoleteTunnelNotrackRules removes rules created by all previous NOTRACK implementations.
+func (c *Controller) deleteObsoleteTunnelNotrackRules(ipt *iptables.IPTables, protocol string) error {
+	for _, chain := range []string{Prerouting, Output} {
+		rules, err := ipt.List(RAW, chain)
+		if err != nil {
+			return fmt.Errorf("failed to list raw %s rules: %w", chain, err)
+		}
+		for _, rule := range rules {
+			fields := util.DoubleQuotedFields(rule)
+			if len(fields) < 3 || !isTunnelNotrackRule(fields) {
+				continue
+			}
+			if err := ipt.Delete(RAW, chain, fields[2:]...); err != nil {
+				return fmt.Errorf("failed to delete obsolete %s %s NOTRACK rule: %w", protocol, chain, err)
+			}
+		}
+	}
+	return nil
+}
+
+func isTunnelNotrackRule(fields []string) bool {
+	var udp, notrack, tunnelPort bool
+	for i, field := range fields {
+		switch field {
+		case "-p":
+			udp = i+1 < len(fields) && fields[i+1] == "udp"
+		case "--dport":
+			if i+1 < len(fields) {
+				tunnelPort = slices.Contains([]string{"6081", "4789", "8472"}, fields[i+1])
+			}
+		case "-j":
+			notrack = i+1 < len(fields) && fields[i+1] == "NOTRACK"
+		}
+	}
+	return udp && tunnelPort && notrack
+}
+
+// getTunnelIptablesRules generates active NOTRACK rules and obsolete rules for overlay tunnels.
+func (c *Controller) getTunnelIptablesRules(tunnelMatchSet string) (activeRules, obsoleteRules []util.IPTableRule) {
+	tunnelPort := c.getTunnelPort()
+	var tunnelIface string
+	if c.config != nil {
+		tunnelIface = c.config.GetTunnelIface()
+	}
+
+	enabled := c.config == nil || c.config.EnableTunnelNotrack
+
+	for _, port := range []int{6081, 4789, 8472} {
+		if tunnelIface != "" && tunnelMatchSet != "" {
+			// Clean up match-set rules for inactive ports or when feature is disabled
+			if !enabled || port != tunnelPort {
+				obsoleteRules = append(obsoleteRules,
+					util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-i %s -p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, tunnelIface, port, tunnelMatchSet))},
+					util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-o %s -p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, tunnelIface, port, tunnelMatchSet))},
+				)
+			}
+		}
+	}
+
+	if enabled && tunnelPort != 0 && tunnelIface != "" && tunnelMatchSet != "" {
+		activeRules = append(activeRules,
+			util.IPTableRule{Table: RAW, Chain: Prerouting, Rule: strings.Fields(fmt.Sprintf(`-i %s -p udp -m udp --dport %d -m set --match-set %s src -j NOTRACK`, tunnelIface, tunnelPort, tunnelMatchSet))},
+			util.IPTableRule{Table: RAW, Chain: Output, Rule: strings.Fields(fmt.Sprintf(`-o %s -p udp -m udp --dport %d -m set --match-set %s dst -j NOTRACK`, tunnelIface, tunnelPort, tunnelMatchSet))},
+		)
+	}
+
+	return activeRules, obsoleteRules
 }

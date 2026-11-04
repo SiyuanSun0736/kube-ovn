@@ -8,6 +8,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/set"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
@@ -201,6 +202,30 @@ func (c *Controller) getOtherNodes(protocol string) ([]string, error) {
 		}
 	}
 	return ret, nil
+}
+
+func (c *Controller) getTunnelRemoteIPs(protocol string) ([]string, error) {
+	nodeIPs := set.New[string]()
+
+	// Fetch remote_ip directly from local OVS tunnel interfaces if available
+	if c.config != nil {
+		tunnelType := c.config.NetworkType
+		if tunnelType == util.NetworkTypeGeneve || tunnelType == util.NetworkTypeVxlan || tunnelType == util.NetworkTypeStt {
+			if remoteIPs, err := ovs.FindTunnelRemoteIPs(tunnelType); err == nil {
+				for _, ip := range remoteIPs {
+					if util.CheckProtocol(ip) == protocol {
+						nodeIPs.Insert(ip)
+					}
+				}
+			} else {
+				klog.V(5).Infof("failed to get tunnel remote IPs from OVS: %v", err)
+			}
+		}
+	}
+
+	res := nodeIPs.UnsortedList()
+	sort.Strings(res)
+	return res, nil
 }
 
 func getCidrByProtocol(cidr, protocol string) (string, error) {

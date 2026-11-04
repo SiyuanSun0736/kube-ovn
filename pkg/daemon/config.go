@@ -40,6 +40,7 @@ type Configuration struct {
 	tunnelIface               string
 	Iface                     string
 	HostTunnelSrc             bool
+	EnableTunnelNotrack       bool
 	DPDKTunnelIface           string
 	MTU                       int
 	MSS                       int
@@ -96,6 +97,7 @@ type Configuration struct {
 	// NodeNetworks stores the mapping of network name to encap IP from node annotation
 	NodeNetworks      map[string]string
 	nodeNetworksMutex sync.RWMutex
+	tunnelIfaceMutex  sync.RWMutex
 	DefaultEncapIP    string
 }
 
@@ -153,6 +155,7 @@ func ParseFlags() *Configuration {
 		// Node-local EIP access for VPC NAT Gateway
 		argEnableNodeLocalAccessVpcNatGwEIP = pflag.Bool("enable-node-local-access-vpc-nat-gw-eip", true, "Enable node local access to VPC NAT gateway iptables EIP addresses via macvlan sub-interface")
 		argNonPrimaryCNI                    = pflag.Bool("non-primary-cni-mode", false, "Use Kube-OVN in non primary cni mode. When true, skip setting NetworkUnavailable node condition")
+		argEnableTunnelNotrack              = pflag.Bool("enable-tunnel-notrack", true, "Enable NOTRACK for overlay tunnel traffic to avoid connection tracking overhead. Note: Must be set to false in NAT scenarios (e.g. VPC NAT Gateway) where overlay traffic requires conntrack.")
 	)
 
 	// mute info log for ipset lib
@@ -183,6 +186,7 @@ func ParseFlags() *Configuration {
 		CniConfName:               *argsCniConfName,
 		Iface:                     *argIface,
 		HostTunnelSrc:             *argHostTunnelSrc,
+		EnableTunnelNotrack:       *argEnableTunnelNotrack,
 		DPDKTunnelIface:           *argDPDKTunnelIface,
 		MTU:                       *argMTU,
 		EnableMirror:              *argEnableMirror,
@@ -311,7 +315,7 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 
 		klog.Infof("use %s on %s as tunnel address", encapIP, iface.Name)
 		mtu = iface.MTU
-		config.tunnelIface = iface.Name
+		config.SetTunnelIface(iface.Name)
 	}
 
 	encapIsIPv6 := util.CheckProtocol(encapIP) == kubeovnv1.ProtocolIPv6
@@ -591,6 +595,24 @@ func (config *Configuration) GetEncapIPByNetwork(networkName string) (string, er
 	}
 
 	return "", fmt.Errorf("network %s not found in node networks", networkName)
+}
+
+func (config *Configuration) SetTunnelIface(iface string) {
+	if config == nil {
+		return
+	}
+	config.tunnelIfaceMutex.Lock()
+	defer config.tunnelIfaceMutex.Unlock()
+	config.tunnelIface = iface
+}
+
+func (config *Configuration) GetTunnelIface() string {
+	if config == nil {
+		return ""
+	}
+	config.tunnelIfaceMutex.RLock()
+	defer config.tunnelIfaceMutex.RUnlock()
+	return config.tunnelIface
 }
 
 func setChecksum(encapChecksum bool) error {

@@ -2,6 +2,7 @@ package ovs
 
 import (
 	"fmt"
+	"testing"
 
 	"github.com/stretchr/testify/require"
 )
@@ -243,4 +244,43 @@ func (suite *OvnClientTestSuite) testListQosQueueIDs() {
 	// ovs-vsctl cmd is not available in the test environment
 	require.Error(t, err)
 	require.Empty(t, ret)
+}
+
+func TestParseTunnelRemoteIPs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		output   string
+		expected []string
+	}{
+		{
+			name: "standard ovsdb json format",
+			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.25"]]]],[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.26"]]]]],"headings":["options"]}`,
+			expected: []string{"10.210.10.25", "10.210.10.26"},
+		},
+		{
+			name: "ipv6 ovsdb json format",
+			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","fd00::24"],["remote_ip","fd00::25"]]]]],"headings":["options"]}`,
+			expected: []string{"fd00::25"},
+		},
+		{
+			name: "non-ip remote_ip ignored",
+			output: `{"data":[[["map",[["key","flow"],["remote_ip","flow"]]]],[["map",[["remote_ip",""]]]]],"headings":["options"]}`,
+			expected: nil,
+		},
+		{
+			name:     "empty output",
+			output:   "",
+			expected: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ips, err := parseTunnelRemoteIPs(tc.output)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, ips)
+		})
+	}
 }
