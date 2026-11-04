@@ -537,12 +537,10 @@ func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatG
 		return fmt.Errorf("spec.tcpConnLimit must be greater than or equal to 0, got %d", *gw.Spec.TcpConnLimit)
 	}
 
-	for _, key := range []string{util.VpcNatTcpConnLimitAnnotation, util.VpcNatTcpConnLimitLegacyAnnotation} {
-		if val, ok := gw.Annotations[key]; ok {
-			limit, err := strconv.Atoi(strings.TrimSpace(val))
-			if err != nil || limit < 0 {
-				return fmt.Errorf("annotation %s must be a non-negative integer, got %q", key, val)
-			}
+	if val, ok := gw.Annotations[util.VpcNatTcpConnLimitAnnotation]; ok {
+		limit, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil || limit < 0 {
+			return fmt.Errorf("annotation %s must be a non-negative integer, got %q", util.VpcNatTcpConnLimitAnnotation, val)
 		}
 	}
 

@@ -938,22 +938,17 @@ func TestVpcNatGwDesiredTcpConnLimit(t *testing.T) {
 	gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "15000"}
 	assert.Equal(t, 15000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 3. Legacy annotation tcp-connlimit
-	delete(gw.Annotations, util.VpcNatTcpConnLimitAnnotation)
-	gw.Annotations[util.VpcNatTcpConnLimitLegacyAnnotation] = "25000"
-	assert.Equal(t, 25000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
-
-	// 4. Spec field overrides annotation
+	// 3. Spec field overrides annotation
 	gw.Spec.TcpConnLimit = ptr.To(30000)
 	assert.Equal(t, 30000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 5. Spec field 0 disables connlimit
+	// 4. Spec field 0 disables connlimit
 	gw.Spec.TcpConnLimit = ptr.To(0)
 	assert.Equal(t, 0, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 
-	// 6. Removing spec field restores default (50000)
+	// 5. Removing spec field restores default (50000)
 	gw.Spec.TcpConnLimit = nil
-	delete(gw.Annotations, util.VpcNatTcpConnLimitLegacyAnnotation)
+	delete(gw.Annotations, util.VpcNatTcpConnLimitAnnotation)
 	assert.Equal(t, util.DefaultNatGwTcpConnLimit, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
 }
 
@@ -1170,23 +1165,6 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		"600",
 		"8000/s",
 		"16000",
-		util.DefaultNatGwSynHtableMax,
-		util.DefaultNatGwSynHtableExpire,
-	}}, calls)
-
-	// 3. Legacy annotations support
-	calls = nil
-	gw.Annotations = map[string]string{
-		util.VpcNatSynDstRateLimitLegacyAnnotation:  "25000/s",
-		util.VpcNatSynDstBurstLimitLegacyAnnotation: "50000",
-	}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
-	require.Equal(t, [][]string{{
-		natGwTcpSynLimitSet,
-		"300/s",
-		"600",
-		"25000/s",
-		"50000",
 		util.DefaultNatGwSynHtableMax,
 		util.DefaultNatGwSynHtableExpire,
 	}}, calls)

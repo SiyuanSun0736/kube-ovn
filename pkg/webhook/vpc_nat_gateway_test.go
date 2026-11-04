@@ -303,7 +303,7 @@ func TestValidateVpcNatGW_TcpConnLimit(t *testing.T) {
 
 	t.Run("invalid annotation limit negative", func(t *testing.T) {
 		gw := baseGw()
-		gw.Annotations = map[string]string{util.VpcNatTcpConnLimitLegacyAnnotation: "-5"}
+		gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "-5"}
 		err := hook.ValidateVpcNatGW(t.Context(), gw)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "must be a non-negative integer")
