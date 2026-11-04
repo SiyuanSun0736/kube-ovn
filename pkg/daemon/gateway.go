@@ -223,7 +223,7 @@ func (c *Controller) getTunnelNodes(protocol string) ([]string, error) {
 		}
 	}
 
-	// 2. Fetch Encap IPs from NodeNetworks annotation and fallback to NodeInternalIP
+	// 2. Fetch Encap IPs from NodeNetworks annotation if configured
 	nodes, err := c.nodesLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list nodes: %v", err)
@@ -240,12 +240,6 @@ func (c *Controller) getTunnelNodes(protocol string) ([]string, error) {
 				if util.CheckProtocol(ip) == protocol {
 					nodeIPs.Insert(ip)
 				}
-			}
-		}
-		// Fallback to NodeInternalIP
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == v1.NodeInternalIP && util.CheckProtocol(addr.Address) == protocol {
-				nodeIPs.Insert(addr.Address)
 			}
 		}
 	}
