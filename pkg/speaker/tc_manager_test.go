@@ -124,3 +124,14 @@ func TestTCManagerIsEIPFilter(t *testing.T) {
 		t.Errorf("非 kube-ovn 过滤器不应被匹配")
 	}
 }
+
+// TestTCManagerAttachRequiresInterface 验证未指定接口时 Attach 明确报错，禁止误挂载到默认路由网卡
+func TestTCManagerAttachRequiresInterface(t *testing.T) {
+	mgr := NewTCManager(&Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      "",
+	})
+	if err := mgr.Attach(""); err == nil {
+		t.Fatal("期望未指定接口时 Attach 报错，但返回了 nil")
+	}
+}

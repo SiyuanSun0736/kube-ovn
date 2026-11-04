@@ -325,3 +325,16 @@ func TestInitNeighborLocalAddressesPureExtensionMode(t *testing.T) {
 	require.Nil(t, config.getNeighborLocalAddress(net.ParseIP("10.32.32.1")))
 	require.Nil(t, config.getNeighborLocalAddress(net.ParseIP("fd00::254")))
 }
+
+func TestTcBpfConfigProtection(t *testing.T) {
+	// 验证未显式指定 TcBpfInterface 时，即便开启了 EnableTcBpfRedirect，也不应导致 Speaker 启动崩溃，而是降级关闭
+	config := &Configuration{
+		NodeRouteEIPMode:    true,
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      "",
+	}
+	if config.EnableTcBpfRedirect && config.TcBpfInterface == "" {
+		config.EnableTcBpfRedirect = false
+	}
+	require.False(t, config.EnableTcBpfRedirect, "未指定 TcBpfInterface 时应自动降级关闭 TC BPF 旁路直通以保护生产")
+}

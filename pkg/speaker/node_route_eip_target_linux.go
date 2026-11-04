@@ -114,11 +114,6 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 				return TargetInfo{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
 			}
 			parentIndex := 0
-			if defaultParent == "" {
-				if iface, err := detectDefaultInterface(); err == nil {
-					defaultParent = iface
-				}
-			}
 			if defaultParent != "" {
 				if plink, err := lookup(defaultParent); err == nil {
 					parentIndex = plink.Attrs().Index

@@ -16,6 +16,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -80,11 +81,8 @@ func (m *linuxTCManager) Attach(linkName string) error {
 		linkName = m.cfg.TcBpfInterface
 	}
 	if linkName == "" {
-		var err error
-		linkName, err = detectDefaultInterface()
-		if err != nil {
-			return err
-		}
+		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting")
+		return errors.New("tc-bpf-interface must be explicitly specified")
 	}
 	link, err := netlink.LinkByName(linkName)
 	if err != nil {
@@ -175,23 +173,6 @@ func (m *linuxTCManager) load() error {
 	m.collection = coll
 	m.v4Map, m.v6Map = coll.Maps[tcEIPv4MapName], coll.Maps[tcEIPv6MapName]
 	return nil
-}
-
-func detectDefaultInterface() (string, error) {
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
-	if err != nil {
-		return "", err
-	}
-	for _, r := range routes {
-		if r.Dst == nil && r.LinkIndex > 0 {
-			link, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
-				return "", err
-			}
-			return link.Attrs().Name, nil
-		}
-	}
-	return "", errors.New("no default IPv4 interface found; specify --tc-bpf-interface")
 }
 
 const defaultTcBpfPriority uint16 = 5
