@@ -109,10 +109,16 @@ func (m *linuxTCManager) Attach(linkName string) error {
 	prio := m.priority()
 	for _, filter := range filters {
 		attrs := filter.Attrs()
+		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != prio {
+			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
+			if ok && m.isEIPFilter(bpf) {
+				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
+					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
+				}
+			}
 			continue
 		}
-		bpf, ok := filter.(*netlink.BpfFilter)
 		if !ok || !m.isEIPFilter(bpf) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", prio, linkName)
 		}
@@ -186,8 +192,9 @@ func (m *linuxTCManager) priority() uint16 {
 
 // 严格仅匹配本程序的 TC 过滤器（包括原始 tc loader 生成的名字）。
 // 绝不删除与其他 CNI 共享的整个 priority 规则或 clsact qdisc 队列。
+// 基于 Handle=1 与唯一 Filter 名称识别，解耦 priority 以支持跨 priority 升级迁移与统一清理。
 func (m *linuxTCManager) isEIPFilter(filter *netlink.BpfFilter) bool {
-	return filter.Handle == 1 && filter.Priority == m.priority() &&
+	return filter != nil && filter.Handle == 1 &&
 		(filter.Name == tcEIPFilterName || filter.Name == "tc_eip.o:[classifier]")
 }
 

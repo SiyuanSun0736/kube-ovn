@@ -3,12 +3,14 @@
 package speaker
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -232,4 +234,65 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 	require.NoError(t, m.(*linuxTCManager).v4Map.Lookup([]byte{203, 0, 113, 10}, &counters))
 	require.Equal(t, uint64(2), counters.Packets, "local macvlan delivery must not recirculate through TC")
 	require.NoError(t, pingErr, "%s", output)
+}
+
+func TestTCPriorityMigrationAndCleanup(t *testing.T) {
+	requireBPFIntegration(t)
+	pin := testTCPinPath(t)
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-prio-%d", time.Now().UnixNano()%100000)}}
+	require.NoError(t, netlink.LinkAdd(link))
+	t.Cleanup(func() { _ = netlink.LinkDel(link) })
+
+	// 1. 模拟旧实例：使用 Priority 5 挂载
+	cfg1 := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfMapPath:        pin,
+		TcBpfPriority:       5,
+	}
+	m1 := NewTCManager(cfg1)
+	require.NoError(t, m1.Attach(link.Name))
+
+	// 验证 Priority 5 过滤器已就绪
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 1)
+	require.Equal(t, uint16(5), filters[0].Attrs().Priority)
+
+	// 2. 模拟运维调整 priority 为 7 并重启新实例
+	cfg2 := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfMapPath:        pin,
+		TcBpfPriority:       7,
+	}
+	m2 := NewTCManager(cfg2)
+	require.NoError(t, m2.Attach(link.Name))
+
+	// 挂载第三方（如 Cilium/QoS）的过滤器，验证不会被误删
+	foreign := &netlink.MatchAll{FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Index, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 2, Priority: 10, Protocol: unix.ETH_P_ALL}}
+	require.NoError(t, netlink.FilterAdd(foreign))
+
+	// 3. 验证旧 Priority 5 过滤器已被自动剥离，当前仅留有 Priority 7 和第三方 Priority 10
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 2)
+	var foundPrio7, foundPrio10 bool
+	for _, f := range filters {
+		if f.Attrs().Priority == 7 {
+			foundPrio7 = true
+		}
+		if f.Attrs().Priority == 10 {
+			foundPrio10 = true
+		}
+	}
+	require.True(t, foundPrio7, "必须成功挂载新 Priority 7 规则")
+	require.True(t, foundPrio10, "必须保留第三方 Priority 10 规则")
+
+	// 4. 模拟停用功能执行 Close()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
+	require.NoError(t, m2.Close())
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 1)
+	require.Equal(t, uint16(10), filters[0].Attrs().Priority)
 }

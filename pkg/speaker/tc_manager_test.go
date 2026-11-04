@@ -72,7 +72,7 @@ func TestTCManagerPriority(t *testing.T) {
 	}
 }
 
-// TestTCManagerIsEIPFilter 验证过滤器精准匹配逻辑（仅匹配当前配置的 priority，不匹配历史残留 priority 1）
+// TestTCManagerIsEIPFilter 验证过滤器精准匹配逻辑（基于 Handle=1 与名称解耦 priority，支持跨 priority 迁移与清理）
 func TestTCManagerIsEIPFilter(t *testing.T) {
 	mgr := NewTCManager(&Configuration{TcBpfPriority: 5}).(*linuxTCManager)
 
@@ -88,16 +88,16 @@ func TestTCManagerIsEIPFilter(t *testing.T) {
 		t.Errorf("期望匹配 priority 5 的本程序过滤器，但匹配失败")
 	}
 
-	// 历史 priority 1 不再匹配
-	fOldPriority := &netlink.BpfFilter{
+	// 历史或不同 priority（如 1、7）均能精准识别为本程序过滤器，以便跨 priority 升级驱逐与停用清理
+	fOtherPriority := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			Handle:   1,
 			Priority: 1,
 		},
 		Name: tcEIPFilterName,
 	}
-	if mgr.isEIPFilter(fOldPriority) {
-		t.Errorf("priority 1 过滤器不应被匹配")
+	if !mgr.isEIPFilter(fOtherPriority) {
+		t.Errorf("不同 priority 的本程序过滤器亦应被正确识别")
 	}
 
 	// handle 不为 1 不匹配
@@ -112,7 +112,7 @@ func TestTCManagerIsEIPFilter(t *testing.T) {
 		t.Errorf("handle!=1 过滤器不应被匹配")
 	}
 
-	// 非本程序名字不匹配
+	// 非本程序名字不匹配（即便 handle 为 1，如 Cilium）
 	fOtherName := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			Handle:   1,
