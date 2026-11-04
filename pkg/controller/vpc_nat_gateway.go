@@ -428,7 +428,7 @@ func (c *Controller) syncNatGwTcpConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	desiredLimit := c.getVpcNatGwDesiredTcpConnLimit(gw)
 	dataplaneMode := c.getNatGwDataplaneMode(gw)
 
-	// Check convergence decision (Item 3):
+	// Check convergence decision:
 	// A new/restarted Pod (or force=true during init) must be programmed.
 	// Normal convergence checks that:
 	// 1. Status tcpConnLimit matches desiredLimit
