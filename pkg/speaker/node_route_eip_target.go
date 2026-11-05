@@ -3,13 +3,11 @@
 package speaker
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 
-	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	nadutils "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/utils"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
 
@@ -44,9 +42,11 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 	if !ok {
 		nadName, nadNamespace = subnet.Name, pod.Namespace
 	}
-	var statuses []nadv1.NetworkStatus
-	if err := json.Unmarshal([]byte(pod.Annotations[nadv1.NetworkStatusAnnot]), &statuses); err != nil {
-		return TCRedirectTarget{}, fmt.Errorf("parse network status for Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	expectedNetName := nadNamespace + "/" + nadName
+
+	statuses, err := nadutils.GetNetworkStatus(pod)
+	if err != nil {
+		return TCRedirectTarget{}, fmt.Errorf("failed to get network status for Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 
 	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
@@ -64,16 +64,12 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			return TCRedirectTarget{}, fmt.Errorf("interface %s is not a bridge-mode macvlan", name)
 		}
 		for _, status := range statuses {
-			networkName := status.Name
-			if !strings.Contains(networkName, "/") {
-				networkName = pod.Namespace + "/" + networkName
-			}
-			if networkName != nadNamespace+"/"+nadName {
+			if status.Name != expectedNetName {
 				continue
 			}
 			mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
-				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
 			target := TCRedirectTarget{TargetIfindex: link.Attrs().Index, ParentIfindex: link.Attrs().ParentIndex, TargetMAC: mac}
 			if !validTCRedirectTarget(target) {
@@ -85,11 +81,7 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 		// 非 macvlan 模式（例如 ptp / veth-pair 模式）：
 		// 通过查询 Pod 外部 IP 的宿主机路由反查目标宿主机端 veth 设备。
 		for _, status := range statuses {
-			networkName := status.Name
-			if !strings.Contains(networkName, "/") {
-				networkName = pod.Namespace + "/" + networkName
-			}
-			if networkName != nadNamespace+"/"+nadName {
+			if status.Name != expectedNetName {
 				continue
 			}
 			if len(status.IPs) == 0 {
@@ -111,7 +103,7 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			targetLinkIndex := routes[0].LinkIndex
 			mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
-				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
 			parentIndex := 0
 			if defaultParent != "" {
@@ -129,5 +121,5 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			return target, nil
 		}
 	}
-	return TCRedirectTarget{}, fmt.Errorf("pod %s/%s has no network status for %s/%s", pod.Namespace, pod.Name, nadNamespace, nadName)
+	return TCRedirectTarget{}, fmt.Errorf("pod %s/%s has no network status for %s", pod.Namespace, pod.Name, expectedNetName)
 }
