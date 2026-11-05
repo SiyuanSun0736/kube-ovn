@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -28,13 +29,15 @@ func requireBPFIntegration(t *testing.T) {
 	}
 }
 
-func newTestTCMaps(t *testing.T) (*linuxTCManager, *ebpf.Map, *ebpf.Map) {
+// newTestTCManager 构建测试专用的 linuxTCManager 实例并注入预设大小的 BPF Hash Map。
+func newTestTCManager(t *testing.T) (*linuxTCManager, *ebpf.Map, *ebpf.Map) {
 	t.Helper()
 	requireBPFIntegration(t)
-	v4, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 32, MaxEntries: 64})
+	targetSize := uint32(unsafe.Sizeof(bpfEipTarget{}))
+	v4, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: targetSize, MaxEntries: 64})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, v4.Close()) })
-	v6, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 16, ValueSize: 32, MaxEntries: 64})
+	v6, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 16, ValueSize: targetSize, MaxEntries: 64})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, v6.Close()) })
 	m := newTCManager(&Configuration{EnableTcBpfRedirect: true}).(*linuxTCManager)
@@ -43,7 +46,7 @@ func newTestTCMaps(t *testing.T) (*linuxTCManager, *ebpf.Map, *ebpf.Map) {
 }
 
 func TestTCIPv4PacketKey(t *testing.T) {
-	m, v4, _ := newTestTCMaps(t)
+	m, v4, _ := newTestTCManager(t)
 	ip := net.ParseIP("111.62.156.190")
 	require.NoError(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
 	var value bpfEipTarget
@@ -54,7 +57,7 @@ func TestTCIPv4PacketKey(t *testing.T) {
 }
 
 func TestTCSyncRemovesStaleEntries(t *testing.T) {
-	m, v4, v6 := newTestTCMaps(t)
+	m, v4, v6 := newTestTCManager(t)
 	old := bpfEipTarget{Ifindex: 10}
 	require.NoError(t, v4.Put([]byte{1, 2, 3, 4}, old))
 	require.NoError(t, v6.Put(net.ParseIP("2001:db8::1").To16(), old))
@@ -65,7 +68,7 @@ func TestTCSyncRemovesStaleEntries(t *testing.T) {
 }
 
 func TestTCRejectsInvalidTarget(t *testing.T) {
-	m, _, _ := newTestTCMaps(t)
+	m, _, _ := newTestTCManager(t)
 	for _, target := range []TCRedirectTarget{{}, {TargetIfindex: 10}, {TargetIfindex: -1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}} {
 		require.Error(t, m.AddEIP(net.ParseIP("2001:db8::1"), target))
 	}
@@ -174,7 +177,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 }
 
 func TestTCSyncPreservesExpectedAndCleansStale(t *testing.T) {
-	m, v4, _ := newTestTCMaps(t)
+	m, v4, _ := newTestTCManager(t)
 	ip := net.ParseIP("192.0.2.10")
 	target := TCRedirectTarget{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
 	require.NoError(t, m.AddEIP(ip, target))
@@ -190,7 +193,7 @@ func TestTCSyncPreservesExpectedAndCleansStale(t *testing.T) {
 }
 
 func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
-	m, v4, _ := newTestTCMaps(t)
+	m, v4, _ := newTestTCManager(t)
 	dummy := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-ret-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(dummy))
 	t.Cleanup(func() { _ = netlink.LinkDel(dummy) })

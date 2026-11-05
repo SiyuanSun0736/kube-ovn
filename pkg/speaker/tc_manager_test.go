@@ -25,8 +25,8 @@ func TestTCManagerRedirectTargetLayout(t *testing.T) {
 	}
 }
 
-// TestTCManagerLifecycle 验证 TCManager 初始化与基础生命周期调用安全
-func TestTCManagerLifecycle(t *testing.T) {
+// TestNewTCManager 验证 TCManager 初始化与基础生命周期调用安全
+func TestNewTCManager(t *testing.T) {
 	cfg := &Configuration{
 		EnableTcBpfRedirect: false,
 		TcBpfInterface:      "bond0",
