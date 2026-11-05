@@ -36,7 +36,7 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 	}
 	nadName, nadNamespace, ok := util.GetNadBySubnetProvider(subnet.Spec.Provider)
 	if !ok {
-		nadName, nadNamespace = subnet.Name, pod.Namespace
+		return TCRedirectTarget{}, fmt.Errorf("subnet %s provider %q is not a valid NAD format (<name>.<namespace>)", subnet.Name, subnet.Spec.Provider)
 	}
 	expectedNetName := nadNamespace + "/" + nadName
 

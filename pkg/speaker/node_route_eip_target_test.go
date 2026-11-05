@@ -78,6 +78,16 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		require.ErrorContains(t, err, "NAT gateway pod is missing")
 	})
 
+	t.Run("invalid provider format", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "invalid-provider-without-dot"},
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nat-gw", Namespace: "kube-system"}}
+		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
+		require.ErrorContains(t, err, "is not a valid NAD format")
+	})
+
 	t.Run("macvlan mode target resolution", func(t *testing.T) {
 		subnet := &kubeovnv1.Subnet{
 			ObjectMeta: metav1.ObjectMeta{
