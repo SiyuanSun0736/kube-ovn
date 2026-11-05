@@ -222,11 +222,6 @@ func ParseFlags() (*Configuration, error) {
 		return nil, err
 	}
 
-	if config.EnableTcBpfRedirect && config.TcBpfInterface == "" {
-		klog.Errorf("--enable-tc-bpf-redirect requires explicit --tc-bpf-interface (e.g. macbond1); disabling TC BPF redirect to protect production from misrouting to default route interface")
-		config.EnableTcBpfRedirect = false
-	}
-
 	if err := config.validateRequiredFlags(); err != nil {
 		return nil, err
 	}
@@ -326,6 +321,10 @@ func (config *Configuration) validateRequiredFlags() error {
 	// NodeRouteEIPMode requires NodeName to identify local NAT gateway pods
 	if config.NodeRouteEIPMode && config.NodeName == "" {
 		missingFlags = append(missingFlags, "--node-route-eip-mode requires --node-name to be specified")
+	}
+
+	if config.EnableTcBpfRedirect && config.TcBpfInterface == "" {
+		missingFlags = append(missingFlags, "--enable-tc-bpf-redirect requires explicit --tc-bpf-interface (e.g. macbond1)")
 	}
 
 	if config.EnableBFD {

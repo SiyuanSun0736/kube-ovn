@@ -118,6 +118,18 @@ func TestValidateRequiredFlags(t *testing.T) {
 			errContains: []string{"node-name"},
 		},
 		{
+			name: "enable-tc-bpf-redirect requires tc-bpf-interface",
+			config: &Configuration{
+				NeighborAddresses:   []net.IP{net.ParseIP("192.168.1.1")},
+				ClusterAs:           65000,
+				NeighborAs:          65001,
+				EnableTcBpfRedirect: true,
+				TcBpfInterface:      "",
+			},
+			expectError: true,
+			errContains: []string{"tc-bpf-interface"},
+		},
+		{
 			name:        "missing all required flags",
 			config:      &Configuration{},
 			expectError: true,
@@ -327,14 +339,17 @@ func TestInitNeighborLocalAddressesPureExtensionMode(t *testing.T) {
 }
 
 func TestTcBpfConfigProtection(t *testing.T) {
-	// 验证未显式指定 TcBpfInterface 时，即便开启了 EnableTcBpfRedirect，也不应导致 Speaker 启动崩溃，而是降级关闭
+	// 验证未显式指定 TcBpfInterface 时，开启 EnableTcBpfRedirect 应触发参数校验错误并阻止启动（快速失败）
 	config := &Configuration{
+		NeighborAddresses:   []net.IP{net.ParseIP("192.168.1.1")},
+		ClusterAs:           65000,
+		NeighborAs:          65001,
+		NodeName:            "node1",
 		NodeRouteEIPMode:    true,
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      "",
 	}
-	if config.EnableTcBpfRedirect && config.TcBpfInterface == "" {
-		config.EnableTcBpfRedirect = false
-	}
-	require.False(t, config.EnableTcBpfRedirect, "未指定 TcBpfInterface 时应自动降级关闭 TC BPF 旁路直通以保护生产")
+	err := config.validateRequiredFlags()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--enable-tc-bpf-redirect requires explicit --tc-bpf-interface")
 }
