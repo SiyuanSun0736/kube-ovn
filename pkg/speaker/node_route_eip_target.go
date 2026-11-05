@@ -101,16 +101,13 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
-			parentIndex := 0
 			if defaultParent != "" {
-				if plink, err := lookup(defaultParent); err == nil {
-					parentIndex = plink.Attrs().Index
+				if plink, err := lookup(defaultParent); err == nil && targetLinkIndex == plink.Attrs().Index {
+					return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s points to ingress interface %s (%d), not a local pod veth", podIP, defaultParent, plink.Attrs().Index)
 				}
 			}
-			if parentIndex > 0 && targetLinkIndex == parentIndex {
-				return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s points to ingress/parent interface %d, not a local pod veth", podIP, parentIndex)
-			}
-			target := TCRedirectTarget{TargetIfindex: targetLinkIndex, ParentIfindex: parentIndex, TargetMAC: mac}
+			// veth 设备无父设备（ParentIfindex 为 0）
+			target := TCRedirectTarget{TargetIfindex: targetLinkIndex, ParentIfindex: 0, TargetMAC: mac}
 			if !validTCRedirectTarget(target) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}

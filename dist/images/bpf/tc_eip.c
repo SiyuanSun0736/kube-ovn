@@ -82,7 +82,8 @@ static __always_inline int mac_eq(const __u8 *a, const __u8 *b) {
 static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
                                              struct eip_target *target) {
     struct ethhdr *eth = data;
-    return skb->ifindex == target->parent_ifindex &&
+    return target->parent_ifindex &&
+           skb->ifindex == target->parent_ifindex &&
            mac_eq(eth->h_dest, target->target_mac);
 }
 
