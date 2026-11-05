@@ -316,10 +316,54 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	require.True(t, foundPrio7, "必须成功挂载新 Priority 7 规则")
 	require.True(t, foundPrio10, "必须保留第三方 Priority 10 规则")
 
-	// 4. 模拟停用功能执行 Close()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
-	require.NoError(t, m2.Close())
+	// 4. 模拟停用功能执行 Clean()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
+	require.NoError(t, m2.Clean())
 	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
 	require.Equal(t, uint16(10), filters[0].Attrs().Priority)
+}
+
+func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
+	requireBPFIntegration(t)
+	pin := testTCPinPath(t)
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-reload-%d", time.Now().UnixNano()%100000)}}
+	require.NoError(t, netlink.LinkAdd(link))
+	t.Cleanup(func() { _ = netlink.LinkDel(link) })
+
+	cfg := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfMapPath:        pin,
+	}
+
+	// 1. 启动第一代实例并写入条目
+	m1 := NewTCManager(cfg)
+	require.NoError(t, m1.Attach(link.Name))
+	ip := net.ParseIP("183.240.180.136")
+	target := TCRedirectTarget{TargetIfindex: 100, ParentIfindex: 10, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0x18, 1}}
+	require.NoError(t, m1.AddEIP(ip, target))
+
+	// 2. 模拟进程优雅退出/热更：执行 Close()，此时内核 Filter 与 Pinned Map 必须完好保留
+	require.NoError(t, m1.Close())
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 1, "TC filter must remain active after graceful Close")
+
+	// 3. 启动第二代实例：应该成功复用既有 Map
+	m2 := NewTCManager(cfg)
+	require.NoError(t, m2.Attach(link.Name))
+
+	// 验证第二代实例直接继承了第一代的 EIP 条目，业务在进程重启期间完全无中断
+	var old bpfEipTarget
+	require.NoError(t, m2.(*linuxTCManager).v4Map.Lookup(ip.To4(), &old), "reloaded manager must inherit existing entries")
+	require.Equal(t, uint32(100), old.Ifindex)
+
+	// 4. 显式 Clean 之后，规则与 Map 彻底被清理
+	require.NoError(t, m2.Clean())
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Empty(t, filters, "TC filter must be removed after Clean")
+	_, err = os.Stat(pin)
+	require.True(t, os.IsNotExist(err), "pinned map must be removed after Clean")
 }

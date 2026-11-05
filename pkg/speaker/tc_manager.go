@@ -32,8 +32,11 @@ type TCManager interface {
 	// retainedIPs 可选指定当前属于本节点活跃范围、但因 Pod 元数据短暂就绪延迟而需声明式保留存量映射的 EIP 列表。
 	SyncEIPs(expected map[string]TCRedirectTarget, retainedIPs ...string) error
 
-	// Close 关闭并释放已打开的 BPF 文件描述符与相关句柄
+	// Close 关闭并释放已打开的 BPF 文件描述符与相关句柄，但保留内核中的 TC Filter 规则与 Pinned Map 数据面，支持热更新无损重启
 	Close() error
+
+	// Clean 彻底清理内核中的 TC Filter 挂载与 Pinned Map（通常在显式停用该特性时调用）
+	Clean() error
 }
 
 // NewTCManager 根据当前 Speaker 配置构造 TCManager 实例

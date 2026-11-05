@@ -257,10 +257,15 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		if ip == "" {
 			continue
 		}
-		if c.config.EnableTcBpfRedirect && redirectTarget != nil && validTCRedirectTarget(*redirectTarget) {
+		if c.config.EnableTcBpfRedirect {
+			if redirectTarget == nil || !validTCRedirectTarget(*redirectTarget) {
+				klog.V(3).Infof("deferring BGP route announcement for EIP %s until TC redirect target is ready", ip)
+				continue
+			}
 			if err := c.tcManager.AddEIP(net.ParseIP(ip), *redirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
+				continue
 			}
 		}
 		if c.isRouteAnnounced(ip) {

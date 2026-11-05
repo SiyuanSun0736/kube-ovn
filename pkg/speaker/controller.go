@@ -265,7 +265,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 //	    announces NAT gateway EIPs from inside the gateway pod.
 func (c *Controller) Reconcile() {
 	if c.tcCleanupPending {
-		if err := c.tcManager.Close(); err != nil {
+		if err := c.tcManager.Clean(); err != nil {
 			klog.Errorf("failed to clean up disabled TC EIP redirection, will retry on next reconcile: %v", err)
 		} else {
 			c.tcCleanupPending = false

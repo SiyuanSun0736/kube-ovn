@@ -147,31 +147,52 @@ func (m *linuxTCManager) load() error {
 	if spec.Programs["tc_eip_ingress"] == nil || spec.Maps[tcEIPv4MapName] == nil || spec.Maps[tcEIPv6MapName] == nil {
 		return errors.New("TC object is missing its EIP classifier or maps")
 	}
-	// 启动时使用全新代际的 Map。Speaker 重启后旧的 Pin 绝不能带入过期的 ifindex；
-	// 周期性对账逻辑会自动重新填充当前有效的目标网关信息。
+	// 优先尝试复用 bpffs 中既有的 Pinned Map，实现进程重启/热更新期间数据面 0 丢包。
 	for _, ms := range spec.Maps {
 		ms.Pinning = ebpf.PinNone
 	}
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove BPF memlock limit: %w", err)
 	}
-	coll, err := ebpf.NewCollection(spec)
+
+	v4Path, v6Path := m.mapPaths()
+	mapPaths := map[string]string{tcEIPv4MapName: v4Path, tcEIPv6MapName: v6Path}
+	replacements := make(map[string]*ebpf.Map)
+	for name, p := range mapPaths {
+		if pinned, err := ebpf.LoadPinnedMap(p, nil); err == nil {
+			replacements[name] = pinned
+		}
+	}
+
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
+	if err != nil && len(replacements) > 0 {
+		klog.Warningf("failed to load TC program with existing pinned maps, falling back to new maps: %v", err)
+		for _, r := range replacements {
+			_ = r.Close()
+		}
+		replacements = make(map[string]*ebpf.Map)
+		for _, p := range mapPaths {
+			_ = removePin(p)
+		}
+		coll, err = ebpf.NewCollection(spec)
+	}
 	if err != nil {
+		for _, r := range replacements {
+			_ = r.Close()
+		}
 		return fmt.Errorf("load TC program: %w", err)
 	}
-	if err = m.cleanupFilters(""); err != nil {
-		coll.Close()
-		return err
-	}
-	v4, v6 := m.mapPaths()
-	for name, path := range map[string]string{tcEIPv4MapName: v4, tcEIPv6MapName: v6} {
-		if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
-			err = removePin(path)
+
+	// 仅对新创建（未复用）的 Map 挂载至 bpffs
+	for name, path := range mapPaths {
+		if _, ok := replacements[name]; ok {
+			continue
 		}
-		if err == nil {
-			err = coll.Maps[name].Pin(path)
+		if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			coll.Close()
+			return fmt.Errorf("create map dir %s: %w", filepath.Dir(path), err)
 		}
-		if err != nil {
+		if err = coll.Maps[name].Pin(path); err != nil {
 			coll.Close()
 			return fmt.Errorf("pin EIP map %s: %w", path, err)
 		}
@@ -433,8 +454,25 @@ func removePin(path string) error {
 	return nil
 }
 
-// Close 会在功能停用时尽力而为（Best-Effort）清理遗留的 TC 挂载、BPF Collection 与 Pinned Map，并聚合返回所有错误。
+// Close 关闭并释放已打开的用户态 BPF Collection 与文件描述符句柄，
+// 但保留内核中的 TC Filter 规则与 Pinned Map 数据面，支持进程重启与热更新期间数据面 0 丢包。
 func (m *linuxTCManager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.collection != nil {
+		m.collection.Close()
+		m.collection = nil
+		m.v4Map = nil
+		m.v6Map = nil
+		m.progID = 0
+		m.progTag = ""
+	}
+	m.closed = true
+	return nil
+}
+
+// Clean 会在功能显式停用时尽力而为（Best-Effort）彻底清理遗留的 TC 挂载、BPF Collection 与 Pinned Map，并聚合返回所有错误。
+func (m *linuxTCManager) Clean() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var errs []error

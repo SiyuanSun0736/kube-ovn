@@ -52,17 +52,17 @@ func TestTCFailureDoesNotBlockServiceReconciliation(t *testing.T) {
 
 type trackingTCManager struct {
 	TCManager
-	closeErr error
-	closed   bool
+	cleanErr error
+	cleaned  bool
 }
 
-func (m *trackingTCManager) Close() error {
-	m.closed = true
-	return m.closeErr
+func (m *trackingTCManager) Clean() error {
+	m.cleaned = true
+	return m.cleanErr
 }
 
-func TestTCCloseFailureRetriesUntilSuccess(t *testing.T) {
-	mgr := &trackingTCManager{closeErr: errors.New("permission denied")}
+func TestTCCleanFailureRetriesUntilSuccess(t *testing.T) {
+	mgr := &trackingTCManager{cleanErr: errors.New("permission denied")}
 	services := &trackingServicesLister{}
 	nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	require.NoError(t, nodes.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: map[string]string{util.BgpSpeakLbVipLabel: "true"}}}))
@@ -74,14 +74,14 @@ func TestTCCloseFailureRetriesUntilSuccess(t *testing.T) {
 		servicesLister:   services,
 		nodesLister:      listerv1.NewNodeLister(nodes),
 	}
-	// 第一次 Reconcile：Close 失败，tcCleanupPending 必须保留为 true 以便下次重试，同时业务对账不被中断
+	// 第一次 Reconcile：Clean 失败，tcCleanupPending 必须保留为 true 以便下次重试，同时业务对账不被中断
 	c.Reconcile()
-	require.True(t, mgr.closed, "tcManager.Close must be called")
-	require.True(t, c.tcCleanupPending, "tcCleanupPending must be retained on Close failure for retry")
+	require.True(t, mgr.cleaned, "tcManager.Clean must be called")
+	require.True(t, c.tcCleanupPending, "tcCleanupPending must be retained on Clean failure for retry")
 	require.True(t, services.listed, "Reconciliation must proceed even if TC cleanup fails")
 
-	// 第二次 Reconcile：故障恢复，Close 成功，tcCleanupPending 清除为 false
-	mgr.closeErr = nil
+	// 第二次 Reconcile：故障恢复，Clean 成功，tcCleanupPending 清除为 false
+	mgr.cleanErr = nil
 	c.Reconcile()
-	require.False(t, c.tcCleanupPending, "tcCleanupPending must be cleared when Close succeeds")
+	require.False(t, c.tcCleanupPending, "tcCleanupPending must be cleared when Clean succeeds")
 }
