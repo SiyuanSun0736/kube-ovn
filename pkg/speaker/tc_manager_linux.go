@@ -34,14 +34,15 @@ type bpfEipTarget struct {
 }
 
 type linuxTCManager struct {
-	cfg        *Configuration
-	mu         sync.Mutex
-	collection *ebpf.Collection
-	v4Map      *ebpf.Map
-	v6Map      *ebpf.Map
-	progID     uint32
-	progTag    string
-	closed     bool
+	cfg         *Configuration
+	mu          sync.Mutex
+	collection  *ebpf.Collection
+	v4Map       *ebpf.Map
+	v6Map       *ebpf.Map
+	progID      uint32
+	progTag     string
+	attachedDev string
+	closed      bool
 }
 
 func newTCManager(cfg *Configuration) TCManager { return &linuxTCManager{cfg: cfg} }
@@ -66,15 +67,16 @@ func (m *linuxTCManager) mapPaths() (string, string) {
 	return v4, v6
 }
 
-// Attach 具备幂等性，支持网卡设备或过滤器重建后的自动恢复。
-// 失败的尝试不会留下成功挂载标记，可安全重试。
-func (m *linuxTCManager) Attach(linkName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// ensureAttached 自动确保指定的物理网卡已挂载 TC BPF 程序，并通过内存缓存短路避免高频 Netlink 系统调用。
+func (m *linuxTCManager) ensureAttached(linkName string) error {
 	if m.closed {
 		return errors.New("TC manager is closed")
 	}
 	if !m.cfg.EnableTcBpfRedirect {
+		return nil
+	}
+	// 若处于测试注入独立 Map 模式（未加载完整 BPF Collection），跳过底层网卡挂载
+	if m.collection == nil && (m.v4Map != nil || m.v6Map != nil) {
 		return nil
 	}
 	if linkName == "" {
@@ -84,6 +86,17 @@ func (m *linuxTCManager) Attach(linkName string) error {
 		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting")
 		return errors.New("tc-bpf-interface must be explicitly specified")
 	}
+	if m.attachedDev == linkName {
+		return nil
+	}
+	if err := m.attach(linkName); err != nil {
+		return err
+	}
+	m.attachedDev = linkName
+	return nil
+}
+
+func (m *linuxTCManager) attach(linkName string) error {
 	link, err := netlink.LinkByName(linkName)
 	if err != nil {
 		return err
@@ -133,6 +146,14 @@ func (m *linuxTCManager) Attach(linkName string) error {
 		},
 		Fd: prog.FD(), Name: tcEIPFilterName, DirectAction: true,
 	})
+}
+
+// Attach 具备幂等性，支持网卡设备或过滤器重建后的自动恢复。
+// 失败的尝试不会留下成功挂载标记，可安全重试。
+func (m *linuxTCManager) Attach(linkName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureAttached(linkName)
 }
 
 func (m *linuxTCManager) load() error {
@@ -274,6 +295,7 @@ func (m *linuxTCManager) cleanupFilters(linkName string) error {
 func (m *linuxTCManager) Detach(linkName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.attachedDev = ""
 	return m.cleanupFilters(linkName)
 }
 
@@ -338,6 +360,9 @@ func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
+	if err := m.ensureAttached(m.cfg.TcBpfInterface); err != nil {
+		return err
+	}
 	return m.addEIP(ip, target)
 }
 
@@ -366,6 +391,11 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retained
 	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
+	}
+	if len(expected) > 0 || len(retainedIPs) > 0 {
+		if err := m.ensureAttached(m.cfg.TcBpfInterface); err != nil {
+			return err
+		}
 	}
 	wanted := make(map[string]bool, len(expected)+len(retainedIPs))
 	var errs []error
@@ -459,6 +489,7 @@ func removePin(path string) error {
 func (m *linuxTCManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.attachedDev = ""
 	if m.collection != nil {
 		m.collection.Close()
 		m.collection = nil
@@ -475,6 +506,7 @@ func (m *linuxTCManager) Close() error {
 func (m *linuxTCManager) Clean() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.attachedDev = ""
 	var errs []error
 	if err := m.cleanupFilters(""); err != nil {
 		errs = append(errs, err)

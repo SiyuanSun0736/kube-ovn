@@ -244,12 +244,6 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		redirectTarget, _, err = c.resolveEipRedirectTarget(eip)
 		if err != nil {
 			errs = append(errs, err)
-		} else if redirectTarget != nil {
-			if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
-				klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
-				errs = append(errs, err)
-				redirectTarget = nil
-			}
 		}
 	}
 
