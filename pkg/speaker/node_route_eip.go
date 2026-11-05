@@ -238,17 +238,17 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 	}
 
 	var errs []error
-	var tcTarget TCRedirectTarget
+	var redirectTarget TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
 		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 		if err != nil {
-			klog.Warningf("failed to get NAT GW pod %s for TC BPF: %v", podName, err)
+			klog.Warningf("failed to get NAT GW pod %s for EIP redirection: %v", podName, err)
 			errs = append(errs, err)
 		} else {
-			tcTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
+			redirectTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
 			if err != nil {
-				klog.Warningf("failed to resolve TC target info for EIP %s: %v", eipName, err)
+				klog.Warningf("failed to resolve redirect target for EIP %s: %v", eipName, err)
 				errs = append(errs, err)
 			} else {
 				if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
@@ -264,8 +264,8 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		if ip == "" {
 			continue
 		}
-		if c.config.EnableTcBpfRedirect && validTCRedirectTarget(tcTarget) {
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), tcTarget); err != nil {
+		if c.config.EnableTcBpfRedirect && validTCRedirectTarget(redirectTarget) {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), redirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 			}
@@ -319,8 +319,8 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 // can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
-	expectedTcMap := make(map[string]TCRedirectTarget)
-	var retainedTcEIPs []string
+	expectedEipTargets := make(map[string]TCRedirectTarget)
+	var retainedEIPs []string
 	var targetErrors []error
 
 	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
@@ -341,8 +341,8 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
-		var tcTarget TCRedirectTarget
-		var tcResolved bool
+		var redirectTarget TCRedirectTarget
+		var targetResolved bool
 		var shouldRetainIfTransient bool
 		if c.config.EnableTcBpfRedirect {
 			podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
@@ -350,22 +350,22 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			if err == nil {
 				// 声明式状态判定：若 Pod 已被标记删除或处于失败状态，属于确定性失效，绝不保留旧映射
 				if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodFailed {
-					klog.Warningf("NAT GW pod %s for EIP %s is terminating or failed, will not retain TC redirection", podName, eipName)
+					klog.Warningf("NAT GW pod %s for EIP %s is terminating or failed, will not retain redirect target", podName, eipName)
 				} else {
-					tcTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
+					redirectTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
 					if err == nil {
-						tcResolved = true
+						targetResolved = true
 					} else {
 						// Pod 正常活跃，仅因 NetworkStatus 正在写入或 Subnet 缓存短暂未就绪，可声明式保留存量可用映射
 						shouldRetainIfTransient = true
-						klog.Warningf("failed to resolve TC target info for EIP %s, but pod %s is active: %v", eipName, podName, err)
+						klog.Warningf("failed to resolve redirect target for EIP %s, but pod %s is active: %v", eipName, podName, err)
 					}
 				}
 			} else if !apierrors.IsNotFound(err) {
 				// 非 NotFound 的瞬时缓存/API 抖动，同样声明式保留存量映射
 				shouldRetainIfTransient = true
 			}
-			if err != nil && !tcResolved {
+			if err != nil && !targetResolved {
 				targetErrors = append(targetErrors, err)
 			}
 		}
@@ -373,10 +373,10 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if tcResolved {
-					expectedTcMap[ip] = tcTarget
+				if targetResolved {
+					expectedEipTargets[ip] = redirectTarget
 				} else if shouldRetainIfTransient {
-					retainedTcEIPs = append(retainedTcEIPs, ip)
+					retainedEIPs = append(retainedEIPs, ip)
 				}
 			}
 		}
@@ -385,11 +385,11 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	if c.config.EnableTcBpfRedirect {
 		err := c.tcManager.Attach(c.config.TcBpfInterface)
 		if err == nil {
-			err = c.tcManager.SyncEIPs(expectedTcMap, retainedTcEIPs...)
+			err = c.tcManager.SyncEIPs(expectedEipTargets, retainedEIPs...)
 		}
 		if err != nil {
 			// TC eBPF 挂载或同步失败时不应撤销 BGP 路由；降级回退到宿主机内核协议栈以优先保障服务连续性
-			klog.Errorf("failed to sync TC BPF redirection, falling back to kernel datapath: %v", err)
+			klog.Errorf("failed to sync EIP redirection targets, falling back to kernel datapath: %v", err)
 			targetErrors = append(targetErrors, err)
 		}
 	}
