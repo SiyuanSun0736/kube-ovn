@@ -1,23 +1,12 @@
 # EIP TC 旁路直通加速与抗 conntrack 击穿防护
 
-Kube-OVN 主 Dockerfile 在独立构建阶段编译 `tc_eip.c`，并将 `/etc/kube-ovn/tc_eip.o` 同时打包进 amd64 与 arm64 镜像中。
-在安装有 clang、libbpf 头文件及 Linux UAPI 头文件的 Linux 环境下，可直接执行 `make -C dist/images/bpf` 进行独立编译。
+Kube-OVN 主 Dockerfile 在独立构建阶段编译 `tc_eip.c`，并将 `/etc/kube-ovn/tc_eip.o` 打包进镜像。
+在具备 clang 与 Linux UAPI 头文件环境下，可执行 `make -C dist/images/bpf` 独立编译。
 
-## 编译机制与内核跨版本兼容性 (AOT vs 现场编译)
+## 编译与内核兼容性
 
-### 1. 为什么采用提前编译（AOT），而不是在节点环境现场编译？
-- **规避现场编译的生产隐患**：若在物理节点或 Pod 内现场调用 clang 编译，容器镜像需强制内置数十 MB 至数百 MB 的编译器、头文件及构建工具链（如 `clang`、`llvm`、`make`、`linux-libc-dev`）。若物理节点升级了内核小版本但缺少对应的 `linux-headers`，极易因头文件缺失导致 Speaker 启动失败（CrashLoopBackOff），引发整节点 BGP 路由与网络中断。
-- **参考 Cilium 的架构演进**：
-  - **早期 Cilium（v1.9 及以前）**：在节点 Agent 容器内打包 clang/llvm，运行时根据物理节点配置动态拼装头文件宏并在现场编译。但这导致节点重启时遭遇极高的 CPU 峰值冲击、启动变慢，且严重依赖节点底层的内核开发包环境。
-  - **现代 Cilium（v1.10+）**：已全面放弃现场编译，转向 **BPF CO-RE + AOT 提前预编译**。即在 CI/镜像构建期统一编译好通用的 BPF ELF 目标文件，运行时直接加载并通过内存修补（`.rodata`）或 BTF 重定位动态适配。
-
-### 2. Linux 5.x / 6.x 内核免重编译原理
-本模块的 `tc_eip.c` 实现严格遵循 Linux 用户空间稳定 ABI（UAPI）规范：
-- **核心数据结构**：仅依赖 `struct __sk_buff`。这是 Linux 内核专门为 eBPF 提供的用户空间稳定镜像结构体，其字段布局与成员偏移在 Linux 5.x 及 6.x 内核中**被严格冻结，永不破坏向后兼容性**。内核加载器在校验时会自动执行上下文访问重写（Context Rewrite）；
-- **网络协议头**：以太网帧头 `struct ethhdr` 与 IPv4 报头 `struct iphdr` 为标准协议定义，布局数十年不变；
-- **BPF 辅助函数**：调用的 `bpf_map_lookup_elem`、`bpf_skb_store_bytes`、`bpf_redirect` 均为 Linux 4.14+ 即固化的通用 Helper，签名完全稳定。
-
-因此，在构建镜像时编译生成的 `tc_eip.o` ELF 文件，**天然兼容 Linux 5.4+ 的所有 Linux 5.x 与 6.x 内核（包括各种小版本补丁）**，在物理集群环境（如 `5.15.0-161`、`5.15.0-198`、`6.x` 等）节点间升级或混跑时，**均无需在环境上重新编译**，开箱即用。
+`tc_eip.c` 仅依赖标准网络头（`ethhdr`, `iphdr`）、稳定 UAPI 结构 `struct __sk_buff` 以及基础 Helper（`bpf_map_lookup_elem`, `bpf_skb_store_bytes`, `bpf_redirect`）。
+编译产物 `tc_eip.o` 为通用 ELF 目标文件，免去节点现场编译和 kernel-headers 依赖，直接适配 Linux 5.4+ 的所有 5.x 及 6.x 内核。
 
 ## 运行配置与网络架构
 
