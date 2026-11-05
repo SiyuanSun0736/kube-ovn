@@ -18,7 +18,7 @@ Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF
 网关 Pod 的外网子网通过其 `ovn.kubernetes.io/nad-macvlan-master` 注解独立指定 macvlan 主设备（Master）。
 宿主机 macvlan 必须以 bridge 模式运行。网关 Pod 的 Multus network-status 必须包含该外网 NAD 及其真实硬件 MAC 地址。
 未解析或非法的目标会被拒绝，并在全量对账过程中从旁路 Map 中剔除并按需重试。
-带有内联 VLAN Tag 的报文将直接放行，不走旁路直通。
+支持解析单层（802.1Q/802.1ad）及双层 QinQ VLAN Tag 报文，改写最外层 MAC 并保留 VLAN 封装直通网关 Pod。
 
 `--tc-bpf-map-path` 指定 IPv4 Pinned Map 挂载路径，默认为 `/sys/fs/bpf/kube_ovn_eip_v4_map`。
 IPv6 沿用该路径，将其中的 `_v4_map` 替换为 `_v6_map`（若无此后缀则直接追加 `_v6_map`）。

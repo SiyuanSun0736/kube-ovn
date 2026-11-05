@@ -42,6 +42,12 @@ struct eip_target {
     __u32 parent_ifindex;   // macvlan 父设备接口索引（Master ifindex）
 };
 
+// VLAN 报文头结构体（IEEE 802.1Q / 802.1ad，共 4 字节）
+struct vlan_hdr {
+    __be16 h_vlan_TCI;                  // 优先权、CFI 与 VLAN 标识符 (VID)
+    __be16 h_vlan_encapsulated_proto;   // 内层封装的上层协议（如 ETH_P_IP 或内层 802.1Q）
+};
+
 // IPv4 EIP ➔ 本地网关网卡索引与统计映射表
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -86,8 +92,8 @@ static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
 // - TC_ACT_OK (0)：专用于“已命中 EIP 且正处于 macvlan 本地交付链路”的报文，直接终止 TC 处理交由内核驱动 RX 处理，规避重定向死循环；
 // - TC_ACT_SHOT (2)：仅在底层严重异常（如 bpf_skb_store_bytes 越界失败）时安全丢包。
 // 处理 IPv4 报文逻辑
-static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end) {
-    struct iphdr *iph = data + sizeof(struct ethhdr);
+static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end, __u32 l3_offset) {
+    struct iphdr *iph = data + l3_offset;
     // 边界检查，防止越界访问引发内核校验器拒绝
     if ((void *)(iph + 1) > data_end) {
         return TC_ACT_UNSPEC;
@@ -105,7 +111,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
         return TC_ACT_OK;
     }
 
-    // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC
+    // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC（外层 MAC 偏移为 0）
     if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
         target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {
         if (bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest), target->target_mac, 6, 0) < 0) {
@@ -119,8 +125,8 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
 }
 
 // 处理 IPv6 报文逻辑
-static __always_inline int process_ipv6(struct __sk_buff *skb, void *data, void *data_end) {
-    struct ipv6hdr *ip6h = data + sizeof(struct ethhdr);
+static __always_inline int process_ipv6(struct __sk_buff *skb, void *data, void *data_end, __u32 l3_offset) {
+    struct ipv6hdr *ip6h = data + l3_offset;
     if ((void *)(ip6h + 1) > data_end) {
         return TC_ACT_UNSPEC;
     }
@@ -158,16 +164,25 @@ int tc_eip_ingress(struct __sk_buff *skb) {
     }
 
     __u16 h_proto = bpf_ntohs(eth->h_proto);
+    __u32 l3_offset = sizeof(struct ethhdr);
 
-    // 遇到 VLAN Tag 流量时放行，保持与底层网络封装兼容
-    if (h_proto == ETH_P_8021Q || h_proto == ETH_P_8021AD) {
-        return TC_ACT_UNSPEC;
+    // 支持解析 802.1Q 与 802.1ad VLAN 标签（包括单层与双层 QinQ），兼容外网/宿主机带 Tag 的网络流量
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (h_proto == ETH_P_8021Q || h_proto == ETH_P_8021AD) {
+            struct vlan_hdr *vhdr = data + l3_offset;
+            if ((void *)(vhdr + 1) > data_end) {
+                return TC_ACT_UNSPEC;
+            }
+            h_proto = bpf_ntohs(vhdr->h_vlan_encapsulated_proto);
+            l3_offset += sizeof(struct vlan_hdr);
+        }
     }
 
     if (h_proto == ETH_P_IP) {
-        return process_ipv4(skb, data, data_end);
+        return process_ipv4(skb, data, data_end, l3_offset);
     } else if (h_proto == ETH_P_IPV6) {
-        return process_ipv6(skb, data, data_end);
+        return process_ipv6(skb, data, data_end, l3_offset);
     }
 
     // 其它未知协议报文默认放行
