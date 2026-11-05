@@ -208,33 +208,35 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 
 	eip, err := c.eipLister.Get(eipName)
 	if err != nil {
-		// EIP 已被删除，跳过处理
+		// EIP was deleted, skip processing
 		klog.V(3).Infof("iptables-eip %s not found, may have been deleted", eipName)
 		return nil
 	}
 
-	// 跳过未就绪的 EIP - 待其 Ready 后再处理；周期性对账 (syncNodeRouteEIPs) 也会清理陈旧路由
+	// Skip non-ready EIPs - they will be processed when they become ready
+	// Periodic reconcile (syncNodeRouteEIPs) will clean up any stale routes
 	if !eip.Status.Ready {
 		return nil
 	}
 
-	// 检查该 EIP 是否启用了 BGP 注解
+	// Check if BGP annotation is enabled for this EIP
 	if eip.Annotations[util.BgpAnnotation] != "true" {
 		klog.V(3).Infof("iptables-eip %s does not have BGP annotation, skipping", eipName)
-		// 撤销存量路由（应对 BGP 注解被动态移除的场景）
+		// Withdraw any existing routes for this EIP (in case annotation was removed)
 		c.withdrawEIPRoutes(eip)
 		return nil
 	}
 
-	// 检查 NAT 网关 Pod 是否在本地节点正常运行
+	// Check if the NAT gateway pod is running on the local node
 	if !c.hasNatGwPodOnLocalNode(eip) {
 		klog.V(3).Infof("NAT GW pod for iptables-eip %s not on local node %s, withdrawing routes",
 			eipName, c.config.NodeName)
-		// 撤销存量路由（应对网关 Pod 漂移到其他节点或删除下线的场景）
+		// Withdraw any existing routes for this EIP (in case pod moved to another node)
 		c.withdrawEIPRoutes(eip)
 		return nil
 	}
 
+	// Announce routes only if not already announced (idempotent)
 	var errs []error
 	var redirectTarget *TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
@@ -280,9 +282,9 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 	return errors.Join(errs...)
 }
 
-// hasNatGwPodOnLocalNode 检查该 EIP 对应的 NAT 网关 Pod 是否正在本节点正常运行。
-// 网关 Pod 命名规范：vpc-nat-gw-{natGwDp}-0
-// 仅当 Pod 存在、处于 Running 状态且未被标记删除（非 Terminating），并调度在本节点时才返回 true。
+// hasNatGwPodOnLocalNode checks if the NAT gateway pod for this EIP is running on the local node.
+// NAT gateway pod name follows the pattern: vpc-nat-gw-{natGwDp}-0
+// Returns true only if the pod exists, is Running, and is scheduled on the local node.
 func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	if eip.Spec.NatGwDp == "" {
 		klog.Errorf("iptables-eip %s has empty NatGwDp field", eip.Name)
@@ -290,14 +292,14 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	}
 
 	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-	// 使用监听 VpcNatGwNamespace 的 gwPodsLister
+	// Use gwPodsLister which watches pods in VpcNatGwNamespace
 	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 	if err != nil {
 		klog.V(3).Infof("failed to get NAT GW pod %s/%s: %v", c.config.VpcNatGwNamespace, podName, err)
 		return false
 	}
 
-	// 仅对运行在本节点且非删除态的 Pod 宣告路由
+	// Only announce routes for Running pods on local node
 	return pod.Spec.NodeName == c.config.NodeName && isPodRunning(pod)
 }
 
@@ -334,30 +336,32 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	return &target, false, nil
 }
 
-// syncNodeRouteEIPs 在 node-route 模式下全量对账所有 EIP。
-// 该方法寻找与本地 NAT 网关 Pod 关联的所有 EIP 并进行宣告，同时撤销不再应当宣告的 EIP。
+// syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
+// This method finds all EIPs associated with local NAT gateway pods and announces them.
+// It also withdraws any EIPs that should no longer be announced.
 //
-// 当同时启用 EnableLbSvcAnnounce 时，Service VIP 前缀会合并到期望集合中，
-// 从而使 node-route-eip 模式与 Service VIP 宣告能在同一个 speaker 实例上并发运行。
+// When EnableLbSvcAnnounce is also enabled, Service VIP prefixes are
+// merged into the expected set so that node-route-eip mode and Service VIP announcements
+// can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
 	expectedEipTargets := make(map[string]TCRedirectTarget)
 	var retainedEIPs []string
 	var targetErrors []error
 
-	// EIP 数据面：宣告本地 NAT 网关 Pod 的 IptablesEIP 地址
+	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
 	for _, eip := range eips {
-		// 仅处理带有 BGP 注解且处于 Ready 状态的 EIP
+		// Only process ready EIPs with BGP annotation
 		if eip.Annotations[util.BgpAnnotation] != "true" || !eip.Status.Ready {
 			continue
 		}
 
-		// 仅处理调度在本地且正常运行的 NAT 网关 Pod 的 EIP
+		// Only announce EIPs for local NAT gateway pods
 		if !c.hasNatGwPodOnLocalNode(eip) {
 			continue
 		}
