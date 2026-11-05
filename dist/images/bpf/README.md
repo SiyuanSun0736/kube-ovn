@@ -63,7 +63,24 @@ TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `-
      skb->ifindex == target->parent_ifindex && mac_eq(eth->h_dest, target->target_mac)
      ```
      当前网卡为父网卡且**目的 MAC 已经被改写为 Pod MAC**，精准识别出这是“已完成旁路、正在本地交付中的报文”；
-   - **直接放行**：立即返回 `TC_ACT_OK` (0)，直接终止后续 TC 过滤并交由内核驱动将报文送入目标 Pod 的接收队列（RX），彻底终结重定向循环，同时避免重复穿越宿主机 Netfilter 与 conntrack。
+   - **直接放行与驱动截胡（彻底绕过宿主机 Netfilter）**：
+     - 立即返回 `TC_ACT_OK` (0)，直接终止后续 TC 过滤；
+     - 内核协议栈紧接着执行二层接收钩子 `rx_handler`（即 `macvlan_handle_frame`）。由于目的 MAC 已经是 Pod MAC，macvlan 驱动将报文判定归属目标 Pod，直接将其交由 Pod 接收队列（RX），并向宿主机内核返回 `RX_HANDLER_CONSUMED`；
+     - 宿主机协议栈在此处直接中断处理流程（`goto out`），**根本不会继续向下流转至宿主机的 `ip_rcv` 与 Netfilter / conntrack 模块**。实机核验表明宿主机 conntrack 表项始终为 0，彻底切断重定向死循环并保持全局免跟踪。
+
+### 数据流向拓扑链对比
+
+- **架构 A（Veth-Pair 模式）**：
+  ```text
+  外部交换机 ──► macbond1 (TC Ingress) ──► bpf_redirect(vethXXXX, 0) ──► Pod 内部接收
+  ```
+  *(跨 Netns 独立设备直接投递，物理接口仅触发 1 次，天然不回流)*
+
+- **架构 B（Macvlan Bridge 模式）**：
+  ```text
+  外部交换机 ──► macbond1 (首次 TC Ingress: 改写为 Pod MAC) ──► bpf_redirect(macvlan, 0) ──► macvlan bridge 驱动 (借道 netif_rx 回灌) ──► macbond1 (二次 TC Ingress: is_local_delivery 命中放行 TC_ACT_OK) ──► rx_handler (macvlan_handle_frame 消费) ──► Pod 内部接收
+  ```
+  *(借道 SoftIRQ 重新入队触发二次 Ingress，由哨兵精准放行并经驱动层截胡，全链路 0 宿主机 conntrack)*
 
 启动时会用全新代际的空 Map 替换旧的 EIP 挂载，并通过最佳努力（Best-effort）机制在宣布 BGP 路由的同时异步建立与核对 TC BPF 直通映射；若 TC 挂载或映射同步发生失败，系统将自动回退到宿主机内核协议栈转发以保障 BGP 路由与服务的连续性。
 周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
