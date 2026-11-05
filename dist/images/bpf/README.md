@@ -73,14 +73,14 @@ TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `-
 
 ### 热更新与生命周期管理
 
-参考 Cilium Agent 的平滑热更新机制，Speaker 重启或更新期间**内核 BPF 程序永不 detach**：
-- **热更新与复用**：新实例启动时若程序未变直接复用，若字节码升级则通过 `netlink.FilterReplace` 在内核原子替换（Atomic Swap），全程零中断；
-- **主动卸载**：仅在显式配置 `--enable-tc-bpf-redirect=false` 停用功能或迁移 priority 时，才会主动 detach 清理。
+参考 Cilium Agent 的平滑无损热更新机制，Speaker 重启、滚动更新或意外崩溃期间，**内核数据面（TC 过滤器与 Pinned Map）永不断流、永不清除**：
+- **优雅停机与容灾**：Speaker 进程退出时仅关闭用户态句柄（`Close`），物理网卡上的 TC 过滤器与 `/sys/fs/bpf` 中的 Pinned Map 保持常驻内核持续工作，外网业务流量 0 中断、0 丢包；
+- **启动自动复用（Map Reuse）**：新实例启动时优先通过 `LoadPinnedMap` 直接复用 bpffs 中存量的 EIP 重定向 Map，新进程一启动即持有完备映射，彻底消除“空 Map 窗口期”；
+- **字节码原子切替（Atomic Swap）**：若随镜像升级了 BPF 字节码，通过 `netlink.FilterReplace` 在内核中同一优先级原子替换，实现无缝平滑过渡；
+- **增量平滑对账**：启动后由 Informer 异步对账（`SyncEIPs`），按需修剪已失效或漂移的孤儿条目，增量补齐新条目；
+- **BGP 安全就绪时序**：在新增 EIP 时，必须先在 TC BPF Map 中完成目标网卡与 MAC 的映射下发，才对外发布 BGP 路由；若目标尚未就绪，暂缓宣告，杜绝因外部流量提前涌入而发生黑洞丢包；
+- **主动卸载**：仅在显式配置 `--enable-tc-bpf-redirect=false` 彻底停用功能（或触发动态清理）时，系统才会执行 `Clean()` 主动拔除物理网卡上的 TC 过滤器并移除 Pinned Map。
 
-启动时会用全新代际的空 Map 替换旧的 EIP 挂载，并通过最佳努力（Best-effort）机制在宣布 BGP 路由的同时异步建立与核对 TC BPF 直通映射；若 TC 挂载或映射同步发生失败，系统将自动回退到宿主机内核协议栈转发以保障 BGP 路由与服务的连续性。
-周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
-正常退出时会清理自己拥有的过滤器和固化的 Pinned Map。
-若需停用本特性，请保持 node-route 模式开启并以 `--enable-tc-bpf-redirect=false` 重启；下一个 Speaker 实例也会主动清理非正常退出留下的挂载痕迹。
 严禁在同一物理节点上同时运行多个 node-route speaker。
 
 ## 内核回归测试
