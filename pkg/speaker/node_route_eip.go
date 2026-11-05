@@ -237,25 +237,28 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		return nil
 	}
 
+	var errs []error
 	var tcTarget TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
 		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 		if err != nil {
 			klog.Warningf("failed to get NAT GW pod %s for TC BPF: %v", podName, err)
+			errs = append(errs, err)
 		} else {
 			tcTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
 			if err != nil {
 				klog.Warningf("failed to resolve TC target info for EIP %s: %v", eipName, err)
+				errs = append(errs, err)
 			} else {
 				if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
 					klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
+					errs = append(errs, err)
 				}
 			}
 		}
 	}
 
-	var errs []error
 	var announced []string
 	for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 		if ip == "" {
