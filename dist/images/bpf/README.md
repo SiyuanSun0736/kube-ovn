@@ -71,6 +71,12 @@ TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `-
   ```
   *(借道 SoftIRQ 重新入队触发二次 Ingress，由哨兵精准放行并经驱动层截胡，全链路 0 宿主机 conntrack)*
 
+### 热更新与生命周期管理
+
+参考 Cilium Agent 的平滑热更新机制，Speaker 重启或更新期间**内核 BPF 程序永不 detach**：
+- **热更新与复用**：新实例启动时若程序未变直接复用，若字节码升级则通过 `netlink.FilterReplace` 在内核原子替换（Atomic Swap），全程零中断；
+- **主动卸载**：仅在显式配置 `--enable-tc-bpf-redirect=false` 停用功能或迁移 priority 时，才会主动 detach 清理。
+
 启动时会用全新代际的空 Map 替换旧的 EIP 挂载，并通过最佳努力（Best-effort）机制在宣布 BGP 路由的同时异步建立与核对 TC BPF 直通映射；若 TC 挂载或映射同步发生失败，系统将自动回退到宿主机内核协议栈转发以保障 BGP 路由与服务的连续性。
 周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
 正常退出时会清理自己拥有的过滤器和固化的 Pinned Map。
