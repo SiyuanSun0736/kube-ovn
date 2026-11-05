@@ -25,14 +25,12 @@ const (
 	tcEIPv6MapName  = "kube_ovn_eip_v6_map"
 )
 
-// 结构体内存布局必须与 tc_eip.c 中的 struct eip_target 保持完全一致（总计 32 字节，严格 64 位对齐）
+// 结构体内存布局必须与 tc_eip.c 中的 struct eip_target 保持完全一致（总计 16 字节，严格 32 位对齐）
 type bpfEipTarget struct {
 	Ifindex       uint32
 	TargetMAC     [6]byte
 	Pad           [2]byte
 	ParentIfindex uint32
-	Packets       uint64
-	Bytes         uint64
 }
 
 type linuxTCManager struct {
@@ -304,8 +302,7 @@ func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
 	copy(target.TargetMAC[:], info.TargetMAC)
 	var old bpfEipTarget
 	if err = targetMap.Lookup(key, &old); err == nil {
-		// 周期性全量对账过程中，若目标参数未发生变化，则不重置运行时的报文和字节统计计数器
-		if old.Ifindex == target.Ifindex && old.ParentIfindex == target.ParentIfindex && old.TargetMAC == target.TargetMAC {
+		if old == target {
 			return nil
 		}
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {

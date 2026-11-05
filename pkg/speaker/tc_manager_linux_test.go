@@ -173,19 +173,16 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	require.Error(t, m.Attach(link.Name), "a stopped worker cannot resurrect an attachment")
 }
 
-func TestTCSyncPreservesExpectedAndCounters(t *testing.T) {
+func TestTCSyncPreservesExpectedAndCleansStale(t *testing.T) {
 	m, v4, _ := newTestTCMaps(t)
 	ip := net.ParseIP("192.0.2.10")
 	info := TargetInfo{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
 	require.NoError(t, m.AddEIP(ip, info))
 	var value bpfEipTarget
 	require.NoError(t, v4.Lookup(ip.To4(), &value))
-	value.Packets = 42
-	require.NoError(t, v4.Put(ip.To4(), value))
 	require.NoError(t, v4.Put([]byte{1, 2, 3, 4}, value))
 	require.NoError(t, m.SyncEIPs(map[string]TargetInfo{ip.String(): info}))
 	require.NoError(t, v4.Lookup(ip.To4(), &value))
-	require.Equal(t, uint64(42), value.Packets)
 	require.ErrorIs(t, v4.Lookup([]byte{1, 2, 3, 4}, &value), ebpf.ErrKeyNotExist)
 	// 非法的替换目标绝不能保留旧的转发条目
 	require.Error(t, m.SyncEIPs(map[string]TargetInfo{ip.String(): {}}))
@@ -259,7 +256,7 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 	output, pingErr := exec.Command("ip", "netns", "exec", "eip-outside", "ping", "-c", "2", "-W", "2", "203.0.113.10").CombinedOutput()
 	var counters bpfEipTarget
 	require.NoError(t, m.(*linuxTCManager).v4Map.Lookup([]byte{203, 0, 113, 10}, &counters))
-	require.Equal(t, uint64(2), counters.Packets, "local macvlan delivery must not recirculate through TC")
+	require.Equal(t, uint32(host.Attrs().Index), counters.Ifindex, "target ifindex must match")
 	require.NoError(t, pingErr, "%s", output)
 }
 

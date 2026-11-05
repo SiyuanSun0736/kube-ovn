@@ -34,14 +34,12 @@
 // BPF Map 最大支持的 EIP 记录条目数
 #define MAX_EIP_ENTRIES 65536
 
-// 重定向目标信息结构体（内存严格按 64 位对齐，总大小为 32 字节）
+// 重定向目标信息结构体（内存严格按 32 位对齐，总大小为 16 字节）
 struct eip_target {
     __u32 ifindex;          // 本地网关 Pod 对应的宿主机接口设备索引（macvlan 或 veth）
     __u8  target_mac[6];    // 目标网卡硬件 MAC 地址（若非 0 则执行二层 MAC 重写）
     __u8  pad[2];           // 2 字节填充，对齐到 4 字节
-    __u32 parent_ifindex;   // macvlan 父设备接口索引（Master ifindex）；同时使后续计数器严格对齐到 8 字节边界
-    __u64 packets;          // 命中直通的累计数据包计数
-    __u64 bytes;            // 命中直通的累计字节统计
+    __u32 parent_ifindex;   // macvlan 父设备接口索引（Master ifindex）
 };
 
 // IPv4 EIP ➔ 本地网关网卡索引与统计映射表
@@ -107,10 +105,6 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
         return TC_ACT_OK;
     }
 
-    // 原子递增转发统计计数
-    __sync_fetch_and_add(&target->packets, 1);
-    __sync_fetch_and_add(&target->bytes, skb->len);
-
     // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC
     if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
         target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {
@@ -140,9 +134,6 @@ static __always_inline int process_ipv6(struct __sk_buff *skb, void *data, void 
     if (is_local_delivery(skb, data, target)) {
         return TC_ACT_OK;
     }
-
-    __sync_fetch_and_add(&target->packets, 1);
-    __sync_fetch_and_add(&target->bytes, skb->len);
 
     if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
         target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {

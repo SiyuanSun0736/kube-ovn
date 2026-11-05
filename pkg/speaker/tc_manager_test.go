@@ -14,14 +14,14 @@ import (
 // TestTCManagerTargetInfoLayout 严格断言内核 struct eip_target 与 Go 结构体 bpfEipTarget 在 64 位体系下的内存对齐
 func TestTCManagerTargetInfoLayout(t *testing.T) {
 	var target bpfEipTarget
-	// 4 (Ifindex) + 6 (TargetMAC) + 2 (Pad) + 4 (Pad2) + 8 (Packets) + 8 (Bytes) = 32 字节
-	if size := unsafe.Sizeof(target); size != 32 {
-		t.Fatalf("bpfEipTarget 结构体内存大小异常: 期望 32 字节 (64-bit 严格对齐)，实际为 %d 字节", size)
+	// 4 (Ifindex) + 6 (TargetMAC) + 2 (Pad) + 4 (ParentIfindex) = 16 字节
+	if size := unsafe.Sizeof(target); size != 16 {
+		t.Fatalf("bpfEipTarget 结构体内存大小异常: 期望 16 字节，实际为 %d 字节", size)
 	}
 
-	// 验证 64 位 Packets 字段严格从 16 字节偏移量开始
-	if offset := unsafe.Offsetof(target.Packets); offset != 16 {
-		t.Fatalf("Packets 字段偏移量异常: 期望从 16 字节开始，实际为 %d", offset)
+	// 验证 ParentIfindex 字段严格从 12 字节偏移量开始
+	if offset := unsafe.Offsetof(target.ParentIfindex); offset != 12 {
+		t.Fatalf("ParentIfindex 字段偏移量异常: 期望从 12 字节开始，实际为 %d", offset)
 	}
 }
 
