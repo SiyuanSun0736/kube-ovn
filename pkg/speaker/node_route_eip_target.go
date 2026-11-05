@@ -15,19 +15,15 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+// getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。
+// 直接以 EIP 本身的 ExternalSubnet 为准定位外网子网，避免网关配置多个外网子网时产生歧义。
 func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
-	attachmentSubnet := eip.Spec.ExternalSubnet
-	if c.natgatewayLister != nil && eip.Spec.NatGwDp != "" {
-		if gw, err := c.natgatewayLister.Get(eip.Spec.NatGwDp); err == nil && len(gw.Spec.ExternalSubnets) > 0 {
-			attachmentSubnet = util.GetNatGwExternalNetwork(gw.Spec.ExternalSubnets)
-		}
+	if eip.Spec.ExternalSubnet == "" {
+		return TCRedirectTarget{}, fmt.Errorf("iptables-eip %s has empty externalSubnet", eip.Name)
 	}
-	subnet, err := c.subnetsLister.Get(attachmentSubnet)
+	subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
 	if err != nil {
-		subnet, err = c.subnetsLister.Get(eip.Spec.ExternalSubnet)
-		if err != nil {
-			return TCRedirectTarget{}, err
-		}
+		return TCRedirectTarget{}, fmt.Errorf("failed to get external subnet %s for EIP %s: %w", eip.Spec.ExternalSubnet, eip.Name, err)
 	}
 	return natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
 }
