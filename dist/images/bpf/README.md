@@ -41,10 +41,29 @@ TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `-
 - **Cilium TC**：只占用内网出口网卡（`bond0`，负责集群管理通信）以及各个 Pod 虚拟网卡 `*_h`（容器侧安全策略）。
 两者在网络接口上严格物理隔离、各司其职，互不干扰。
 若当前 priority 已被非本程序过滤器占用，系统将报错拒绝挂载以避免覆盖冲突。
-非 EIP 报文返回 `TC_ACT_UNSPEC` (-1)，正常放行进入宿主机 Linux 网络协议栈。
-在 direct-action 模式下，`TC_ACT_OK` (0) 专用于 macvlan bridge 本地交付链路（报文已改写为 Pod MAC 再次进入 Ingress 时），直接终止后续 TC 过滤并交由驱动将报文交付给目标 Pod RX 处理，彻底避开重定向死循环与宿主机 Netfilter / conntrack 跟踪表。
-命中 EIP 的公网报文会通过宿主机 macvlan 直通转发，且目的 MAC 被改写为网关 Pod 的实际 MAC。
-在 macvlan bridge 本地交付模式下，报文会重新进入 Master 的 Ingress；在 Master 上已寻址到 Pod MAC 的报文将直接返回 `TC_ACT_OK` 进入 macvlan RX 处理，避免重定向死循环，且彻底规避穿越宿主机 Netfilter 与 conntrack 跟踪表。
+
+### 数据面收发流向与 macvlan bridge 防死循环机制
+
+程序工作在 `direct-action` (da) 模式下，针对不同数据流的处理流程如下：
+
+1. **非 EIP 报文（宿主机自身流量 / 其它 Pod 流量）**：
+   - 返回 `TC_ACT_UNSPEC` (-1)；
+   - 保持数据包原样，正常放行进入宿主机 Linux 网络协议栈（路由选择、Netfilter / conntrack 等常规路径）。
+
+2. **外网命中 EIP 报文（首次到达 Ingress）**：
+   - 报文源 MAC 为上游交换机 MAC，目的 MAC 为宿主机物理网卡（如 `macbond1`）MAC；
+   - BPF 查表命中 EIP，判定目标 MAC 非全零，调用 `bpf_skb_store_bytes` 将目的 MAC 原子改写为目标 Pod 的硬件 MAC；
+   - 调用 `bpf_redirect(target_ifindex, 0)` 将报文重定向到目标网络设备（如宿主机上的 macvlan bridge 接口），跳过宿主机 conntrack。
+
+3. **macvlan bridge 本地交付与防死循环链路（二次进入 Ingress）**：
+   - **二次注入成因**：在 macvlan bridge 模式下，重定向到宿主机端 macvlan 接口后，macvlan 驱动会将报文的接收端借道父物理设备进行二层本地交换分发（`macvlan_handle_frame` / `netif_rx` 重新入队）。这会导致报文在宿主机软中断（SoftIRQ）上下文中**再次触发父网卡（`macbond1`）的 TC Ingress Hook**。
+   - **死循环隐患**：此时报文的目的 IP 依然是该 EIP，若再次无脑重定向，报文将在物理网卡与 macvlan 间发生无限 Ping-Pong 死循环，直至软中断打满丢包。
+   - **哨兵判定与终结**：BPF 程序入口处通过 `is_local_delivery` 校验：
+     ```c
+     skb->ifindex == target->parent_ifindex && mac_eq(eth->h_dest, target->target_mac)
+     ```
+     当前网卡为父网卡且**目的 MAC 已经被改写为 Pod MAC**，精准识别出这是“已完成旁路、正在本地交付中的报文”；
+   - **直接放行**：立即返回 `TC_ACT_OK` (0)，直接终止后续 TC 过滤并交由内核驱动将报文送入目标 Pod 的接收队列（RX），彻底终结重定向循环，同时避免重复穿越宿主机 Netfilter 与 conntrack。
 
 启动时会用全新代际的空 Map 替换旧的 EIP 挂载，并通过最佳努力（Best-effort）机制在宣布 BGP 路由的同时异步建立与核对 TC BPF 直通映射；若 TC 挂载或映射同步发生失败，系统将自动回退到宿主机内核协议栈转发以保障 BGP 路由与服务的连续性。
 周期性对账逻辑会自动重试加载或挂载失败的操作、更新变动的目标网卡信息，并清理已漂移到其它节点的陈旧条目。
