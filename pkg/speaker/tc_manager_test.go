@@ -11,8 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestTCManagerTargetInfoLayout 严格断言内核 struct eip_target 与 Go 结构体 bpfEipTarget 在 64 位体系下的内存对齐
-func TestTCManagerTargetInfoLayout(t *testing.T) {
+// TestTCManagerRedirectTargetLayout 严格断言内核 struct eip_target 与 Go 结构体 bpfEipTarget 在 64 位体系下的内存对齐
+func TestTCManagerRedirectTargetLayout(t *testing.T) {
 	var target bpfEipTarget
 	// 4 (Ifindex) + 6 (TargetMAC) + 2 (Pad) + 4 (ParentIfindex) = 16 字节
 	if size := unsafe.Sizeof(target); size != 16 {
@@ -39,13 +39,13 @@ func TestTCManagerLifecycle(t *testing.T) {
 	}
 
 	eip := net.ParseIP("111.62.156.190")
-	info := TargetInfo{
+	target := TCRedirectTarget{
 		TargetIfindex: 10,
 		TargetMAC:     net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 	}
 
 	// 验证在模拟测试环境下的接口增删调用不发生 panic 崩溃
-	if err := mgr.AddEIP(eip, info); err != nil {
+	if err := mgr.AddEIP(eip, target); err != nil {
 		t.Errorf("AddEIP: %v", err)
 	}
 

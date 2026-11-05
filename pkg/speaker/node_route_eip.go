@@ -237,14 +237,14 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		return nil
 	}
 
-	var targetInfo TargetInfo
+	var tcTarget TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
 		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 		if err != nil {
 			klog.Warningf("failed to get NAT GW pod %s for TC BPF: %v", podName, err)
 		} else {
-			targetInfo, err = c.getNatGwTargetInfo(pod, eip)
+			tcTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
 			if err != nil {
 				klog.Warningf("failed to resolve TC target info for EIP %s: %v", eipName, err)
 			} else {
@@ -261,8 +261,8 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		if ip == "" {
 			continue
 		}
-		if c.config.EnableTcBpfRedirect && validTarget(targetInfo) {
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), targetInfo); err != nil {
+		if c.config.EnableTcBpfRedirect && validTCRedirectTarget(tcTarget) {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), tcTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 			}
@@ -316,7 +316,7 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 // can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
-	expectedTcMap := make(map[string]TargetInfo)
+	expectedTcMap := make(map[string]TCRedirectTarget)
 	var retainedTcEIPs []string
 	var targetErrors []error
 
@@ -338,7 +338,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
-		var targetInfo TargetInfo
+		var tcTarget TCRedirectTarget
 		var tcResolved bool
 		var shouldRetainIfTransient bool
 		if c.config.EnableTcBpfRedirect {
@@ -349,7 +349,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 				if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodFailed {
 					klog.Warningf("NAT GW pod %s for EIP %s is terminating or failed, will not retain TC redirection", podName, eipName)
 				} else {
-					targetInfo, err = c.getNatGwTargetInfo(pod, eip)
+					tcTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
 					if err == nil {
 						tcResolved = true
 					} else {
@@ -371,7 +371,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
 				if tcResolved {
-					expectedTcMap[ip] = targetInfo
+					expectedTcMap[ip] = tcTarget
 				} else if shouldRetainIfTransient {
 					retainedTcEIPs = append(retainedTcEIPs, ip)
 				}

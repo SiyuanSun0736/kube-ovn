@@ -45,7 +45,7 @@ func newTestTCMaps(t *testing.T) (*linuxTCManager, *ebpf.Map, *ebpf.Map) {
 func TestTCIPv4PacketKey(t *testing.T) {
 	m, v4, _ := newTestTCMaps(t)
 	ip := net.ParseIP("111.62.156.190")
-	require.NoError(t, m.AddEIP(ip, TargetInfo{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
+	require.NoError(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
 	var value bpfEipTarget
 	require.NoError(t, v4.Lookup([]byte{111, 62, 156, 190}, &value), "map key must match packet bytes")
 	require.Equal(t, uint32(10), value.Ifindex)
@@ -58,7 +58,7 @@ func TestTCSyncRemovesStaleEntries(t *testing.T) {
 	old := bpfEipTarget{Ifindex: 10}
 	require.NoError(t, v4.Put([]byte{1, 2, 3, 4}, old))
 	require.NoError(t, v6.Put(net.ParseIP("2001:db8::1").To16(), old))
-	require.NoError(t, m.SyncEIPs(map[string]TargetInfo{}))
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}))
 	var value bpfEipTarget
 	require.ErrorIs(t, v4.Lookup([]byte{1, 2, 3, 4}, &value), ebpf.ErrKeyNotExist)
 	require.ErrorIs(t, v6.Lookup(net.ParseIP("2001:db8::1").To16(), &value), ebpf.ErrKeyNotExist)
@@ -66,10 +66,10 @@ func TestTCSyncRemovesStaleEntries(t *testing.T) {
 
 func TestTCRejectsInvalidTarget(t *testing.T) {
 	m, _, _ := newTestTCMaps(t)
-	for _, info := range []TargetInfo{{}, {TargetIfindex: 10}, {TargetIfindex: -1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}} {
-		require.Error(t, m.AddEIP(net.ParseIP("2001:db8::1"), info))
+	for _, target := range []TCRedirectTarget{{}, {TargetIfindex: 10}, {TargetIfindex: -1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}} {
+		require.Error(t, m.AddEIP(net.ParseIP("2001:db8::1"), target))
 	}
-	require.Error(t, m.SyncEIPs(map[string]TargetInfo{"invalid": {TargetIfindex: 10}}))
+	require.Error(t, m.SyncEIPs(map[string]TCRedirectTarget{"invalid": {TargetIfindex: 10}}))
 }
 
 func TestTCAttachMissingObject(t *testing.T) {
@@ -147,11 +147,11 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	require.NoError(t, m.Attach(link.Name), "retry must load the object after it becomes available")
 	require.NoError(t, m.Attach(link.Name), "attachment must be idempotent")
 	ip := net.ParseIP("2001:db8::1")
-	require.NoError(t, m.AddEIP(ip, TargetInfo{TargetIfindex: link.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
+	require.NoError(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: link.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
 	// 模拟进程未优雅退出即重启。旧 TC 分类器程序保持挂载，新实例必须丢弃旧的陈旧 Map
 	restarted := NewTCManager(cfg)
 	require.NoError(t, restarted.Attach(link.Name))
-	require.NoError(t, restarted.SyncEIPs(map[string]TargetInfo{}))
+	require.NoError(t, restarted.SyncEIPs(map[string]TCRedirectTarget{}))
 	v6, err := ebpf.LoadPinnedMap(strings.TrimSuffix(pin, "_v4_map")+"_v6_map", nil)
 	require.NoError(t, err)
 	var value bpfEipTarget
@@ -176,16 +176,16 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 func TestTCSyncPreservesExpectedAndCleansStale(t *testing.T) {
 	m, v4, _ := newTestTCMaps(t)
 	ip := net.ParseIP("192.0.2.10")
-	info := TargetInfo{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
-	require.NoError(t, m.AddEIP(ip, info))
+	target := TCRedirectTarget{TargetIfindex: 10, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
+	require.NoError(t, m.AddEIP(ip, target))
 	var value bpfEipTarget
 	require.NoError(t, v4.Lookup(ip.To4(), &value))
 	require.NoError(t, v4.Put([]byte{1, 2, 3, 4}, value))
-	require.NoError(t, m.SyncEIPs(map[string]TargetInfo{ip.String(): info}))
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{ip.String(): target}))
 	require.NoError(t, v4.Lookup(ip.To4(), &value))
 	require.ErrorIs(t, v4.Lookup([]byte{1, 2, 3, 4}, &value), ebpf.ErrKeyNotExist)
 	// 非法的替换目标绝不能保留旧的转发条目
-	require.Error(t, m.SyncEIPs(map[string]TargetInfo{ip.String(): {}}))
+	require.Error(t, m.SyncEIPs(map[string]TCRedirectTarget{ip.String(): {}}))
 	require.ErrorIs(t, v4.Lookup(ip.To4(), &value), ebpf.ErrKeyNotExist)
 }
 
@@ -199,14 +199,14 @@ func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
 	ipStale := net.ParseIP("192.0.2.30")
 
 	// 1. 预先注入两个 EIP 条目
-	require.NoError(t, m.AddEIP(ipRetain, TargetInfo{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
-	require.NoError(t, m.AddEIP(ipStale, TargetInfo{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 2}}))
+	require.NoError(t, m.AddEIP(ipRetain, TCRedirectTarget{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
+	require.NoError(t, m.AddEIP(ipStale, TCRedirectTarget{TargetIfindex: dummy.Index, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 2}}))
 
 	// 2. 模拟全量 Reconcile：
 	// expected 为空（假设两个 EIP 都未能解析出最新目标）
 	// 但 ipRetain 属于本地活跃 Pod 暂时抖动（传入 retainedIPs）
 	// ipStale 则已彻底删除（未传入 retainedIPs）
-	require.NoError(t, m.SyncEIPs(map[string]TargetInfo{}, ipRetain.String()))
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}, ipRetain.String()))
 
 	// 3. 验证声明保留的 ipRetain 依然稳稳留在 BPF Map 中
 	var val bpfEipTarget
@@ -252,7 +252,7 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 	require.NoError(t, m.Attach("eip-uplink"))
 	host, err := netlink.LinkByName("eip-host")
 	require.NoError(t, err)
-	require.NoError(t, m.AddEIP(net.ParseIP("203.0.113.10"), TargetInfo{TargetIfindex: host.Attrs().Index, ParentIfindex: host.Attrs().ParentIndex, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0x10, 2}}))
+	require.NoError(t, m.AddEIP(net.ParseIP("203.0.113.10"), TCRedirectTarget{TargetIfindex: host.Attrs().Index, ParentIfindex: host.Attrs().ParentIndex, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0x10, 2}}))
 	output, pingErr := exec.Command("ip", "netns", "exec", "eip-outside", "ping", "-c", "2", "-W", "2", "203.0.113.10").CombinedOutput()
 	var counters bpfEipTarget
 	require.NoError(t, m.(*linuxTCManager).v4Map.Lookup([]byte{203, 0, 113, 10}, &counters))

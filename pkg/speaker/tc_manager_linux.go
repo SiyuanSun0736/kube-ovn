@@ -266,9 +266,9 @@ func eipMapKey(ip net.IP) ([]byte, error) {
 	return nil, fmt.Errorf("invalid EIP %q", ip)
 }
 
-func validTarget(info TargetInfo) bool {
-	return info.ParentIfindex >= 0 && uint64(info.ParentIfindex) <= uint64(^uint32(0)) && info.TargetIfindex > 0 && uint64(info.TargetIfindex) <= uint64(^uint32(0)) &&
-		len(info.TargetMAC) == 6 && info.TargetMAC[0]&1 == 0 && !bytes.Equal(info.TargetMAC, make([]byte, 6))
+func validTCRedirectTarget(target TCRedirectTarget) bool {
+	return target.ParentIfindex >= 0 && uint64(target.ParentIfindex) <= uint64(^uint32(0)) && target.TargetIfindex > 0 && uint64(target.TargetIfindex) <= uint64(^uint32(0)) &&
+		len(target.TargetMAC) == 6 && target.TargetMAC[0]&1 == 0 && !bytes.Equal(target.TargetMAC, make([]byte, 6))
 }
 
 func (m *linuxTCManager) mapFor(key []byte) (*ebpf.Map, error) {
@@ -285,9 +285,9 @@ func (m *linuxTCManager) mapFor(key []byte) (*ebpf.Map, error) {
 	return target, nil
 }
 
-func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
-	if !validTarget(info) {
-		return fmt.Errorf("invalid TC target for %s: ifindex=%d mac=%s", ip, info.TargetIfindex, info.TargetMAC)
+func (m *linuxTCManager) addEIP(ip net.IP, target TCRedirectTarget) error {
+	if !validTCRedirectTarget(target) {
+		return fmt.Errorf("invalid TC target for %s: ifindex=%d mac=%s", ip, target.TargetIfindex, target.TargetMAC)
 	}
 	key, err := eipMapKey(ip)
 	if err != nil {
@@ -297,27 +297,27 @@ func (m *linuxTCManager) addEIP(ip net.IP, info TargetInfo) error {
 	if err != nil {
 		return err
 	}
-	// #nosec G115 -- validTarget 已校验 ifindex 均为非负数且符合 uint32 范围
-	target := bpfEipTarget{Ifindex: uint32(info.TargetIfindex), ParentIfindex: uint32(info.ParentIfindex)}
-	copy(target.TargetMAC[:], info.TargetMAC)
+	// #nosec G115 -- validTCRedirectTarget 已校验 ifindex 均为非负数且符合 uint32 范围
+	bpfTarget := bpfEipTarget{Ifindex: uint32(target.TargetIfindex), ParentIfindex: uint32(target.ParentIfindex)}
+	copy(bpfTarget.TargetMAC[:], target.TargetMAC)
 	var old bpfEipTarget
 	if err = targetMap.Lookup(key, &old); err == nil {
-		if old == target {
+		if old == bpfTarget {
 			return nil
 		}
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return err
 	}
-	return targetMap.Update(key, &target, ebpf.UpdateAny)
+	return targetMap.Update(key, &bpfTarget, ebpf.UpdateAny)
 }
 
-func (m *linuxTCManager) AddEIP(ip net.IP, info TargetInfo) error {
+func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-	return m.addEIP(ip, info)
+	return m.addEIP(ip, target)
 }
 
 func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
@@ -340,7 +340,7 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 	return err
 }
 
-func (m *linuxTCManager) SyncEIPs(expected map[string]TargetInfo, retainedIPs ...string) error {
+func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retainedIPs ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.cfg.EnableTcBpfRedirect {

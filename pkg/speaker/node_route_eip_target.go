@@ -17,7 +17,7 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-func (c *Controller) getNatGwTargetInfo(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TargetInfo, error) {
+func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
 	attachmentSubnet := eip.Spec.ExternalSubnet
 	if c.natgatewayLister != nil && eip.Spec.NatGwDp != "" {
 		if gw, err := c.natgatewayLister.Get(eip.Spec.NatGwDp); err == nil && len(gw.Spec.ExternalSubnets) > 0 {
@@ -28,17 +28,17 @@ func (c *Controller) getNatGwTargetInfo(pod *corev1.Pod, eip *kubeovnv1.Iptables
 	if err != nil {
 		subnet, err = c.subnetsLister.Get(eip.Spec.ExternalSubnet)
 		if err != nil {
-			return TargetInfo{}, err
+			return TCRedirectTarget{}, err
 		}
 	}
-	return natGwTargetInfo(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+	return natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
 }
 
 // TC Ingress 接收网卡与外网子网的 macvlan 父设备可以不是同一个设备。
 // 通过后者进行直通路由并精准重定向到 Pod 的真实硬件 MAC 地址。
-func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup func(string) (netlink.Link, error)) (TargetInfo, error) {
+func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	if pod == nil {
-		return TargetInfo{}, errors.New("NAT gateway pod is missing")
+		return TCRedirectTarget{}, errors.New("NAT gateway pod is missing")
 	}
 	nadName, nadNamespace, ok := util.GetNadBySubnetProvider(subnet.Spec.Provider)
 	if !ok {
@@ -46,22 +46,22 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 	}
 	var statuses []nadv1.NetworkStatus
 	if err := json.Unmarshal([]byte(pod.Annotations[nadv1.NetworkStatusAnnot]), &statuses); err != nil {
-		return TargetInfo{}, fmt.Errorf("parse network status for Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		return TCRedirectTarget{}, fmt.Errorf("parse network status for Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 
 	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
 	if master != "" {
 		name, err := util.GenMacvlanIfaceName(master)
 		if err != nil {
-			return TargetInfo{}, err
+			return TCRedirectTarget{}, err
 		}
 		link, err := lookup(name)
 		if err != nil {
-			return TargetInfo{}, err
+			return TCRedirectTarget{}, err
 		}
 		macvlan, ok := link.(*netlink.Macvlan)
 		if !ok || macvlan.Mode != netlink.MACVLAN_MODE_BRIDGE {
-			return TargetInfo{}, fmt.Errorf("interface %s is not a bridge-mode macvlan", name)
+			return TCRedirectTarget{}, fmt.Errorf("interface %s is not a bridge-mode macvlan", name)
 		}
 		for _, status := range statuses {
 			networkName := status.Name
@@ -73,13 +73,13 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 			}
 			mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
-				return TargetInfo{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
 			}
-			info := TargetInfo{TargetIfindex: link.Attrs().Index, ParentIfindex: link.Attrs().ParentIndex, TargetMAC: mac}
-			if !validTarget(info) {
-				return TargetInfo{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
+			target := TCRedirectTarget{TargetIfindex: link.Attrs().Index, ParentIfindex: link.Attrs().ParentIndex, TargetMAC: mac}
+			if !validTCRedirectTarget(target) {
+				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
-			return info, nil
+			return target, nil
 		}
 	} else {
 		// 非 macvlan 模式（例如 ptp / veth-pair 模式）：
@@ -101,17 +101,17 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 			}
 			routes, err := netlink.RouteGet(podIP)
 			if err != nil || len(routes) == 0 {
-				return TargetInfo{}, fmt.Errorf("failed to get route for pod IP %s: %w", podIP, err)
+				return TCRedirectTarget{}, fmt.Errorf("failed to get route for pod IP %s: %w", podIP, err)
 			}
 			// 拒绝经由外部网关的路由（例如默认路由或间接路由）。
 			// 本地 Pod 的直连 veth 路由必须是直连路由，不能携带下一跳网关。
 			if len(routes[0].Gw) > 0 && !routes[0].Gw.IsUnspecified() {
-				return TargetInfo{}, fmt.Errorf("route for pod IP %s is not a direct route (has gateway %s)", podIP, routes[0].Gw)
+				return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s is not a direct route (has gateway %s)", podIP, routes[0].Gw)
 			}
 			targetLinkIndex := routes[0].LinkIndex
 			mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
-				return TargetInfo{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", networkName, err)
 			}
 			parentIndex := 0
 			if defaultParent != "" {
@@ -120,14 +120,14 @@ func natGwTargetInfo(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent st
 				}
 			}
 			if parentIndex > 0 && targetLinkIndex == parentIndex {
-				return TargetInfo{}, fmt.Errorf("route for pod IP %s points to ingress/parent interface %d, not a local pod veth", podIP, parentIndex)
+				return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s points to ingress/parent interface %d, not a local pod veth", podIP, parentIndex)
 			}
-			info := TargetInfo{TargetIfindex: targetLinkIndex, ParentIfindex: parentIndex, TargetMAC: mac}
-			if !validTarget(info) {
-				return TargetInfo{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
+			target := TCRedirectTarget{TargetIfindex: targetLinkIndex, ParentIfindex: parentIndex, TargetMAC: mac}
+			if !validTCRedirectTarget(target) {
+				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
-			return info, nil
+			return target, nil
 		}
 	}
-	return TargetInfo{}, fmt.Errorf("pod %s/%s has no network status for %s/%s", pod.Namespace, pod.Name, nadNamespace, nadName)
+	return TCRedirectTarget{}, fmt.Errorf("pod %s/%s has no network status for %s/%s", pod.Namespace, pod.Name, nadNamespace, nadName)
 }
