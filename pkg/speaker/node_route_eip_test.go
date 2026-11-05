@@ -3,6 +3,7 @@ package speaker
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -184,6 +185,27 @@ func TestHasNatGwPodOnLocalNode(t *testing.T) {
 					},
 					Spec:   corev1.PodSpec{NodeName: "node1"},
 					Status: corev1.PodStatus{Phase: corev1.PodPending},
+				},
+			},
+			wantResult: false,
+		},
+		{
+			name: "local pod terminating",
+			eip: &kubeovnv1.IptablesEIP{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-eip"},
+				Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "test-gw"},
+			},
+			nodeName:  "node1",
+			namespace: "kube-system",
+			pods: map[string]*corev1.Pod{
+				"kube-system/" + util.GenNatGwPodName("test-gw"): {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              util.GenNatGwPodName("test-gw"),
+						Namespace:         "kube-system",
+						DeletionTimestamp: &metav1.Time{Time: time.Now()},
+					},
+					Spec:   corev1.PodSpec{NodeName: "node1"},
+					Status: corev1.PodStatus{Phase: corev1.PodRunning},
 				},
 			},
 			wantResult: false,

@@ -41,7 +41,6 @@ import (
 	"net"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -209,52 +208,44 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 
 	eip, err := c.eipLister.Get(eipName)
 	if err != nil {
-		// EIP was deleted, skip processing
+		// EIP 已被删除，跳过处理
 		klog.V(3).Infof("iptables-eip %s not found, may have been deleted", eipName)
 		return nil
 	}
 
-	// Skip non-ready EIPs - they will be processed when they become ready
-	// Periodic reconcile (syncNodeRouteEIPs) will clean up any stale routes
+	// 跳过未就绪的 EIP - 待其 Ready 后再处理；周期性对账 (syncNodeRouteEIPs) 也会清理陈旧路由
 	if !eip.Status.Ready {
 		return nil
 	}
 
-	// Check if BGP annotation is enabled for this EIP
+	// 检查该 EIP 是否启用了 BGP 注解
 	if eip.Annotations[util.BgpAnnotation] != "true" {
 		klog.V(3).Infof("iptables-eip %s does not have BGP annotation, skipping", eipName)
-		// Withdraw any existing routes for this EIP (in case annotation was removed)
+		// 撤销存量路由（应对 BGP 注解被动态移除的场景）
 		c.withdrawEIPRoutes(eip)
 		return nil
 	}
 
-	// Check if the NAT gateway pod is running on the local node
+	// 检查 NAT 网关 Pod 是否在本地节点正常运行
 	if !c.hasNatGwPodOnLocalNode(eip) {
 		klog.V(3).Infof("NAT GW pod for iptables-eip %s not on local node %s, withdrawing routes",
 			eipName, c.config.NodeName)
-		// Withdraw any existing routes for this EIP (in case pod moved to another node)
+		// 撤销存量路由（应对网关 Pod 漂移到其他节点或删除下线的场景）
 		c.withdrawEIPRoutes(eip)
 		return nil
 	}
 
 	var errs []error
-	var redirectTarget TCRedirectTarget
+	var redirectTarget *TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
-		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
+		var err error
+		redirectTarget, _, err = c.resolveEipRedirectTarget(eip)
 		if err != nil {
-			klog.Warningf("failed to get NAT GW pod %s for EIP redirection: %v", podName, err)
 			errs = append(errs, err)
-		} else {
-			redirectTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
-			if err != nil {
-				klog.Warningf("failed to resolve redirect target for EIP %s: %v", eipName, err)
+		} else if redirectTarget != nil {
+			if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
+				klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
 				errs = append(errs, err)
-			} else {
-				if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
-					klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
-					errs = append(errs, err)
-				}
 			}
 		}
 	}
@@ -264,8 +255,8 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		if ip == "" {
 			continue
 		}
-		if c.config.EnableTcBpfRedirect && validTCRedirectTarget(redirectTarget) {
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), redirectTarget); err != nil {
+		if c.config.EnableTcBpfRedirect && redirectTarget != nil && validTCRedirectTarget(*redirectTarget) {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), *redirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 			}
@@ -289,9 +280,9 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 	return errors.Join(errs...)
 }
 
-// hasNatGwPodOnLocalNode checks if the NAT gateway pod for this EIP is running on the local node.
-// NAT gateway pod name follows the pattern: vpc-nat-gw-{natGwDp}-0
-// Returns true only if the pod exists, is Running, and is scheduled on the local node.
+// hasNatGwPodOnLocalNode 检查该 EIP 对应的 NAT 网关 Pod 是否正在本节点正常运行。
+// 网关 Pod 命名规范：vpc-nat-gw-{natGwDp}-0
+// 仅当 Pod 存在、处于 Running 状态且未被标记删除（非 Terminating），并调度在本节点时才返回 true。
 func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	if eip.Spec.NatGwDp == "" {
 		klog.Errorf("iptables-eip %s has empty NatGwDp field", eip.Name)
@@ -299,73 +290,84 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 	}
 
 	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-	// Use gwPodsLister which watches pods in VpcNatGwNamespace
+	// 使用监听 VpcNatGwNamespace 的 gwPodsLister
 	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 	if err != nil {
 		klog.V(3).Infof("failed to get NAT GW pod %s/%s: %v", c.config.VpcNatGwNamespace, podName, err)
 		return false
 	}
 
-	// Only announce routes for Running pods on local node
-	return pod.Spec.NodeName == c.config.NodeName && pod.Status.Phase == corev1.PodRunning
+	// 仅对运行在本节点且非删除态的 Pod 宣告路由
+	return pod.Spec.NodeName == c.config.NodeName && isPodRunning(pod)
 }
 
-// syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
-// This method finds all EIPs associated with local NAT gateway pods and announces them.
-// It also withdraws any EIPs that should no longer be announced.
+// resolveEipRedirectTarget 解析当前 EIP 在本地网关 Pod 的重定向直通目标。
+// 返回值：
+// - target: 解析成功的直通目标（解析失败或不适用时为 nil）
+// - retainStale: 当活跃 Pod 仅因元数据短暂就绪延迟（如 Multus NetworkStatus 写入中）时为 true，
+//   指示声明式保留存量 TC BPF 映射，避免流量被瞬时中断
+// - err: 解析异常错误
+func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRedirectTarget, bool, error) {
+	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
+	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			// 非 NotFound 的瞬时缓存或 API 抖动：声明式保留存量映射以防网络中断
+			return nil, true, fmt.Errorf("failed to get NAT GW pod %s: %w", podName, err)
+		}
+		return nil, false, err
+	}
+
+	// 若 Pod 处于删除中或非 Running 阶段，属于确定性失效：绝不保留旧映射
+	if isPodDeleting(pod) || !isPodRunning(pod) {
+		klog.Warningf("NAT GW pod %s for EIP %s is terminating or not running, dropping redirect target", podName, eip.Name)
+		return nil, false, nil
+	}
+
+	target, err := c.getNatGwTCRedirectTarget(pod, eip)
+	if err != nil {
+		// Pod 正常活跃，但网卡/子网元数据暂未就绪（如 NetworkStatus 写入延迟），保留存量映射
+		klog.Warningf("failed to resolve redirect target for EIP %s while pod %s is active: %v", eip.Name, podName, err)
+		return nil, true, err
+	}
+
+	return &target, false, nil
+}
+
+// syncNodeRouteEIPs 在 node-route 模式下全量对账所有 EIP。
+// 该方法寻找与本地 NAT 网关 Pod 关联的所有 EIP 并进行宣告，同时撤销不再应当宣告的 EIP。
 //
-// When EnableLbSvcAnnounce is also enabled, Service VIP prefixes are
-// merged into the expected set so that node-route-eip mode and Service VIP announcements
-// can operate concurrently on the same speaker instance.
+// 当同时启用 EnableLbSvcAnnounce 时，Service VIP 前缀会合并到期望集合中，
+// 从而使 node-route-eip 模式与 Service VIP 宣告能在同一个 speaker 实例上并发运行。
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
 	expectedEipTargets := make(map[string]TCRedirectTarget)
 	var retainedEIPs []string
 	var targetErrors []error
 
-	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
+	// EIP 数据面：宣告本地 NAT 网关 Pod 的 IptablesEIP 地址
 	eips, err := c.eipLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
 	for _, eip := range eips {
-		eipName := eip.Name
-		// Only process ready EIPs with BGP annotation
+		// 仅处理带有 BGP 注解且处于 Ready 状态的 EIP
 		if eip.Annotations[util.BgpAnnotation] != "true" || !eip.Status.Ready {
 			continue
 		}
 
-		// Only announce EIPs for local NAT gateway pods
+		// 仅处理调度在本地且正常运行的 NAT 网关 Pod 的 EIP
 		if !c.hasNatGwPodOnLocalNode(eip) {
 			continue
 		}
 
-		var redirectTarget TCRedirectTarget
-		var targetResolved bool
-		var shouldRetainIfTransient bool
+		var redirectTarget *TCRedirectTarget
+		var retainStale bool
 		if c.config.EnableTcBpfRedirect {
-			podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
-			pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
-			if err == nil {
-				// 声明式状态判定：若 Pod 已被标记删除或处于失败状态，属于确定性失效，绝不保留旧映射
-				if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodFailed {
-					klog.Warningf("NAT GW pod %s for EIP %s is terminating or failed, will not retain redirect target", podName, eipName)
-				} else {
-					redirectTarget, err = c.getNatGwTCRedirectTarget(pod, eip)
-					if err == nil {
-						targetResolved = true
-					} else {
-						// Pod 正常活跃，仅因 NetworkStatus 正在写入或 Subnet 缓存短暂未就绪，可声明式保留存量可用映射
-						shouldRetainIfTransient = true
-						klog.Warningf("failed to resolve redirect target for EIP %s, but pod %s is active: %v", eipName, podName, err)
-					}
-				}
-			} else if !apierrors.IsNotFound(err) {
-				// 非 NotFound 的瞬时缓存/API 抖动，同样声明式保留存量映射
-				shouldRetainIfTransient = true
-			}
-			if err != nil && !targetResolved {
+			var err error
+			redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
+			if err != nil && redirectTarget == nil {
 				targetErrors = append(targetErrors, err)
 			}
 		}
@@ -373,9 +375,9 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if targetResolved {
-					expectedEipTargets[ip] = redirectTarget
-				} else if shouldRetainIfTransient {
+				if redirectTarget != nil {
+					expectedEipTargets[ip] = *redirectTarget
+				} else if retainStale {
 					retainedEIPs = append(retainedEIPs, ip)
 				}
 			}
