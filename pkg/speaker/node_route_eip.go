@@ -338,7 +338,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	cached, ok := c.gwTargetCache[eip.Spec.NatGwDp]
 	c.gwTargetCacheMu.RUnlock()
 	if ok && cached.podUID == pod.UID {
-		return &cached.target, false, nil
+		return &cached.eipRedirectTarget, false, nil
 	}
 
 	// 2. 缓存未命中或 Pod 重建（UID 变更），实时解析网卡目标
@@ -352,8 +352,8 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	// 3. 解析成功，存入长效 UID 缓存
 	c.gwTargetCacheMu.Lock()
 	c.gwTargetCache[eip.Spec.NatGwDp] = gwTargetCacheEntry{
-		podUID: pod.UID,
-		target: eipRedirectTarget,
+		podUID:            pod.UID,
+		eipRedirectTarget: eipRedirectTarget,
 	}
 	c.gwTargetCacheMu.Unlock()
 
@@ -371,7 +371,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
 	expectedEipTargets := make(map[string]TCRedirectTarget)
 	var retainedEIPs []string
-	var targetErrors []error
+	var redirectErrors []error
 
 	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
@@ -404,14 +404,14 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			if cached, ok := eipResolutionCache[cacheKey]; ok {
 				eipRedirectTarget, retainStale = cached.eipRedirectTarget, cached.retainStale
 				if cached.err != nil && eipRedirectTarget == nil {
-					targetErrors = append(targetErrors, cached.err)
+					redirectErrors = append(redirectErrors, cached.err)
 				}
 			} else {
 				var err error
 				eipRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
 				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale, err: err}
 				if err != nil && eipRedirectTarget == nil {
-					targetErrors = append(targetErrors, err)
+					redirectErrors = append(redirectErrors, err)
 				}
 			}
 		}
@@ -436,7 +436,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		if err != nil {
 			// TC eBPF 挂载或同步失败时不应撤销 BGP 路由；降级回退到宿主机内核协议栈以优先保障服务连续性
 			klog.Errorf("failed to sync EIP redirection targets, falling back to kernel datapath: %v", err)
-			targetErrors = append(targetErrors, err)
+			redirectErrors = append(redirectErrors, err)
 		}
 	}
 
@@ -459,7 +459,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(targetErrors...))
+	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(redirectErrors...))
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.

@@ -162,8 +162,8 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 		TargetMAC:     net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
 	}
 	c.gwTargetCache["gw-test"] = gwTargetCacheEntry{
-		podUID: types.UID("pod-uid-1111"),
-		target: expectedTarget,
+		podUID:            types.UID("pod-uid-1111"),
+		eipRedirectTarget: expectedTarget,
 	}
 
 	// 2. 调用 resolveEipRedirectTarget，应直接命中 UID 缓存并返回，完全不调用 getNatGwTCRedirectTarget
@@ -205,8 +205,8 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 		},
 	}
 	c.gwTargetCache["gw-test"] = gwTargetCacheEntry{
-		podUID: types.UID("pod-uid-1111"),
-		target: expectedTarget,
+		podUID:            types.UID("pod-uid-1111"),
+		eipRedirectTarget: expectedTarget,
 	}
 	err = podIndexer.Update(podDeleting)
 	require.NoError(t, err)
