@@ -460,7 +460,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	}
 
 	if err := c.reconcileRoutes(expectedPrefixes); err != nil {
-		targetErrors = append(targetErrors, err)
+		klog.Errorf("failed to reconcile routes: %v", err)
 	}
 
 	return errors.Join(targetErrors...)
