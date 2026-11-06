@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	nadutils "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/utils"
 	"github.com/vishvananda/netlink"
@@ -17,17 +18,34 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+// isPodVethName 校验设备名称是否为 Pod 的 host 端 veth 设备（例如以 _net1_h、_h 结尾或以 veth 开头）
+func isPodVethName(name string) bool {
+	return strings.HasSuffix(name, "_net1_h") ||
+		strings.HasSuffix(name, "_h") ||
+		strings.HasPrefix(name, "veth")
+}
+
 func defaultFDBLookup(mac net.HardwareAddr) (int, error) {
-	neighs, err := netlink.NeighList(0, unix.AF_BRIDGE)
+	return fdbLookupInternal(mac, netlink.NeighList, netlink.LinkByIndex)
+}
+
+func fdbLookupInternal(mac net.HardwareAddr, neighList func(int, int) ([]netlink.Neigh, error), linkByIndex func(int) (netlink.Link, error)) (int, error) {
+	neighs, err := neighList(0, unix.AF_BRIDGE)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list bridge FDB entries: %w", err)
 	}
 	for _, neigh := range neighs {
 		if bytes.Equal(neigh.HardwareAddr, mac) {
-			return neigh.LinkIndex, nil
+			link, err := linkByIndex(neigh.LinkIndex)
+			if err != nil {
+				continue
+			}
+			if isPodVethName(link.Attrs().Name) {
+				return neigh.LinkIndex, nil
+			}
 		}
 	}
-	return 0, fmt.Errorf("no bridge FDB entry found for MAC %s", mac)
+	return 0, fmt.Errorf("no bridge FDB entry found on pod veth interfaces for MAC %s", mac)
 }
 
 // getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。

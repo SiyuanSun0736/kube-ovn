@@ -342,4 +342,46 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		_, err = natGwTCRedirectTarget(pod, subnet, "bond0", nil, fdbLookup)
 		require.ErrorContains(t, err, "has no network status for kube-system/wan")
 	})
+
+	t.Run("fdbLookupInternal device name filtering", func(t *testing.T) {
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+		neighs := []netlink.Neigh{
+			{LinkIndex: 1, HardwareAddr: mac}, // bond0 (物理口/bond口，应被跳过)
+			{LinkIndex: 2, HardwareAddr: mac}, // 119ec988_net1_h (Pod veth 口，应被选中)
+		}
+
+		links := map[int]string{
+			1: "bond0",
+			2: "119ec988_net1_h",
+		}
+
+		neighListMock := func(int, int) ([]netlink.Neigh, error) {
+			return neighs, nil
+		}
+		linkByIndexMock := func(idx int) (netlink.Link, error) {
+			name, ok := links[idx]
+			if !ok {
+				return nil, errors.New("link not found")
+			}
+			return &netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: idx, Name: name}}, nil
+		}
+
+		// 成功过滤跳过 bond0，精准命中 119ec988_net1_h
+		idx, err := fdbLookupInternal(mac, neighListMock, linkByIndexMock)
+		require.NoError(t, err)
+		require.Equal(t, 2, idx)
+
+		// 测试全部为非 Pod 网卡时报错
+		links[2] = "ens7f0"
+		_, err = fdbLookupInternal(mac, neighListMock, linkByIndexMock)
+		require.ErrorContains(t, err, "no bridge FDB entry found on pod veth interfaces")
+
+		// 测试 isPodVethName
+		require.True(t, isPodVethName("119ec988_net1_h"))
+		require.True(t, isPodVethName("a1a3a0b2527d_h"))
+		require.True(t, isPodVethName("vethab07e886"))
+		require.False(t, isPodVethName("bond0"))
+		require.False(t, isPodVethName("ens7f0"))
+		require.False(t, isPodVethName("docker0"))
+	})
 }
