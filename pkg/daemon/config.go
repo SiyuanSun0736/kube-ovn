@@ -82,6 +82,7 @@ type Configuration struct {
 	UDPConnCheckPort          int32
 	EnableTProxy              bool
 	OVSVsctlConcurrency       int32
+	SetGeneveTxOff            bool
 	SetVxlanTxOff             bool
 	LogPerm                   string
 	EnableNonPrimaryCNI       bool
@@ -145,6 +146,7 @@ func ParseFlags() *Configuration {
 		argCertManagerIPSecCert      = pflag.Bool("cert-manager-ipsec-cert", false, "Whether to use cert-manager for signing IPSec certificates")
 		argCertManagerIssuerName     = pflag.String("cert-manager-issuer-name", "kube-ovn", "The cert-manager issuer name to request certificates from")
 		argOVNIPSecCertDuration      = pflag.Int("ovn-ipsec-cert-duration", 2*365*24*60*60, "The duration requested for IPSec certificates (seconds)")
+		argSetGeneveTxOff            = pflag.Bool("set-geneve-tx-off", false, "Whether to set genev_sys_6081 tx off")
 		argSetVxlanTxOff             = pflag.Bool("set-vxlan-tx-off", false, "Whether to set vxlan_sys_4789 tx off")
 		argLogPerm                   = pflag.String("log-perm", "640", "The permission for the log file")
 
@@ -219,6 +221,7 @@ func ParseFlags() *Configuration {
 		UDPConnCheckPort:          *argUDPConnectivityCheckPort,
 		EnableTProxy:              *argEnableTProxy,
 		OVSVsctlConcurrency:       *argOVSVsctlConcurrency,
+		SetGeneveTxOff:            *argSetGeneveTxOff,
 		SetVxlanTxOff:             *argSetVxlanTxOff,
 		LogPerm:                   *argLogPerm,
 		TLSMinVersion:             *argTLSMinVersion,
