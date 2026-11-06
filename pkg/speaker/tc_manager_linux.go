@@ -139,6 +139,11 @@ func (m *linuxTCManager) attach(linkName string) error {
 			return nil
 		}
 	}
+	// 使用 FilterReplace 在指定网卡的 Ingress 队列上原子挂载或就地替换（Atomic Swap）eBPF TC 过滤器：
+	// 1. LinkIndex/Parent: 挂载到宿主机物理网卡的 clsact Ingress 入向通道，在报文进入内核 Netfilter/conntrack 之前提前拦截；
+	// 2. Handle/Priority/Protocol: 独占配置的优先级（默认 5），匹配所有二层以太网协议（ETH_P_ALL，含 IPv4/IPv6/VLAN）；
+	// 3. DirectAction: 开启 direct-action (da) 快速通道，允许 BPF 程序直接执行 bpf_redirect 进行微秒级线速转发，跳过传统 TC Action 管道；
+	// 4. 原子切替：内核依靠 RCU 机制实现热更无锁平滑升级，过程全程零中断、不漏包。
 	return netlink.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
