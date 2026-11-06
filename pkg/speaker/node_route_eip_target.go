@@ -18,17 +18,26 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-// isPodVethName 校验设备名称是否为 Pod 的 host 端 veth 设备（例如以 _net1_h、_h 结尾或以 veth 开头）
+// isPodVethName 校验设备名称是否属于 Pod 在宿主机端的 host 端 veth 网卡设备：
+// 1. 以 "_net1_h" 结尾：Multus 辅助网卡（如网关业务直通外网口）在宿主机端的配对端；
+// 2. 以 "_h" 结尾：Kube-OVN/PTP 等 CNI 默认在宿主机端的 Pod 配对端；
+// 3. 以 "veth" 开头：通用或旧版 CNI 创建的宿主机端 veth 设备。
+// 用于在遍历 Linux 网桥 FDB 转发表时排除底层物理网卡（如 ens7f0）、Bond 聚合口（如 bond0）等非 Pod 设备。
 func isPodVethName(name string) bool {
 	return strings.HasSuffix(name, "_net1_h") ||
 		strings.HasSuffix(name, "_h") ||
 		strings.HasPrefix(name, "veth")
 }
 
+// defaultFDBLookup 生产默认使用的网桥 FDB 转发表查询实现。
 func defaultFDBLookup(mac net.HardwareAddr) (int, error) {
 	return fdbLookupInternal(mac, netlink.NeighList, netlink.LinkByIndex)
 }
 
+// fdbLookupInternal 通过 Linux 内核网桥 FDB 转发表（AF_BRIDGE），仅凭 Pod MAC 地址反查其在宿主机端挂载的 veth 接口 ifindex：
+// 1. 调用 netlink.NeighList(0, unix.AF_BRIDGE) 查询宿主机所有网桥接口的 FDB 记录（等价于 `bridge fdb show`）；
+// 2. 比对 HardwareAddr 是否与 Pod 的 MAC 精确一致；
+// 3. 校验匹配到的设备名称必须满足 isPodVethName，排除 bond0/物理口等相同 MAC 的干扰项，确保定位到正确的 Pod host 端端口。
 func fdbLookupInternal(mac net.HardwareAddr, neighList func(int, int) ([]netlink.Neigh, error), linkByIndex func(int) (netlink.Link, error)) (int, error) {
 	neighs, err := neighList(0, unix.AF_BRIDGE)
 	if err != nil {
@@ -40,6 +49,7 @@ func fdbLookupInternal(mac net.HardwareAddr, neighList func(int, int) ([]netlink
 			if err != nil {
 				continue
 			}
+			// 过滤非 Pod veth 网卡（例如 bond0 或物理网卡）
 			if isPodVethName(link.Attrs().Name) {
 				return neigh.LinkIndex, nil
 			}
@@ -112,7 +122,10 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 		}
 	} else {
 		// 非 macvlan 模式（veth-pair 模式）：
-		// 纯二层无 IP 依赖，通过网桥 FDB 转发表根据 Pod MAC 反查宿主机端端口
+		// 纯二层无 IP 依赖，彻底消除对 Pod IP (status.IPs[0]) 和路由表 (netlink.RouteGet) 的依赖。
+		// 1. 直接以 Pod 的 network-status 中的 status.Mac 为准；
+		// 2. 通过宿主机网桥 FDB 转发表（AF_BRIDGE）反查接入该网桥的 host 端 veth 网卡设备；
+		// 3. 严格限定匹配到的设备名属于 Pod host 端 veth（_net1_h / _h / veth...），防止误匹配到物理口/Bond 口。
 		fdbFind := defaultFDBLookup
 		if len(fdbLookup) > 0 && fdbLookup[0] != nil {
 			fdbFind = fdbLookup[0]
@@ -129,11 +142,13 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("failed to resolve host veth device for pod %s/%s via bridge FDB: %w", pod.Namespace, pod.Name, err)
 			}
+			// 防环回安全校验：重定向目标网卡不能是 Ingress 接收父设备自身（例如 bond0）
 			if defaultParent != "" {
 				if plink, err := lookup(defaultParent); err == nil && targetLinkIndex == plink.Attrs().Index {
 					return TCRedirectTarget{}, fmt.Errorf("bridge FDB target device points to ingress interface %s (%d), not a local pod veth", defaultParent, plink.Attrs().Index)
 				}
 			}
+			// veth-pair 点对点模式直通 Pod，ParentIfindex 为 0
 			target := TCRedirectTarget{TargetIfindex: targetLinkIndex, ParentIfindex: 0, TargetMAC: mac}
 			if !validTCRedirectTarget(target) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
