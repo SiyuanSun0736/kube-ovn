@@ -71,6 +71,13 @@ type Configuration struct {
 	VpcNatGwNamespace string
 	NodeRouteEIPMode  bool
 
+	// TC eBPF 物理宿主机公网 EIP 旁路直通加速与抗 conntrack 击穿防护配置
+	EnableTcBpfRedirect bool   // 是否开启 eBPF TC Ingress 旁路直通加速
+	TcBpfInterface      string // 挂载 TC 的宿主机物理网卡（如 macbond1），启用 --enable-tc-bpf-redirect 时必须显式指定
+	TcBpfProgPath       string // 编译后的 eBPF TC 分类器二进制目标文件路径（默认为 /etc/kube-ovn/tc_eip.o）
+	TcBpfMapPath        string // 固化的 BPF Map 基础路径（默认为 /sys/fs/bpf/kube_ovn_eip_v4_map）
+	TcBpfPriority       uint16 // TC BPF 过滤器的挂载优先级 priority/pref (默认 5，数值越小优先级越高，预留 1-4 给更高优先级防护，优于常规 CNI)
+
 	// BFD (Bidirectional Forwarding Detection) configuration
 	EnableBFD              bool
 	BFDMinTX               uint32 // minimum transmit interval in milliseconds (converted to microseconds for GoBGP)
@@ -116,6 +123,11 @@ func ParseFlags() (*Configuration, error) {
 		argLogPerm                     = pflag.String("log-perm", "640", "The permission for the log file")
 		argVpcNatGwNamespace           = pflag.String("vpc-nat-gw-namespace", "kube-system", "The namespace where VPC NAT Gateway pods are deployed, default: kube-system")
 		argNodeRouteEIPMode            = pflag.BoolP("node-route-eip-mode", "", false, "Make the BGP speaker announce EIPs for local NAT gateway pods. Mutually exclusive with --nat-gw-mode. Speaker runs on node with host network and announces EIPs for vpc-nat-gw pods on the same node")
+		argEnableTcBpfRedirect         = pflag.BoolP("enable-tc-bpf-redirect", "", false, "Enable eBPF TC ingress bypass and redirection to forward EIP traffic directly to the gateway pod, bypassing host conntrack")
+		argTcBpfInterface              = pflag.String("tc-bpf-interface", "", "The physical host interface to attach the TC BPF filter to (e.g. macbond1). Required when --enable-tc-bpf-redirect is set")
+		argTcBpfProgPath               = pflag.String("tc-bpf-prog-path", "/etc/kube-ovn/tc_eip.o", "Path to the compiled eBPF TC classifier binary object")
+		argTcBpfMapPath                = pflag.String("tc-bpf-map-path", "/sys/fs/bpf/kube_ovn_eip_v4_map", "Pinned base path for the persistent BPF map")
+		argTcBpfPriority               = pflag.Uint16("tc-bpf-priority", 5, "TC BPF filter attachment priority/pref (default 5; lower numbers have higher priority, reserving 1-4 for higher precedence filters)")
 		argEnableBFD                   = pflag.BoolP("enable-bfd", "", false, "Enable BFD (Bidirectional Forwarding Detection) for fast failure detection")
 		argBFDMinTX                    = pflag.Uint32("bfd-min-tx", 1000, "BFD minimum transmit interval in milliseconds (default 1000, max 4294967)")
 		argBFDMinRX                    = pflag.Uint32("bfd-min-rx", 1000, "BFD minimum receive interval in milliseconds (default 1000, max 4294967)")
@@ -195,6 +207,11 @@ func ParseFlags() (*Configuration, error) {
 		LogPerm:                     *argLogPerm,
 		VpcNatGwNamespace:           *argVpcNatGwNamespace,
 		NodeRouteEIPMode:            *argNodeRouteEIPMode,
+		EnableTcBpfRedirect:         *argEnableTcBpfRedirect,
+		TcBpfInterface:              *argTcBpfInterface,
+		TcBpfProgPath:               *argTcBpfProgPath,
+		TcBpfMapPath:                *argTcBpfMapPath,
+		TcBpfPriority:               *argTcBpfPriority,
 		EnableBFD:                   *argEnableBFD,
 		BFDMinTX:                    *argBFDMinTX,
 		BFDMinRX:                    *argBFDMinRX,
@@ -271,6 +288,9 @@ func ParseFlags() (*Configuration, error) {
 // - NatGwMode: speaker runs inside NAT gateway pod, announces EIPs for that specific gateway
 // - NodeRouteEIPMode: speaker runs on node, announces EIPs for all local NAT gateway pods
 func (config *Configuration) validateMutuallyExclusiveModes() error {
+	if config.EnableTcBpfRedirect && !config.NodeRouteEIPMode {
+		return errors.New("--enable-tc-bpf-redirect requires --node-route-eip-mode")
+	}
 	if config.NatGwMode && config.NodeRouteEIPMode {
 		return errors.New("--nat-gw-mode and --node-route-eip-mode are mutually exclusive")
 	}
@@ -301,6 +321,10 @@ func (config *Configuration) validateRequiredFlags() error {
 	// NodeRouteEIPMode requires NodeName to identify local NAT gateway pods
 	if config.NodeRouteEIPMode && config.NodeName == "" {
 		missingFlags = append(missingFlags, "--node-route-eip-mode requires --node-name to be specified")
+	}
+
+	if config.EnableTcBpfRedirect && config.TcBpfInterface == "" {
+		missingFlags = append(missingFlags, "--enable-tc-bpf-redirect requires explicit --tc-bpf-interface (e.g. macbond1)")
 	}
 
 	if config.EnableBFD {

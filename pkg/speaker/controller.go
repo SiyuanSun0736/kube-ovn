@@ -1,10 +1,12 @@
 package speaker
 
 import (
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeinformers "k8s.io/client-go/informers"
@@ -23,6 +25,11 @@ import (
 )
 
 const controllerAgentName = "ovn-speaker"
+
+type gwTargetCacheEntry struct {
+	podUID types.UID
+	target TCRedirectTarget
+}
 
 type Controller struct {
 	config *Configuration
@@ -52,6 +59,14 @@ type Controller struct {
 
 	natgatewayLister kubeovnlister.VpcNatGatewayLister
 	natgatewaySynced cache.InformerSynced
+
+	// tcManager 负责管理物理宿主机网卡的 eBPF TC Ingress 过滤器生命周期与 BPF Map 路由表同步
+	tcManager        TCManager
+	tcCleanupPending bool
+
+	// gwTargetCache 缓存每个网关 Pod UID 对应的 TC 重定向目标，只要网关 Pod 未重建，即完全免去系统调用与重复计算
+	gwTargetCacheMu sync.RWMutex
+	gwTargetCache   map[string]gwTargetCacheEntry
 
 	// eipQueue is used in node-route-eip-mode for processing EIP events
 	eipQueue workqueue.TypedRateLimitingInterface[string]
@@ -156,6 +171,9 @@ func NewController(config *Configuration) *Controller {
 		eipSynced:        eipInformer.Informer().HasSynced,
 		natgatewayLister: natgatewayInformer.Lister(),
 		natgatewaySynced: natgatewayInformer.Informer().HasSynced,
+		tcManager:        NewTCManager(config),
+		tcCleanupPending: config.NodeRouteEIPMode && !config.EnableTcBpfRedirect,
+		gwTargetCache:    make(map[string]gwTargetCacheEntry),
 
 		informerFactory:        informerFactory,
 		nodeInformerFactory:    nodeInformerFactory,
@@ -209,6 +227,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	klog.Info("Started workers")
 
+	if c.config.NodeRouteEIPMode {
+		defer func() {
+			if err := c.tcManager.Close(); err != nil {
+				klog.Errorf("failed to close TC EIP manager: %v", err)
+			}
+		}()
+	}
+
 	// Start node-route-eip workers if in that mode
 	if c.config.NodeRouteEIPMode {
 		c.startNodeRouteEIPWorkers(stopCh, 1)
@@ -250,6 +276,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 //	    nat-gw-mode does not participate in Service VIP announcement; it only
 //	    announces NAT gateway EIPs from inside the gateway pod.
 func (c *Controller) Reconcile() {
+	if c.tcCleanupPending {
+		if err := c.tcManager.Clean(); err != nil {
+			klog.Errorf("failed to clean up disabled TC EIP redirection, will retry on next reconcile: %v", err)
+		} else {
+			c.tcCleanupPending = false
+		}
+	}
+
 	switch {
 	case c.config.NatGwMode:
 		// EIP plane (nat-gw-mode): speaker runs inside the NAT gateway pod and

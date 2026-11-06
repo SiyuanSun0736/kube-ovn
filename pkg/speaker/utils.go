@@ -48,6 +48,16 @@ func isPodAlive(p *corev1.Pod) bool {
 	return true
 }
 
+// isPodRunning 判断 Pod 是否处于正常活跃运行态（处于 Running 阶段且未被标记删除）
+func isPodRunning(pod *corev1.Pod) bool {
+	return pod != nil && pod.Status.Phase == corev1.PodRunning && pod.DeletionTimestamp == nil
+}
+
+// isPodDeleting 判断 Pod 是否处于 Terminating 终止删除态
+func isPodDeleting(pod *corev1.Pod) bool {
+	return pod != nil && pod.DeletionTimestamp != nil
+}
+
 // isClusterIPService returns whether a Service is of type ClusterIP or not
 func isClusterIPService(svc *corev1.Service) bool {
 	return svc.Spec.Type == corev1.ServiceTypeClusterIP &&
