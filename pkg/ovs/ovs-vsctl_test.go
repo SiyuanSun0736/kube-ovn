@@ -255,18 +255,18 @@ func TestParseTunnelRemoteIPs(t *testing.T) {
 		expected []string
 	}{
 		{
-			name: "standard ovsdb json format",
-			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.25"]]]],[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.26"]]]]],"headings":["options"]}`,
+			name:     "standard ovsdb json format",
+			output:   `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.25"]]]],[["map",[["csum","true"],["key","flow"],["local_ip","10.210.10.24"],["remote_ip","10.210.10.26"]]]]],"headings":["options"]}`,
 			expected: []string{"10.210.10.25", "10.210.10.26"},
 		},
 		{
-			name: "ipv6 ovsdb json format",
-			output: `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","fd00::24"],["remote_ip","fd00::25"]]]]],"headings":["options"]}`,
+			name:     "ipv6 ovsdb json format",
+			output:   `{"data":[[["map",[["csum","true"],["key","flow"],["local_ip","fd00::24"],["remote_ip","fd00::25"]]]]],"headings":["options"]}`,
 			expected: []string{"fd00::25"},
 		},
 		{
-			name: "non-ip remote_ip ignored",
-			output: `{"data":[[["map",[["key","flow"],["remote_ip","flow"]]]],[["map",[["remote_ip",""]]]]],"headings":["options"]}`,
+			name:     "non-ip remote_ip ignored",
+			output:   `{"data":[[["map",[["key","flow"],["remote_ip","flow"]]]],[["map",[["remote_ip",""]]]]],"headings":["options"]}`,
 			expected: nil,
 		},
 		{
