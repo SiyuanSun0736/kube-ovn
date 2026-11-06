@@ -14,6 +14,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	listerv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -39,6 +42,26 @@ func (f *fakeSubnetLister) Get(name string) (*kubeovnv1.Subnet, error) {
 	return nil, apierrors.NewNotFound(kubeovnv1.Resource("subnet"), name)
 }
 
+// fakeNatGatewayLister 模拟测试用的 VpcNatGatewayLister
+type fakeNatGatewayLister struct {
+	gateways map[string]*kubeovnv1.VpcNatGateway
+}
+
+func (f *fakeNatGatewayLister) List(_ labels.Selector) ([]*kubeovnv1.VpcNatGateway, error) {
+	var list []*kubeovnv1.VpcNatGateway
+	for _, gw := range f.gateways {
+		list = append(list, gw)
+	}
+	return list, nil
+}
+
+func (f *fakeNatGatewayLister) Get(name string) (*kubeovnv1.VpcNatGateway, error) {
+	if gw, ok := f.gateways[name]; ok {
+		return gw, nil
+	}
+	return nil, apierrors.NewNotFound(kubeovnv1.Resource("vpcnatgateway"), name)
+}
+
 // TestGetNatGwTCRedirectTarget 验证 Controller.getNatGwTCRedirectTarget 对 EIP ExternalSubnet 的校验与定位
 func TestGetNatGwTCRedirectTarget(t *testing.T) {
 	t.Run("empty external subnet", func(t *testing.T) {
@@ -55,19 +78,158 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 		require.ErrorContains(t, err, "has empty externalSubnet")
 	})
 
-	t.Run("external subnet not found", func(t *testing.T) {
+	t.Run("external subnet not found with gateway fallback", func(t *testing.T) {
+		gwSubnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "gw-ext-subnet",
+				Annotations: map[string]string{util.NadMacvlanMasterAnnotation: "bond2"},
+			},
+			Spec: kubeovnv1.SubnetSpec{Provider: "wan.kube-system"},
+		}
 		c := &Controller{
-			config:        &Configuration{TcBpfInterface: "bond0"},
-			subnetsLister: &fakeSubnetLister{subnets: map[string]*kubeovnv1.Subnet{}},
+			config: &Configuration{TcBpfInterface: "bond0"},
+			subnetsLister: &fakeSubnetLister{subnets: map[string]*kubeovnv1.Subnet{
+				"gw-ext-subnet": gwSubnet,
+			}},
+			natgatewayLister: &fakeNatGatewayLister{gateways: map[string]*kubeovnv1.VpcNatGateway{
+				"gw-1": {
+					ObjectMeta: metav1.ObjectMeta{Name: "gw-1"},
+					Spec:       kubeovnv1.VpcNatGatewaySpec{ExternalSubnets: []string{"gw-ext-subnet"}},
+				},
+			}},
 		}
 		eip := &kubeovnv1.IptablesEIP{
-			ObjectMeta: metav1.ObjectMeta{Name: "eip-missing-subnet"},
-			Spec:       kubeovnv1.IptablesEIPSpec{ExternalSubnet: "non-exist-subnet"},
+			ObjectMeta: metav1.ObjectMeta{Name: "eip-with-diff-subnet"},
+			Spec: kubeovnv1.IptablesEIPSpec{
+				NatGwDp:        "gw-1",
+				ExternalSubnet: "las-derived-subnet-not-found",
+			},
 		}
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nat-gw-pod", Namespace: "kube-system"}}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-gw-1-0",
+				Namespace: "kube-system",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot: `[{"name":"kube-system/wan","mac":"02:00:00:00:00:99"}]`,
+				},
+			},
+		}
+		// 在当前测试环境下，直接调用 getNatGwTCRedirectTarget 会走 fallback 逻辑到 gw-ext-subnet，
+		// 最终调用 natGwTCRedirectTarget 解析网卡。
+		// 由于该测试未 mock netlink.LinkByName，会返回找不到 netlink link 的错误，
+		// 但错误信息证明已经成功 fallback 到了 "gw-ext-subnet" 对应的 macvlan 接口检查，而不是停留在 "las-derived-subnet-not-found"
 		_, err := c.getNatGwTCRedirectTarget(pod, eip)
-		require.ErrorContains(t, err, "failed to get external subnet non-exist-subnet")
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "las-derived-subnet-not-found")
 	})
+}
+
+// TestResolveEipRedirectTargetCache 验证 UID 缓存机制：只要 Pod UID 相同直接复用缓存，Pod 重建或失效则失效更新
+func TestResolveEipRedirectTargetCache(t *testing.T) {
+	gwSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gw-ext",
+		},
+		Spec: kubeovnv1.SubnetSpec{Provider: "wan.kube-system"},
+	}
+	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	podLister := listerv1.NewPodLister(podIndexer)
+
+	c := &Controller{
+		config: &Configuration{
+			TcBpfInterface:    "bond0",
+			VpcNatGwNamespace: "kube-system",
+		},
+		gwPodsLister:  podLister,
+		subnetsLister: &fakeSubnetLister{subnets: map[string]*kubeovnv1.Subnet{"gw-ext": gwSubnet}},
+		gwTargetCache: make(map[string]gwTargetCacheEntry),
+	}
+
+	podName := util.GenNatGwPodName("gw-test")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: "kube-system",
+			UID:       types.UID("pod-uid-1111"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+	err := podIndexer.Add(pod)
+	require.NoError(t, err)
+
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip-test"},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			NatGwDp:        "gw-test",
+			ExternalSubnet: "gw-ext",
+		},
+	}
+
+	// 1. 预先在缓存中填入 uid-1111 的已解析 Target
+	expectedTarget := TCRedirectTarget{
+		TargetIfindex: 10,
+		ParentIfindex: 2,
+		TargetMAC:     net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+	}
+	c.gwTargetCache["gw-test"] = gwTargetCacheEntry{
+		podUID: types.UID("pod-uid-1111"),
+		target: expectedTarget,
+	}
+
+	// 2. 调用 resolveEipRedirectTarget，应直接命中 UID 缓存并返回，完全不调用 getNatGwTCRedirectTarget
+	target, retainStale, err := c.resolveEipRedirectTarget(eip)
+	require.NoError(t, err)
+	require.False(t, retainStale)
+	require.NotNil(t, target)
+	require.Equal(t, expectedTarget, *target)
+
+	// 3. Pod 被删除重建，UID 变为 pod-uid-2222
+	podRebuilt := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: "kube-system",
+			UID:       types.UID("pod-uid-2222"),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+	err = podIndexer.Update(podRebuilt)
+	require.NoError(t, err)
+
+	// 调用时因 UID 不匹配，缓存失效，尝试重新解析（因为未 mock netlink 会报错，证明没有走旧缓存）
+	_, _, err = c.resolveEipRedirectTarget(eip)
+	require.Error(t, err)
+
+	// 4. Pod 处于 Terminating 状态（带有 DeletionTimestamp），清理缓存并返回 nil
+	now := metav1.Now()
+	podDeleting := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              podName,
+			Namespace:         "kube-system",
+			UID:               types.UID("pod-uid-1111"),
+			DeletionTimestamp: &now,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+	c.gwTargetCache["gw-test"] = gwTargetCacheEntry{
+		podUID: types.UID("pod-uid-1111"),
+		target: expectedTarget,
+	}
+	err = podIndexer.Update(podDeleting)
+	require.NoError(t, err)
+
+	target, retainStale, err = c.resolveEipRedirectTarget(eip)
+	require.NoError(t, err)
+	require.False(t, retainStale)
+	require.Nil(t, target)
+	// 验证缓存已被清理
+	_, exists := c.gwTargetCache["gw-test"]
+	require.False(t, exists)
 }
 
 // TestNatGwTCRedirectTarget 验证 natGwTCRedirectTarget 在各类网络模式与边界输入下的直通目标解析

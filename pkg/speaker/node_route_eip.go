@@ -317,21 +317,45 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 			// 非 NotFound 的瞬时缓存或 API 抖动：声明式保留存量映射以防网络中断
 			return nil, true, fmt.Errorf("failed to get NAT GW pod %s: %w", podName, err)
 		}
+		// Pod 已不存在，清理对应的 UID 缓存
+		c.gwTargetCacheMu.Lock()
+		delete(c.gwTargetCache, eip.Spec.NatGwDp)
+		c.gwTargetCacheMu.Unlock()
 		return nil, false, err
 	}
 
-	// 若 Pod 处于删除中或非 Running 阶段，属于确定性失效：绝不保留旧映射
+	// 若 Pod 处于删除中或非 Running 阶段，属于确定性失效：绝不保留旧映射，并清理 UID 缓存
 	if isPodDeleting(pod) || !isPodRunning(pod) {
 		klog.Warningf("NAT GW pod %s for EIP %s is terminating or not running, dropping redirect target", podName, eip.Name)
+		c.gwTargetCacheMu.Lock()
+		delete(c.gwTargetCache, eip.Spec.NatGwDp)
+		c.gwTargetCacheMu.Unlock()
 		return nil, false, nil
 	}
 
+	// 1. 尝试从长效 UID 缓存读取（只要 Pod.UID 未变，网卡 ifindex 和 MAC 恒定，无需重复查询 Netlink）
+	c.gwTargetCacheMu.RLock()
+	cached, ok := c.gwTargetCache[eip.Spec.NatGwDp]
+	c.gwTargetCacheMu.RUnlock()
+	if ok && cached.podUID == pod.UID {
+		return &cached.target, false, nil
+	}
+
+	// 2. 缓存未命中或 Pod 重建（UID 变更），实时解析网卡目标
 	target, err := c.getNatGwTCRedirectTarget(pod, eip)
 	if err != nil {
 		// Pod 正常活跃，但网卡/子网元数据暂未就绪（如 NetworkStatus 写入延迟），保留存量映射
 		klog.Warningf("failed to resolve redirect target for EIP %s while pod %s is active: %v", eip.Name, podName, err)
 		return nil, true, err
 	}
+
+	// 3. 解析成功，存入长效 UID 缓存
+	c.gwTargetCacheMu.Lock()
+	c.gwTargetCache[eip.Spec.NatGwDp] = gwTargetCacheEntry{
+		podUID: pod.UID,
+		target: target,
+	}
+	c.gwTargetCacheMu.Unlock()
 
 	return &target, false, nil
 }
@@ -376,7 +400,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		var redirectTarget *TCRedirectTarget
 		var retainStale bool
 		if c.config.EnableTcBpfRedirect {
-			cacheKey := eip.Spec.NatGwDp + "/" + eip.Spec.ExternalSubnet
+			cacheKey := eip.Spec.NatGwDp
 			if cached, ok := targetCache[cacheKey]; ok {
 				redirectTarget, retainStale = cached.target, cached.retainStale
 				if cached.err != nil && redirectTarget == nil {

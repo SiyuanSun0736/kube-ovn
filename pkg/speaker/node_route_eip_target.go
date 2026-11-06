@@ -10,22 +10,55 @@ import (
 	nadutils "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/utils"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 // getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。
-// 直接以 EIP 本身的 ExternalSubnet 为准定位外网子网，避免网关配置多个外网子网时产生歧义。
+// 优先使用 EIP 本身指定的 ExternalSubnet 定位外网网卡；
+// 若 EIP 未指定 ExternalSubnet 或该子网未能匹配到 Pod 上的网卡（例如 LAS 中 EIP 与 Gateway 子网不一致情况），
+// 则自动 fallback 回溯 VpcNatGateway CR 的 ExternalSubnets，解析网关真实绑定的物理外网网卡。
 func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
-	if eip.Spec.ExternalSubnet == "" {
-		return TCRedirectTarget{}, fmt.Errorf("iptables-eip %s has empty externalSubnet", eip.Name)
+	var primaryErr error
+	if eip.Spec.ExternalSubnet != "" {
+		subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
+		if err == nil {
+			target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+			if err == nil {
+				return target, nil
+			}
+			primaryErr = err
+		} else {
+			primaryErr = fmt.Errorf("failed to get external subnet %s for EIP %s: %w", eip.Spec.ExternalSubnet, eip.Name, err)
+		}
+	} else {
+		primaryErr = fmt.Errorf("iptables-eip %s has empty externalSubnet", eip.Name)
 	}
-	subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
-	if err != nil {
-		return TCRedirectTarget{}, fmt.Errorf("failed to get external subnet %s for EIP %s: %w", eip.Spec.ExternalSubnet, eip.Name, err)
+
+	// Fallback: 尝试从对应的 VpcNatGateway 获取其配置的 ExternalSubnets 兜底解析
+	if c.natgatewayLister != nil && eip.Spec.NatGwDp != "" {
+		gw, err := c.natgatewayLister.Get(eip.Spec.NatGwDp)
+		if err == nil && gw != nil {
+			for _, extSubnetName := range gw.Spec.ExternalSubnets {
+				if extSubnetName == "" || extSubnetName == eip.Spec.ExternalSubnet {
+					continue
+				}
+				subnet, err := c.subnetsLister.Get(extSubnetName)
+				if err != nil {
+					continue
+				}
+				target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+				if err == nil {
+					klog.Infof("resolved redirect target for EIP %s fallback to gateway %s externalSubnet %s", eip.Name, gw.Name, extSubnetName)
+					return target, nil
+				}
+			}
+		}
 	}
-	return natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+
+	return TCRedirectTarget{}, primaryErr
 }
 
 // TC Ingress 接收网卡与外网子网的 macvlan 父设备可以不是同一个设备。
