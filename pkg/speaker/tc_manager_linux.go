@@ -20,9 +20,11 @@ import (
 )
 
 const (
-	tcEIPFilterName = "kube-ovn-eip"
-	tcEIPv4MapName  = "kube_ovn_eip_v4_map"
-	tcEIPv6MapName  = "kube_ovn_eip_v6_map"
+	tcEIPFilterName       = "kube-ovn-eip"
+	tcEIPv4MapName        = "kube_ovn_eip_v4_map"
+	tcEIPv6MapName        = "kube_ovn_eip_v6_map"
+	defaultTcEIPv4MapPath = "/sys/fs/bpf/kube_ovn_eip_v4_map"
+	defaultTcEIPv6MapPath = "/sys/fs/bpf/kube_ovn_eip_v6_map"
 )
 
 // 结构体内存布局必须与 tc_eip.c 中的 struct eip_target 保持完全一致（总计 16 字节，严格 32 位对齐）
@@ -57,12 +59,12 @@ func ensureClsactQdisc(link netlink.Link) error {
 	return nil
 }
 
-// mapPaths 根据配置的 IPv4 Pinned Map 路径推导，IPv6 Map 为其同级同名映射文件
+// mapPaths 返回 IPv4 和 IPv6 Pinned Map 路径。
 func (m *linuxTCManager) mapPaths() (string, string) {
-	v4 := m.cfg.TcBpfMapPath
-	if v4 == "" {
-		v4 = "/sys/fs/bpf/kube_ovn_eip_v4_map"
+	if m.cfg.TcBpfMapPath == "" || m.cfg.TcBpfMapPath == defaultTcEIPv4MapPath {
+		return defaultTcEIPv4MapPath, defaultTcEIPv6MapPath
 	}
+	v4 := m.cfg.TcBpfMapPath
 	v6 := strings.TrimSuffix(v4, "_v4_map") + "_v6_map"
 	return v4, v6
 }
