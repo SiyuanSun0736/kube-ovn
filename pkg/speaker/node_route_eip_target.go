@@ -36,23 +36,25 @@ func defaultFDBLookup(mac net.HardwareAddr) (int, error) {
 
 // fdbLookupInternal 通过 Linux 内核网桥 FDB 转发表（AF_BRIDGE），仅凭 Pod MAC 地址反查其在宿主机端挂载的 veth 接口 ifindex：
 // 1. 调用 netlink.NeighList(0, unix.AF_BRIDGE) 查询宿主机所有网桥接口的 FDB 记录（等价于 `bridge fdb show`）；
-// 2. 比对 HardwareAddr 是否与 Pod 的 MAC 精确一致；
-// 3. 校验匹配到的设备名称必须满足 isPodVethName，排除 bond0/物理口等相同 MAC 的干扰项，确保定位到正确的 Pod host 端端口。
+// 2. 校验表项对应的设备名必须满足 isPodVethName（_net1_h / _h / veth...），直接排除 bond0、物理网卡等非 Pod 设备；
+// 3. 在符合规则的 Pod veth 接口表项中比对 HardwareAddr 是否与 Pod 的 MAC 精确一致。
 func fdbLookupInternal(mac net.HardwareAddr, neighList func(int, int) ([]netlink.Neigh, error), linkByIndex func(int) (netlink.Link, error)) (int, error) {
 	neighs, err := neighList(0, unix.AF_BRIDGE)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list bridge FDB entries: %w", err)
 	}
 	for _, neigh := range neighs {
+		link, err := linkByIndex(neigh.LinkIndex)
+		if err != nil {
+			continue
+		}
+		// 1. 先判断网卡名称是否符合 Pod veth 规则
+		if !isPodVethName(link.Attrs().Name) {
+			continue
+		}
+		// 2. 规则符合后再比对 MAC 地址
 		if bytes.Equal(neigh.HardwareAddr, mac) {
-			link, err := linkByIndex(neigh.LinkIndex)
-			if err != nil {
-				continue
-			}
-			// 过滤非 Pod veth 网卡（例如 bond0 或物理网卡）
-			if isPodVethName(link.Attrs().Name) {
-				return neigh.LinkIndex, nil
-			}
+			return neigh.LinkIndex, nil
 		}
 	}
 	return 0, fmt.Errorf("no bridge FDB entry found on pod veth interfaces for MAC %s", mac)
