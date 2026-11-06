@@ -238,10 +238,10 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 
 	// Announce routes only if not already announced (idempotent)
 	var errs []error
-	var gwRedirectTarget *TCRedirectTarget
+	var eipRedirectTarget *TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
 		var err error
-		gwRedirectTarget, _, err = c.resolveEipRedirectTarget(eip)
+		eipRedirectTarget, _, err = c.resolveEipRedirectTarget(eip)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -253,11 +253,11 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 			continue
 		}
 		if c.config.EnableTcBpfRedirect {
-			if gwRedirectTarget == nil || !validTCRedirectTarget(*gwRedirectTarget) {
+			if eipRedirectTarget == nil || !validTCRedirectTarget(*eipRedirectTarget) {
 				klog.V(3).Infof("deferring BGP route announcement for EIP %s until TC redirect target is ready", ip)
 				continue
 			}
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), *gwRedirectTarget); err != nil {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), *eipRedirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 				continue
@@ -305,7 +305,7 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 
 // resolveEipRedirectTarget 解析当前 EIP 在本地网关 Pod 的重定向直通目标。
 // 返回值：
-// - gwRedirectTarget: 解析成功的 NAT 网关直通目标（解析失败或不适用时为 nil）
+// - eipRedirectTarget: 解析成功的 EIP 直通目标（解析失败或不适用时为 nil）
 // - retainStale: 当活跃 Pod 仅因元数据短暂就绪延迟（如 Multus NetworkStatus 写入中）时为 true，
 //   指示声明式保留存量 TC BPF 映射，避免流量被瞬时中断
 // - err: 解析异常错误
@@ -342,7 +342,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	}
 
 	// 2. 缓存未命中或 Pod 重建（UID 变更），实时解析网卡目标
-	gwRedirectTarget, err := c.getNatGwTCRedirectTarget(pod, eip)
+	eipRedirectTarget, err := c.getNatGwTCRedirectTarget(pod, eip)
 	if err != nil {
 		// Pod 正常活跃，但网卡/子网元数据暂未就绪（如 NetworkStatus 写入延迟），保留存量映射
 		klog.Warningf("failed to resolve redirect target for EIP %s while pod %s is active: %v", eip.Name, podName, err)
@@ -353,11 +353,11 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	c.gwTargetCacheMu.Lock()
 	c.gwTargetCache[eip.Spec.NatGwDp] = gwTargetCacheEntry{
 		podUID: pod.UID,
-		target: gwRedirectTarget,
+		target: eipRedirectTarget,
 	}
 	c.gwTargetCacheMu.Unlock()
 
-	return &gwRedirectTarget, false, nil
+	return &eipRedirectTarget, false, nil
 }
 
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
@@ -379,12 +379,12 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
-	type gwTargetResolution struct {
-		gwRedirectTarget *TCRedirectTarget
-		retainStale      bool
-		err              error
+	type eipTargetResolution struct {
+		eipRedirectTarget *TCRedirectTarget
+		retainStale       bool
+		err               error
 	}
-	gwResolutionCache := make(map[string]gwTargetResolution)
+	eipResolutionCache := make(map[string]eipTargetResolution)
 
 	for _, eip := range eips {
 		// Only process ready EIPs with BGP annotation
@@ -397,20 +397,20 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
-		var gwRedirectTarget *TCRedirectTarget
+		var eipRedirectTarget *TCRedirectTarget
 		var retainStale bool
 		if c.config.EnableTcBpfRedirect {
 			cacheKey := eip.Spec.NatGwDp
-			if cached, ok := gwResolutionCache[cacheKey]; ok {
-				gwRedirectTarget, retainStale = cached.gwRedirectTarget, cached.retainStale
-				if cached.err != nil && gwRedirectTarget == nil {
+			if cached, ok := eipResolutionCache[cacheKey]; ok {
+				eipRedirectTarget, retainStale = cached.eipRedirectTarget, cached.retainStale
+				if cached.err != nil && eipRedirectTarget == nil {
 					targetErrors = append(targetErrors, cached.err)
 				}
 			} else {
 				var err error
-				gwRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-				gwResolutionCache[cacheKey] = gwTargetResolution{gwRedirectTarget: gwRedirectTarget, retainStale: retainStale, err: err}
-				if err != nil && gwRedirectTarget == nil {
+				eipRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
+				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale, err: err}
+				if err != nil && eipRedirectTarget == nil {
 					targetErrors = append(targetErrors, err)
 				}
 			}
@@ -419,8 +419,8 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if gwRedirectTarget != nil {
-					expectedEipTargets[ip] = *gwRedirectTarget
+				if eipRedirectTarget != nil {
+					expectedEipTargets[ip] = *eipRedirectTarget
 				} else if retainStale {
 					retainedEIPs = append(retainedEIPs, ip)
 				}
