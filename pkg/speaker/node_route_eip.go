@@ -355,6 +355,13 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
+	type targetResolution struct {
+		target      *TCRedirectTarget
+		retainStale bool
+		err         error
+	}
+	targetCache := make(map[string]targetResolution)
+
 	for _, eip := range eips {
 		// Only process ready EIPs with BGP annotation
 		if eip.Annotations[util.BgpAnnotation] != "true" || !eip.Status.Ready {
@@ -369,10 +376,19 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		var redirectTarget *TCRedirectTarget
 		var retainStale bool
 		if c.config.EnableTcBpfRedirect {
-			var err error
-			redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-			if err != nil && redirectTarget == nil {
-				targetErrors = append(targetErrors, err)
+			cacheKey := eip.Spec.NatGwDp + "/" + eip.Spec.ExternalSubnet
+			if cached, ok := targetCache[cacheKey]; ok {
+				redirectTarget, retainStale = cached.target, cached.retainStale
+				if cached.err != nil && redirectTarget == nil {
+					targetErrors = append(targetErrors, cached.err)
+				}
+			} else {
+				var err error
+				redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
+				targetCache[cacheKey] = targetResolution{target: redirectTarget, retainStale: retainStale, err: err}
+				if err != nil && redirectTarget == nil {
+					targetErrors = append(targetErrors, err)
+				}
 			}
 		}
 
