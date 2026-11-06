@@ -29,11 +29,6 @@ func isPodVethName(name string) bool {
 		strings.HasPrefix(name, "veth")
 }
 
-// defaultFDBLookup 生产默认使用的网桥 FDB 转发表查询实现。
-func defaultFDBLookup(mac net.HardwareAddr) (int, error) {
-	return fdbLookupInternal(mac, netlink.NeighList, netlink.LinkByIndex)
-}
-
 // fdbLookupInternal 通过 Linux 内核网桥 FDB 转发表（AF_BRIDGE），仅凭 Pod MAC 地址反查其在宿主机端挂载的 veth 接口 ifindex：
 // 1. 调用 netlink.NeighList(0, unix.AF_BRIDGE) 查询宿主机所有网桥接口的 FDB 记录（等价于 `bridge fdb show`）；
 // 2. 校验表项对应的设备名必须满足 isPodVethName（_net1_h / _h / veth...），直接排除 bond0、物理网卡等非 Pod 设备；
@@ -128,7 +123,9 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 		// 1. 直接以 Pod 的 network-status 中的 status.Mac 为准；
 		// 2. 通过宿主机网桥 FDB 转发表（AF_BRIDGE）反查接入该网桥的 host 端 veth 网卡设备；
 		// 3. 严格限定匹配到的设备名属于 Pod host 端 veth（_net1_h / _h / veth...），防止误匹配到物理口/Bond 口。
-		fdbFind := defaultFDBLookup
+		fdbFind := func(m net.HardwareAddr) (int, error) {
+			return fdbLookupInternal(m, netlink.NeighList, netlink.LinkByIndex)
+		}
 		if len(fdbLookup) > 0 && fdbLookup[0] != nil {
 			fdbFind = fdbLookup[0]
 		}
