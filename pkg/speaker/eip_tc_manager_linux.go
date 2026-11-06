@@ -20,6 +20,9 @@ const (
 	tcEIPLegacyFilterName = "tc_eip.o:[classifier]"
 	tcEIPv4MapName        = "kube_ovn_eip_v4_map"
 	tcEIPv6MapName        = "kube_ovn_eip_v6_map"
+	defaultTcEIPv4MapPath = "/sys/fs/bpf/" + tcEIPv4MapName
+	defaultTcEIPv6MapPath = "/sys/fs/bpf/" + tcEIPv6MapName
+	defaultTcBpfProgPath  = "/etc/kube-ovn/tc_eip.o"
 )
 
 var tcEIPFilterNames = []string{tcEIPFilterName, tcEIPLegacyFilterName}
@@ -51,13 +54,13 @@ func newTCManager(cfg *Configuration) TCManager {
 	return &linuxTCManager{cfg: cfg}
 }
 
-// mapPaths 根据配置的 IPv4 Pinned Map 路径推导，IPv6 Map 为其同级同名映射文件
+// mapPaths 返回 IPv4 和 IPv6 Pinned Map 路径。
 func (m *linuxTCManager) mapPaths() (string, string) {
-	v4 := m.cfg.TcBpfMapPath
-	if v4 == "" {
-		v4 = "/sys/fs/bpf/kube_ovn_eip_v4_map"
+	if m.cfg.TcBpfMapPath == "" || m.cfg.TcBpfMapPath == defaultTcEIPv4MapPath {
+		return defaultTcEIPv4MapPath, defaultTcEIPv6MapPath
 	}
-	v6 := strings.TrimSuffix(v4, "_v4_map") + "_v6_map"
+	v4 := m.cfg.TcBpfMapPath
+	v6 := strings.TrimSuffix(v4, tcEIPv4MapName) + tcEIPv6MapName
 	return v4, v6
 }
 

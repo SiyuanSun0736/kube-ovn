@@ -459,7 +459,11 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(targetErrors...))
+	if err := c.reconcileRoutes(expectedPrefixes); err != nil {
+		targetErrors = append(targetErrors, err)
+	}
+
+	return errors.Join(targetErrors...)
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.
