@@ -78,23 +78,12 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 		require.ErrorContains(t, err, "has empty externalSubnet")
 	})
 
-	t.Run("external subnet not found with gateway fallback", func(t *testing.T) {
-		gwSubnet := &kubeovnv1.Subnet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        "gw-ext-subnet",
-				Annotations: map[string]string{util.NadMacvlanMasterAnnotation: "bond2"},
-			},
-			Spec: kubeovnv1.SubnetSpec{Provider: "wan.kube-system"},
-		}
+	t.Run("external subnet not found should return error without guessing", func(t *testing.T) {
 		c := &Controller{
 			config: &Configuration{TcBpfInterface: "bond0"},
 			subnetsLister: &fakeSubnetLister{subnets: map[string]*kubeovnv1.Subnet{
-				"gw-ext-subnet": gwSubnet,
-			}},
-			natgatewayLister: &fakeNatGatewayLister{gateways: map[string]*kubeovnv1.VpcNatGateway{
-				"gw-1": {
-					ObjectMeta: metav1.ObjectMeta{Name: "gw-1"},
-					Spec:       kubeovnv1.VpcNatGatewaySpec{ExternalSubnets: []string{"gw-ext-subnet"}},
+				"gw-ext-subnet": {
+					ObjectMeta: metav1.ObjectMeta{Name: "gw-ext-subnet"},
 				},
 			}},
 		}
@@ -109,28 +98,17 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "vpc-nat-gw-gw-1-0",
 				Namespace: "kube-system",
-				Annotations: map[string]string{
-					nadv1.NetworkStatusAnnot: `[{"name":"kube-system/wan","mac":"02:00:00:00:00:99"}]`,
-				},
 			},
 		}
-		name, err := util.GenMacvlanIfaceName("bond2")
-		require.NoError(t, err)
 
 		lookup := func(actual string) (netlink.Link, error) {
-			require.Equal(t, name, actual)
-			return &netlink.Macvlan{
-				LinkAttrs: netlink.LinkAttrs{Index: 25, ParentIndex: 8, HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 3}},
-				Mode:      netlink.MACVLAN_MODE_BRIDGE,
-			}, nil
+			return nil, errors.New("should not be called")
 		}
 
-		// 验证成功 fallback 到 gw-ext-subnet，并解析出正确的 target
-		target, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup)
-		require.NoError(t, err)
-		require.Equal(t, 25, target.TargetIfindex)
-		require.Equal(t, 8, target.ParentIfindex)
-		require.Equal(t, net.HardwareAddr{2, 0, 0, 0, 0, 0x99}, target.TargetMAC)
+		// 验证不搞越界猜测，明确 fail-fast 返回错误
+		_, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "failed to get external subnet las-derived-subnet-not-found")
 	})
 }
 
