@@ -67,15 +67,19 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			if status.Name != expectedNetName {
 				continue
 			}
-			mac, err := net.ParseMAC(status.Mac)
+			gwNet1Mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
-			target := TCRedirectTarget{TargetIfindex: link.Attrs().Index, ParentIfindex: link.Attrs().ParentIndex, TargetMAC: mac}
-			if !validTCRedirectTarget(target) {
+			gwRedirectTarget := TCRedirectTarget{
+				TargetIfindex: link.Attrs().Index,
+				ParentIfindex: link.Attrs().ParentIndex,
+				TargetMAC:     gwNet1Mac,
+			}
+			if !validTCRedirectTarget(gwRedirectTarget) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
-			return target, nil
+			return gwRedirectTarget, nil
 		}
 	} else {
 		// 非 macvlan 模式（例如 ptp / veth-pair 模式）：
@@ -100,22 +104,26 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			if len(routes[0].Gw) > 0 && !routes[0].Gw.IsUnspecified() {
 				return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s is not a direct route (has gateway %s)", podIP, routes[0].Gw)
 			}
-			targetLinkIndex := routes[0].LinkIndex
-			mac, err := net.ParseMAC(status.Mac)
+			gwHostIfindex := routes[0].LinkIndex
+			gwNet1Mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
 			if defaultParent != "" {
-				if plink, err := lookup(defaultParent); err == nil && targetLinkIndex == plink.Attrs().Index {
+				if plink, err := lookup(defaultParent); err == nil && gwHostIfindex == plink.Attrs().Index {
 					return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s points to ingress interface %s (%d), not a local pod veth", podIP, defaultParent, plink.Attrs().Index)
 				}
 			}
 			// veth 设备无父设备（ParentIfindex 为 0）
-			target := TCRedirectTarget{TargetIfindex: targetLinkIndex, ParentIfindex: 0, TargetMAC: mac}
-			if !validTCRedirectTarget(target) {
+			gwRedirectTarget := TCRedirectTarget{
+				TargetIfindex: gwHostIfindex,
+				ParentIfindex: 0,
+				TargetMAC:     gwNet1Mac,
+			}
+			if !validTCRedirectTarget(gwRedirectTarget) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
-			return target, nil
+			return gwRedirectTarget, nil
 		}
 	}
 	return TCRedirectTarget{}, fmt.Errorf("pod %s/%s has no network status for %s", pod.Namespace, pod.Name, expectedNetName)
