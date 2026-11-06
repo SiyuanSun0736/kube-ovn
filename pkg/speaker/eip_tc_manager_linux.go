@@ -66,6 +66,9 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 		return nil
 	}
 	if linkName == "" {
+		linkName = m.attachedDev
+	}
+	if linkName == "" {
 		linkName = m.cfg.TcBpfInterface
 	}
 	if linkName == "" {

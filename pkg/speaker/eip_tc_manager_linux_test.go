@@ -143,7 +143,12 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eip-retry0"}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { require.NoError(t, netlink.LinkDel(link)) })
-	cfg := &Configuration{EnableTcBpfRedirect: true, TcBpfProgPath: "/missing.o", TcBpfMapPath: pin}
+	cfg := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link.Name,
+		TcBpfProgPath:       "/missing.o",
+		TcBpfMapPath:        pin,
+	}
 	m := NewTCManager(cfg)
 	require.Error(t, m.Attach(link.Name))
 	cfg.TcBpfProgPath = os.Getenv("KUBE_OVN_BPF_OBJECT")
@@ -164,7 +169,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	foreign := &netlink.MatchAll{FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Index, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 2, Priority: 10, Protocol: unix.ETH_P_ALL}}
 	require.NoError(t, netlink.FilterAdd(foreign))
 	disabled := NewTCManager(&Configuration{TcBpfMapPath: pin})
-	require.NoError(t, disabled.Close())
+	require.NoError(t, disabled.Clean())
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
@@ -250,7 +255,7 @@ ip -n eip-outside link set lo up
 ip -n eip-outside link set eip-external up
 ip -n eip-outside addr add 198.18.0.3/24 dev eip-external
 ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
-	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfProgPath: os.Getenv("KUBE_OVN_BPF_OBJECT"), TcBpfMapPath: pin})
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: os.Getenv("KUBE_OVN_BPF_OBJECT"), TcBpfMapPath: pin})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	require.NoError(t, m.Attach("eip-uplink"))
 	host, err := netlink.LinkByName("eip-host")
@@ -273,6 +278,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	// 1. 模拟旧实例：使用 Priority 5 挂载
 	cfg1 := &Configuration{
 		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       5,
@@ -289,6 +295,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	// 2. 模拟运维调整 priority 为 7 并重启新实例
 	cfg2 := &Configuration{
 		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       7,
@@ -333,6 +340,7 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 
 	cfg := &Configuration{
 		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
 		TcBpfMapPath:        pin,
 	}
