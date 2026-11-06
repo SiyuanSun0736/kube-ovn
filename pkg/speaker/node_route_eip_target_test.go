@@ -114,13 +114,23 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 				},
 			},
 		}
-		// 在当前测试环境下，直接调用 getNatGwTCRedirectTarget 会走 fallback 逻辑到 gw-ext-subnet，
-		// 最终调用 natGwTCRedirectTarget 解析网卡。
-		// 由于该测试未 mock netlink.LinkByName，会返回找不到 netlink link 的错误，
-		// 但错误信息证明已经成功 fallback 到了 "gw-ext-subnet" 对应的 macvlan 接口检查，而不是停留在 "las-derived-subnet-not-found"
-		_, err := c.getNatGwTCRedirectTarget(pod, eip)
-		require.Error(t, err)
-		require.NotContains(t, err.Error(), "las-derived-subnet-not-found")
+		name, err := util.GenMacvlanIfaceName("bond2")
+		require.NoError(t, err)
+
+		lookup := func(actual string) (netlink.Link, error) {
+			require.Equal(t, name, actual)
+			return &netlink.Macvlan{
+				LinkAttrs: netlink.LinkAttrs{Index: 25, ParentIndex: 8, HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 3}},
+				Mode:      netlink.MACVLAN_MODE_BRIDGE,
+			}, nil
+		}
+
+		// 验证成功 fallback 到 gw-ext-subnet，并解析出正确的 target
+		target, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup)
+		require.NoError(t, err)
+		require.Equal(t, 25, target.TargetIfindex)
+		require.Equal(t, 8, target.ParentIfindex)
+		require.Equal(t, net.HardwareAddr{2, 0, 0, 0, 0, 0x99}, target.TargetMAC)
 	})
 }
 

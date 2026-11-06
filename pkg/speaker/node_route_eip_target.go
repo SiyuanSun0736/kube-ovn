@@ -21,11 +21,15 @@ import (
 // 若 EIP 未指定 ExternalSubnet 或该子网未能匹配到 Pod 上的网卡（例如 LAS 中 EIP 与 Gateway 子网不一致情况），
 // 则自动 fallback 回溯 VpcNatGateway CR 的 ExternalSubnets，解析网关真实绑定的物理外网网卡。
 func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
+	return c.getNatGwTCRedirectTargetInternal(pod, eip, netlink.LinkByName)
+}
+
+func (c *Controller) getNatGwTCRedirectTargetInternal(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	var primaryErr error
 	if eip.Spec.ExternalSubnet != "" {
 		subnet, err := c.subnetsLister.Get(eip.Spec.ExternalSubnet)
 		if err == nil {
-			target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+			target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, lookup)
 			if err == nil {
 				return target, nil
 			}
@@ -49,7 +53,7 @@ func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.Ip
 				if err != nil {
 					continue
 				}
-				target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, netlink.LinkByName)
+				target, err := natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, lookup)
 				if err == nil {
 					klog.Infof("resolved redirect target for EIP %s fallback to gateway %s externalSubnet %s", eip.Name, gw.Name, extSubnetName)
 					return target, nil
