@@ -497,6 +497,32 @@ function ensure_iptables_syn_limit_chain() {
     fi
 }
 
+function flush_iptables_chain_if_exists() {
+    local table=$1
+    local chain=$2
+    [ -z "$iptables_cmd" ] && return 0
+    if $iptables_cmd -t "$table" -L "$chain" -n >/dev/null 2>&1; then
+        if ! $iptables_cmd -t "$table" -F "$chain"; then
+            echo "Failed to flush iptables chain $chain in table $table" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
+function flush_nft_chain_if_exists() {
+    local table=$1
+    local chain=$2
+    [ -z "$nft_cmd" ] && return 0
+    if $nft_cmd list chain ip "$table" "$chain" >/dev/null 2>&1; then
+        if ! $nft_cmd flush chain ip "$table" "$chain"; then
+            echo "Failed to flush nftables chain $chain in table $table" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
 function tcp_connlimit_set() {
     local limit=$1
     local mode=$2
@@ -512,26 +538,16 @@ function tcp_connlimit_set() {
     # 1. Stateless NAT (full-link notrack): bypass conntrack entirely, skip & clean connlimit
     if is_stateless_active "$mode"; then
         echo "Stateless NAT is active (full-link NOTRACK), skipping stateful connlimit and cleaning up any existing connlimit rules"
-        if [ -n "$iptables_cmd" ]; then
-            $iptables_cmd -t mangle -F VPC_CONNLIMIT 2>/dev/null || true
-        fi
-        if [ -n "$nft_cmd" ]; then
-            nft_transaction_ignore_errors \
-                "flush chain ip $NFT_TABLE connlimit"
-        fi
+        flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
+        flush_nft_chain_if_exists "$NFT_TABLE" "connlimit" || return 1
         return 0
     fi
 
     # 2. Disabled (0 or empty): clean connlimit rules
     if [ -z "$limit" ] || [ "$limit" -eq 0 ] 2>/dev/null; then
         echo "TCP connlimit is disabled (limit=$limit), clearing connlimit rules"
-        if [ -n "$iptables_cmd" ]; then
-            $iptables_cmd -t mangle -F VPC_CONNLIMIT 2>/dev/null || true
-        fi
-        if [ -n "$nft_cmd" ]; then
-            nft_transaction_ignore_errors \
-                "flush chain ip $NFT_TABLE connlimit"
-        fi
+        flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
+        flush_nft_chain_if_exists "$NFT_TABLE" "connlimit" || return 1
         return 0
     fi
 
@@ -587,14 +603,37 @@ function to_nft_rate() {
     esac
 }
 
+function calc_bucket_expire_ms() {
+    local rate=$1
+    local burst=$2
+    local num="${rate%/*}"
+    local unit="${rate#*/}"
+    local unit_ms=1000
+
+    case "$unit" in
+        s|sec|second) unit_ms=1000 ;;
+        m|min|minute) unit_ms=60000 ;;
+        h|hour)       unit_ms=3600000 ;;
+        d|day)        unit_ms=86400000 ;;
+        *)            unit_ms=1000 ;;
+    esac
+
+    # Ensure idle expiry is at least the token refill period ceil(burst * unit_ms / num),
+    # with a minimum baseline of 10000ms (10s) to prevent premature entry eviction.
+    local refill_ms=$(( (burst * unit_ms + num - 1) / num ))
+    if [ "$refill_ms" -lt 10000 ]; then
+        refill_ms=10000
+    fi
+    echo "$refill_ms"
+}
+
 function tcp_syn_limit_set() {
     local src_rate=${1:-${SYN_SRC_RATE:-"1000/s"}}
     local src_burst=${2:-${SYN_SRC_BURST:-"2000"}}
     local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
-    # 底层固定哈希桶容量与老化窗口 (无需外部传参)
+    # 底层哈希桶容量与动态老化窗口 (无需外部传参)
     local htable_max=262144
-    local htable_expire=10000
     local dst_htable_max=2048
 
     check_inited
@@ -634,6 +673,11 @@ function tcp_syn_limit_set() {
         return 1
     fi
 
+    local src_htable_expire
+    local dst_htable_expire
+    src_htable_expire=$(calc_bucket_expire_ms "$src_rate" "$src_burst")
+    dst_htable_expire=$(calc_bucket_expire_ms "$dst_rate" "$dst_burst")
+
     echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate, src_burst=$src_burst, dst_rate=$dst_rate, dst_burst=$dst_burst"
 
     # 1. Iptables implementation in raw PREROUTING
@@ -652,7 +696,7 @@ function tcp_syn_limit_set() {
             --hashlimit-mode srcip \
             --hashlimit-name vpc_syn_src \
             --hashlimit-htable-max "$htable_max" \
-            --hashlimit-htable-expire "$htable_expire" \
+            --hashlimit-htable-expire "$src_htable_expire" \
             -j DROP; then
             echo "Failed to install iptables VPC_SYN_LIMIT source rate limit rule" >&2
             return 1
@@ -665,7 +709,7 @@ function tcp_syn_limit_set() {
             --hashlimit-mode dstip \
             --hashlimit-name vpc_syn_dst \
             --hashlimit-htable-max "$dst_htable_max" \
-            --hashlimit-htable-expire "$htable_expire" \
+            --hashlimit-htable-expire "$dst_htable_expire" \
             -j DROP; then
             echo "Failed to install iptables VPC_SYN_LIMIT destination rate limit rule" >&2
             return 1
@@ -674,9 +718,10 @@ function tcp_syn_limit_set() {
 
     # 2. Nftables implementation in raw PREROUTING (priority -300)
     if [ -n "$nft_cmd" ]; then
-        # Safe decimal integer arithmetic after validation
-        local expire_sec=$(( htable_expire / 1000 ))
-        [ "$expire_sec" -le 0 ] && expire_sec=10
+        local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
+        local dst_expire_sec=$(( (dst_htable_expire + 999) / 1000 ))
+        [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
+        [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
 
         # Flush dynamic meters so existing elements do not retain stale rate/burst
         nft_transaction_ignore_errors \
@@ -685,8 +730,8 @@ function tcp_syn_limit_set() {
 
         nft_transaction_ignore_errors \
             "add table ip $NFT_TABLE" \
-            "add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $htable_max; timeout ${expire_sec}s; }" \
-            "add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${expire_sec}s; }" \
+            "add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $htable_max; timeout ${src_expire_sec}s; }" \
+            "add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }" \
             "add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }" \
             "flush chain ip $NFT_TABLE syn-limit" \
             "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return" \
