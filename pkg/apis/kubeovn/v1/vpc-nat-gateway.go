@@ -87,7 +87,7 @@ type VpcNatGatewaySpec struct {
 	// +kubebuilder:default=true
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
 	// TcpConnLimit configures the maximum concurrent TCP connections for the NAT gateway.
-	// If unset, defaults according to gateway specifications (1C -> 10,000, 2C -> 20,000).
+	// If unset, defaults to 50,000 (DefaultNatGwTcpConnLimit).
 	// Set to positive integer for custom threshold; set to 0 to disable connlimit without affecting pre-routing SYN rate limiting.
 	// Applied dynamically without Pod recreation.
 	// +kubebuilder:validation:Optional
