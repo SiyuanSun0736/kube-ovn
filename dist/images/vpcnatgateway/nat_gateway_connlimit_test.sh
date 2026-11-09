@@ -81,6 +81,8 @@ assert_expire "20000/s" "40000" "10000"
 assert_expire "1/minute" "1" "60000"
 assert_expire "1/m" "5" "300000"
 assert_expire "2/hour" "1" "1800000"
+# Excessively large duration should be capped at 86400000ms (24h)
+assert_expire "1/day" "10" "86400000"
 # Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
 assert_expire "0/s" "10" "10000"
 assert_expire "invalid" "10" "10000"
@@ -95,5 +97,20 @@ if ! [[ "100/s" =~ $rate_pattern ]]; then
     echo "FAIL: rate_pattern must accept 100/s" >&2
     exit 1
 fi
+
+# 5. Test is_syn_limit_disabled
+for disabled_val in "0" "0/s" "disable" "disabled" "none" "off"; do
+    if ! is_syn_limit_disabled "$disabled_val"; then
+        echo "FAIL: is_syn_limit_disabled must return 0 for '$disabled_val'" >&2
+        exit 1
+    fi
+done
+
+for enabled_val in "100/s" "1000/s" "1/minute" "enable"; do
+    if is_syn_limit_disabled "$enabled_val"; then
+        echo "FAIL: is_syn_limit_disabled must return 1 for '$enabled_val'" >&2
+        exit 1
+    fi
+done
 
 echo "PASS: nat-gateway connlimit & stateless detection tests passed"

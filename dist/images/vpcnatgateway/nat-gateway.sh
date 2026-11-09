@@ -83,7 +83,7 @@ function show_help() {
     echo "  floating-ip-del          - Delete floating IP mapping"
     echo "  hairpin-snat-set         - Turn the lanIP fallback hairpin SNAT on/off: enable | disable"
     echo "  tcp-connlimit-set        - Set or clear TCP connlimit: <limit> [mode]"
-    echo "  tcp-syn-limit-set        - Set TCP SYN raw rate limit: [src_rate] [src_burst] [dst_rate] [dst_burst] [htable_max] [htable_expire]"
+    echo "  tcp-syn-limit-set        - Set TCP SYN raw rate limit: [src_rate] [src_burst] [dst_rate] [dst_burst]"
     echo "  dnat-add                 - Add DNAT rule"
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
@@ -579,12 +579,15 @@ function tcp_connlimit_set() {
         if $nft_cmd list chain ip "$NFT_TABLE" connlimit 2>/dev/null | grep -E -q -- "ct count over $limit([[:space:]]|$)"; then
             echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
         else
-            nft_transaction_ignore_errors \
+            if ! nft_transaction \
                 "add table ip $NFT_TABLE" \
                 "add chain ip $NFT_TABLE connlimit { type filter hook prerouting priority -150; policy accept; }" \
                 "flush chain ip $NFT_TABLE connlimit" \
                 "add rule ip $NFT_TABLE connlimit iifname \"lo\" return" \
-                "add rule ip $NFT_TABLE connlimit tcp dport 179 return"
+                "add rule ip $NFT_TABLE connlimit tcp dport 179 return"; then
+                echo "Failed to create nftables connlimit chain" >&2
+                return 1
+            fi
 
             # Propagate error if adding the ct count rule fails
             if ! $nft_cmd add rule ip "$NFT_TABLE" connlimit tcp flags \& \(syn\|ack\) == syn ct count over "$limit" drop; then
@@ -629,12 +632,23 @@ function calc_bucket_expire_ms() {
     esac
 
     # Ensure idle expiry is at least the token refill period ceil(burst * unit_ms / num),
-    # with a minimum baseline of 10000ms (10s) to prevent premature entry eviction.
+    # with a minimum baseline of 10000ms (10s) and an upper bound of 86400000ms (24h)
+    # to prevent premature entry eviction or kernel u32 parameter overflow.
     local refill_ms=$(( (burst * unit_ms + num - 1) / num ))
     if [ "$refill_ms" -lt 10000 ]; then
         refill_ms=10000
+    elif [ "$refill_ms" -gt 86400000 ]; then
+        refill_ms=86400000
     fi
     echo "$refill_ms"
+}
+
+function is_syn_limit_disabled() {
+    local val=$1
+    case "$val" in
+        0|0/*|disable|disabled|none|off) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 function tcp_syn_limit_set() {
@@ -647,6 +661,16 @@ function tcp_syn_limit_set() {
     local dst_htable_max=2048
 
     check_inited
+
+    # 0. Check if disabled (0 or disable)
+    if is_syn_limit_disabled "$src_rate"; then
+        echo "TCP SYN rate limit is disabled (src_rate=$src_rate), clearing raw syn limit rules"
+        flush_iptables_chain_if_exists "raw" "VPC_SYN_LIMIT" || return 1
+        flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" || return 1
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+        return 0
+    fi
 
     # Ensure rate format has /s
     [[ "$src_rate" =~ ^[0-9]+$ ]] && src_rate="${src_rate}/s"
@@ -742,12 +766,15 @@ function tcp_syn_limit_set() {
         nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
         nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
 
-        nft_transaction_ignore_errors \
+        if ! nft_transaction \
             "add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $htable_max; timeout ${src_expire_sec}s; }" \
             "add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }" \
             "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return" \
             "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return" \
-            "add rule ip $NFT_TABLE syn-limit tcp dport 179 return"
+            "add rule ip $NFT_TABLE syn-limit tcp dport 179 return"; then
+            echo "Failed to create nftables syn-limit sets or base rules" >&2
+            return 1
+        fi
 
         # Propagate error if adding nft rules fails
         if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(syn\|ack\) == syn update @syn_src_meter \{ ip saddr limit rate over "$nft_src_rate" burst "$src_burst" packets \} drop; then
