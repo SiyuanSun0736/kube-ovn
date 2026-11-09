@@ -403,13 +403,11 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			cacheKey := eip.Spec.NatGwDp
 			if cached, ok := targetCache[cacheKey]; ok {
 				redirectTarget, retainStale = cached.target, cached.retainStale
-				if cached.err != nil && redirectTarget == nil {
-					targetErrors = append(targetErrors, cached.err)
-				}
 			} else {
 				var err error
 				redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
 				targetCache[cacheKey] = targetResolution{target: redirectTarget, retainStale: retainStale, err: err}
+				// 仅在首次解析网关时记录错误；共享同一网关的后续 EIP 直接复用缓存，避免错误日志按受影响 EIP 数量被重复放大
 				if err != nil && redirectTarget == nil {
 					targetErrors = append(targetErrors, err)
 				}
