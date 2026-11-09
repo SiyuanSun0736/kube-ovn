@@ -588,8 +588,8 @@ function to_nft_rate() {
 }
 
 function tcp_syn_limit_set() {
-    local src_rate=${1:-${SYN_SRC_RATE:-"500/s"}}
-    local src_burst=${2:-${SYN_SRC_BURST:-"1000"}}
+    local src_rate=${1:-${SYN_SRC_RATE:-"1000/s"}}
+    local src_burst=${2:-${SYN_SRC_BURST:-"2000"}}
     local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
     local htable_max=${5:-${SYN_HTABLE_MAX:-"262144"}}
