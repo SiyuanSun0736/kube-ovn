@@ -179,8 +179,8 @@ function init() {
     ensure_hairpin_fip
     ensure_hairpin_snat "$(current_hairpin_fallback_state)"
     ensure_exclusive_snat_oif
-    ensure_tcp_connlimit
-    ensure_tcp_syn_limit
+    ensure_iptables_connlimit_chain
+    ensure_iptables_syn_limit_chain
 
     # Pod-level half-open timeout tuning to prevent SYN flood conntrack exhaustion
     sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true
@@ -479,7 +479,7 @@ function is_stateless_active() {
     return 1
 }
 
-function ensure_tcp_connlimit() {
+function ensure_iptables_connlimit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t mangle -N VPC_CONNLIMIT 2>/dev/null || true
         $iptables_cmd -t mangle -C PREROUTING -j VPC_CONNLIMIT 2>/dev/null || \
@@ -487,7 +487,7 @@ function ensure_tcp_connlimit() {
     fi
 }
 
-function ensure_tcp_syn_limit() {
+function ensure_iptables_syn_limit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t raw -N VPC_SYN_LIMIT 2>/dev/null || true
         $iptables_cmd -t raw -C PREROUTING -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_SYN_LIMIT 2>/dev/null || \
@@ -537,7 +537,7 @@ function tcp_connlimit_set() {
 
     # 3. Iptables implementation in mangle PREROUTING
     if [ -n "$iptables_cmd" ]; then
-        ensure_tcp_connlimit
+        ensure_iptables_connlimit_chain
 
         # If already configured with identical limit, avoid flushing to preserve connection accounting
         if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -q -- "--connlimit-above $limit "; then
@@ -648,7 +648,7 @@ function tcp_syn_limit_set() {
 
     # 1. Iptables implementation in raw PREROUTING
     if [ -n "$iptables_cmd" ]; then
-        ensure_tcp_syn_limit
+        ensure_iptables_syn_limit_chain
 
         $iptables_cmd -t raw -F VPC_SYN_LIMIT
         $iptables_cmd -t raw -A VPC_SYN_LIMIT -i lo -j RETURN
