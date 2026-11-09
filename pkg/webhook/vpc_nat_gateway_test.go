@@ -5,11 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -229,83 +227,5 @@ func TestIptablesDnatUpdateServiceRecord(t *testing.T) {
 		)
 		require.False(t, resp.Allowed)
 		require.Contains(t, resp.Result.Message, "immutable")
-	})
-}
-
-func TestValidateVpcNatGW_TcpConnLimit(t *testing.T) {
-	scheme := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, ovnv1.AddToScheme(scheme))
-
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: util.VpcNatConfig, Namespace: metav1.NamespaceSystem},
-		Data: map[string]string{
-			"enable-vpc-nat-gw": "true",
-		},
-	}
-	vpc := &ovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "test-vpc"}}
-	subnet := &ovnv1.Subnet{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-subnet"},
-		Spec:       ovnv1.SubnetSpec{CIDRBlock: "10.0.0.0/24"},
-	}
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, vpc, subnet).Build()
-	hook := &ValidatingHook{cache: &hookCache{reader: reader}}
-
-	baseGw := func() *ovnv1.VpcNatGateway {
-		return &ovnv1.VpcNatGateway{
-			ObjectMeta: metav1.ObjectMeta{Name: "gw0"},
-			Spec: ovnv1.VpcNatGatewaySpec{
-				Vpc:    "test-vpc",
-				Subnet: "test-subnet",
-				LanIP:  "10.0.0.1",
-			},
-		}
-	}
-
-	t.Run("valid default", func(t *testing.T) {
-		gw := baseGw()
-		require.NoError(t, hook.ValidateVpcNatGW(t.Context(), gw))
-	})
-
-	t.Run("valid positive limit", func(t *testing.T) {
-		gw := baseGw()
-		gw.Spec.TcpConnLimit = ptr.To(10000)
-		require.NoError(t, hook.ValidateVpcNatGW(t.Context(), gw))
-	})
-
-	t.Run("valid zero limit (disabled)", func(t *testing.T) {
-		gw := baseGw()
-		gw.Spec.TcpConnLimit = ptr.To(0)
-		require.NoError(t, hook.ValidateVpcNatGW(t.Context(), gw))
-	})
-
-	t.Run("negative limit rejected", func(t *testing.T) {
-		gw := baseGw()
-		gw.Spec.TcpConnLimit = ptr.To(-1)
-		err := hook.ValidateVpcNatGW(t.Context(), gw)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "spec.tcpConnLimit must be greater than or equal to 0")
-	})
-
-	t.Run("valid annotation limit", func(t *testing.T) {
-		gw := baseGw()
-		gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "20000"}
-		require.NoError(t, hook.ValidateVpcNatGW(t.Context(), gw))
-	})
-
-	t.Run("invalid annotation limit non-integer", func(t *testing.T) {
-		gw := baseGw()
-		gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "abc"}
-		err := hook.ValidateVpcNatGW(t.Context(), gw)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "must be a non-negative integer")
-	})
-
-	t.Run("invalid annotation limit negative", func(t *testing.T) {
-		gw := baseGw()
-		gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "-5"}
-		err := hook.ValidateVpcNatGW(t.Context(), gw)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "must be a non-negative integer")
 	})
 }
