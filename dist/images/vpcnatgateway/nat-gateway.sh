@@ -479,9 +479,7 @@ function is_stateless_active() {
     return 1
 }
 
-# 与 nftables 基础链直接挂载内核 Hook 且自带 priority 不同，iptables 自定义链无法独立捕获流量，
-# 必须由系统内置顶层链显式打跳转。该函数幂等确保 mangle 表中存在 VPC_CONNLIMIT 链并插入到 PREROUTING 第 1 位，
-# 便于后续 tcp_connlimit_set 在增删或清空限制策略时只需操作该子链，无需触碰公共 PREROUTING 链。
+# 幂等初始化 iptables mangle 表 VPC_CONNLIMIT 链及 PREROUTING 首位跳转（nftables 原生 Hook 无需此步）
 function ensure_iptables_connlimit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t mangle -N VPC_CONNLIMIT 2>/dev/null || true
@@ -490,9 +488,7 @@ function ensure_iptables_connlimit_chain() {
     fi
 }
 
-# 幂等确保 raw 表中存在 VPC_SYN_LIMIT 链，并将来自公网外网网卡（EXTERNAL_INTERFACE）的 TCP SYN 报文在进入连接跟踪
-# （conntrack）之前重定向到该子链，防止 SYN 洪泛耗尽内核连接跟踪表。而在 nftables 中，syn-limit 是直接挂载在 hook 上的
-# 独立 Base Chain（priority -300），无需顶层跳转规则。
+# 幂等初始化 iptables raw 表 VPC_SYN_LIMIT 链及外网 SYN 引流跳转（nftables 原生 Hook 无需此步）
 function ensure_iptables_syn_limit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t raw -N VPC_SYN_LIMIT 2>/dev/null || true
