@@ -558,7 +558,7 @@ function tcp_connlimit_set() {
         ensure_iptables_connlimit_chain
 
         # If already configured with identical limit, avoid flushing to preserve connection accounting
-        if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -q -- "--connlimit-above $limit "; then
+        if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -E -q -- "--connlimit-above $limit([[:space:]]|$)"; then
             echo "TCP connlimit $limit is already installed, keeping existing accounting match"
         else
             $iptables_cmd -t mangle -F VPC_CONNLIMIT
@@ -576,7 +576,7 @@ function tcp_connlimit_set() {
     # 4. Nftables implementation in mangle PREROUTING (priority -150)
     if [ -n "$nft_cmd" ]; then
         # If already configured with identical limit, avoid flushing to preserve connection accounting
-        if $nft_cmd list chain ip "$NFT_TABLE" connlimit 2>/dev/null | grep -q -- "ct count over $limit "; then
+        if $nft_cmd list chain ip "$NFT_TABLE" connlimit 2>/dev/null | grep -E -q -- "ct count over $limit([[:space:]]|$)"; then
             echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
         else
             nft_transaction_ignore_errors \

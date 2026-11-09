@@ -1010,6 +1010,13 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
 	require.NoError(t, getErr)
 	require.Equal(t, ptr.To(0), patchedGw.Status.TCPConnLimit)
+
+	// 6. Negative spec value safely falls back to default 50000
+	calls = nil
+	delete(gw.Annotations, util.NatGatewayDataplaneModeAnnotation)
+	gw.Spec.TCPConnLimit = ptr.To(-100)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "50000", "stateful"}}, calls)
 }
 
 func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
