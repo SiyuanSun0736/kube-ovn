@@ -63,4 +63,23 @@ if is_stateless_active "unknown"; then
     exit 1
 fi
 
+# 3. Test calc_bucket_expire_ms
+assert_expire() {
+    local rate=$1
+    local burst=$2
+    local want=$3
+    local got
+    got=$(calc_bucket_expire_ms "$rate" "$burst")
+    if [ "$got" != "$want" ]; then
+        echo "FAIL calc_bucket_expire_ms '$rate' '$burst': got '$got', want '$want'" >&2
+        exit 1
+    fi
+}
+
+assert_expire "1000/s" "2000" "10000"
+assert_expire "20000/s" "40000" "10000"
+assert_expire "1/minute" "1" "60000"
+assert_expire "1/m" "5" "300000"
+assert_expire "2/hour" "1" "1800000"
+
 echo "PASS: nat-gateway connlimit & stateless detection tests passed"

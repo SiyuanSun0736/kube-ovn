@@ -1000,13 +1000,16 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "0", "stateful"}}, calls)
 
-	// 5. Stateless mode: pass dataplane mode to script
+	// 5. Stateless mode: pass dataplane mode to script and publish effective limit 0
 	calls = nil
 	gw.Status.TcpConnLimit = ptr.To(0)
 	gw.Spec.TcpConnLimit = ptr.To(15000)
 	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "15000", "stateless"}}, calls)
+	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	require.Equal(t, ptr.To(0), patchedGw.Status.TcpConnLimit)
 }
 
 func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
@@ -1025,7 +1028,7 @@ func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	ctrl := fc.fakeController
 
 	var calls [][]string
-	ctrl.execRulesInPod = func(pod *corev1.Pod, operation string, rules []string) error {
+	ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, rules []string) error {
 		calls = append(calls, append([]string{operation}, rules...))
 		return nil
 	}
@@ -1042,7 +1045,7 @@ func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
 
 	// Case 3: Unsupported older image returns unknown command error -> handled gracefully
 	calls = nil
-	ctrl.execRulesInPod = func(pod *corev1.Pod, operation string, rules []string) error {
+	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
 	}
 	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, skewPod, false))
@@ -1139,7 +1142,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	}
 
 	// 1. Default rate limits
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTcpSynLimitSet,
 		util.DefaultNatGwSynSrcRate,
@@ -1147,6 +1150,11 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.DefaultNatGwSynDstRate,
 		util.DefaultNatGwSynDstBurst,
 	}}, calls)
+
+	// Repeated reconcile without changes must skip reprogramming to preserve buckets
+	calls = nil
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
 
 	// 2. Custom rate limits via annotations
 	calls = nil
@@ -1156,7 +1164,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.VpcNatSynDstRateLimitAnnotation:  "8000/s",
 		util.VpcNatSynDstBurstLimitAnnotation: "16000",
 	}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod))
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTcpSynLimitSet,
 		"300/s",
@@ -1164,4 +1172,21 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		"8000/s",
 		"16000",
 	}}, calls)
+
+	// 3. User input containing 'unknown command' in value must NOT be misclassified as unsupported command
+	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
+		return errors.New("exit status 1: Error: invalid SYN src_rate 'unknown command'")
+	}
+	gw.Annotations[util.VpcNatSynSrcRateLimitAnnotation] = "unknown command"
+	err = ctrl.syncNatGwSynRateLimit(gw, pod, false)
+	require.Error(t, err)
+	require.NotEqual(t, synLimitUnsupported, pod.Annotations[util.VpcNatSynRateLimitAnnotation])
+}
+
+func TestIsUnsupportedCommandError(t *testing.T) {
+	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTcpConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTcpSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTcpSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTcpConnLimitSet))
+	require.False(t, isUnsupportedCommandError(nil, natGwTcpConnLimitSet))
 }
