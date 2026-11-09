@@ -325,7 +325,7 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 
 func (c *Controller) getVpcNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) int {
 	// 1. Explicit spec field
-	if gw.Spec.TCPConnLimit != nil {
+	if gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit >= 0 {
 		return *gw.Spec.TCPConnLimit
 	}
 	// 2. Annotation
