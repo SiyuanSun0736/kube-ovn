@@ -476,64 +476,6 @@ function is_stateless_active() {
     if [ "$mode" = "stateless" ] || [ "$mode" = "stateless-nft" ]; then
         return 0
     fi
-    if [ "$mode" = "stateful" ]; then
-        return 1
-    fi
-    # Check if full-link TCP notrack is actively programmed in raw PREROUTING table.
-    # We must match full TCP bypass or broad notrack in PREROUTING, not narrow port/protocol exemptions (like UDP DNS).
-    if [ -n "$nft_cmd" ]; then
-        # Exclude table/chain/hook declaration lines to avoid matching chain name "notrack"
-        local nft_notrack
-        nft_notrack=$($nft_cmd list chain ip "$NFT_TABLE" notrack 2>/dev/null | grep -E -v '^[[:space:]]*(table|chain|type filter hook|\{|\})' | grep -E -- '\bnotrack\b')
-        if [ -n "$nft_notrack" ]; then
-            while IFS= read -r rule; do
-                [ -z "$rule" ] && continue
-                # Ignore rules with scoped/partial selectors (ports, addresses, flags, sets)
-                if echo "$rule" | grep -E -q -- '\b(dport|sport|saddr|daddr|flags)\b|@|\{|\}'; then
-                    continue
-                fi
-                # Ignore rules explicitly targeting non-TCP protocols or inverted protocols
-                if echo "$rule" | grep -E -q -- '\b(udp|icmp|icmpv6|igmp|esp|ah|sctp)\b|(ip protocol|meta l4proto)[[:space:]]*!='; then
-                    continue
-                fi
-                if echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+[a-zA-Z0-9_-]+' && \
-                   ! echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+(tcp|6)\b'; then
-                    continue
-                fi
-                # Only accept rules that definitely cover full TCP (explicit TCP or broad unconstrained notrack)
-                if echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+(tcp|6)\b|(^|[[:space:]])tcp([[:space:]]|$)' || \
-                   ! echo "$rule" | grep -E -q -- '(ip protocol|meta l4proto)[[:space:]]+[a-zA-Z0-9_-]+|(^|[[:space:]])(tcp|udp|icmp|icmpv6|igmp|esp|ah|sctp)([[:space:]]|$)'; then
-                    return 0
-                fi
-            done <<< "$nft_notrack"
-        fi
-    fi
-    if [ -n "$iptables_save_cmd" ]; then
-        local raw_notrack
-        raw_notrack=$($iptables_save_cmd -t raw 2>/dev/null | grep -E -- '^-A PREROUTING .*-j (NOTRACK|CT --notrack)')
-        if [ -n "$raw_notrack" ]; then
-            while IFS= read -r rule; do
-                [ -z "$rule" ] && continue
-                # Ignore rules with scoped/partial selectors (ports, addresses, flags, match extensions)
-                if echo "$rule" | grep -E -q -- '(^|[[:space:]])(-[sd]\b|--(src|dst|source|destination|dport|sport|destination-port|source-port|tcp-flags|syn)\b|-m[[:space:]]+(multiport|iprange|set|mac|mark|string|length|u32|bpf|owner|conntrack|state|geoip|pkttype)\b)'; then
-                    continue
-                fi
-                # Ignore rules explicitly targeting non-TCP protocols or inverted protocols
-                if echo "$rule" | grep -E -q -- '(^|[[:space:]])(![[:space:]]*(-p|--protocol)|(-p|--protocol)[[:space:]]+!)'; then
-                    continue
-                fi
-                if echo "$rule" | grep -E -q -- '(^|[[:space:]])(-p|--protocol)[[:space:]]+[a-zA-Z0-9_-]+' && \
-                   ! echo "$rule" | grep -E -q -- '(^|[[:space:]])(-p|--protocol)[[:space:]]+(tcp|6)\b'; then
-                    continue
-                fi
-                # Only accept rules that definitely cover full TCP (explicit -p tcp/6 or broad unconstrained notrack)
-                if echo "$rule" | grep -E -q -- '(^|[[:space:]])(-p|--protocol)[[:space:]]+(tcp|6)\b' || \
-                   ! echo "$rule" | grep -E -q -- '(^|[[:space:]])(-p|--protocol)[[:space:]]+[a-zA-Z0-9_-]+'; then
-                    return 0
-                fi
-            done <<< "$raw_notrack"
-        fi
-    fi
     return 1
 }
 
