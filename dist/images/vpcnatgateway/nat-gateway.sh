@@ -610,6 +610,11 @@ function calc_bucket_expire_ms() {
     local unit="${rate#*/}"
     local unit_ms=1000
 
+    if [ -z "$num" ] || ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ]; then
+        echo "10000"
+        return 0
+    fi
+
     case "$unit" in
         s|sec|second) unit_ms=1000 ;;
         m|min|minute) unit_ms=60000 ;;
@@ -642,8 +647,8 @@ function tcp_syn_limit_set() {
     [[ "$src_rate" =~ ^[0-9]+$ ]] && src_rate="${src_rate}/s"
     [[ "$dst_rate" =~ ^[0-9]+$ ]] && dst_rate="${dst_rate}/s"
 
-    # Validate every parameter against safe numeric/rate grammar
-    local rate_pattern="^[0-9]+/(s|sec|second|m|min|minute|h|hour|d|day)$"
+    # Validate every parameter against safe numeric/rate grammar (rate count must be positive)
+    local rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
     local num_pattern="^[0-9]+$"
 
     if ! [[ "$src_rate" =~ $rate_pattern ]]; then
@@ -723,17 +728,18 @@ function tcp_syn_limit_set() {
         [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
         [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
 
-        # Flush dynamic meters so existing elements do not retain stale rate/burst
-        nft_transaction_ignore_errors \
-            "flush set ip $NFT_TABLE syn_src_meter" \
-            "flush set ip $NFT_TABLE syn_dst_meter"
-
+        # Flush chain to release references to existing meters, then delete old sets so new timeout takes effect
         nft_transaction_ignore_errors \
             "add table ip $NFT_TABLE" \
+            "add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }" \
+            "flush chain ip $NFT_TABLE syn-limit"
+
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+
+        nft_transaction_ignore_errors \
             "add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $htable_max; timeout ${src_expire_sec}s; }" \
             "add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }" \
-            "add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }" \
-            "flush chain ip $NFT_TABLE syn-limit" \
             "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return" \
             "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return" \
             "add rule ip $NFT_TABLE syn-limit tcp dport 179 return"
