@@ -17,6 +17,7 @@ Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF
 `--tc-bpf-interface` 指定物理 Ingress 接收网卡；若未指定，则自动探测默认 IPv4 出向网卡。
 网关 Pod 的外网子网通过其 `ovn.kubernetes.io/nad-macvlan-master` 注解独立指定 macvlan 主设备（Master）。
 宿主机 macvlan 必须以 bridge 模式运行。网关 Pod 的 Multus network-status 必须包含该外网 NAD 及其真实硬件 MAC 地址。
+对于未配置 `ovn.kubernetes.io/nad-macvlan-master` 的外部子网（Veth-Pair 网桥模式），Speaker 采用纯二层 Bridge FDB 反查机制：直接依据 Pod 的 `network-status` 硬件 MAC 遍历宿主机网桥转发表（`AF_BRIDGE`），定位接入网桥的 host 端 Pod veth 设备（如 `*_h` 或 `veth*`），实现 0 IP 依赖直通重定向。运行要求：宿主机 Linux 网桥需具备 Pod MAC 的转发表项（由 Pod 启动发包/GARP 动态学习或配置静态 FDB 规则）；Speaker 内部基于 Pod UID 维护长效缓存，并在解析暂时缺失时自动保持存量 TC 映射（`retainStale`），平滑防御 FDB 老化抖动。
 未解析或非法的目标会被拒绝，并在全量对账过程中从旁路 Map 中剔除并按需重试。
 支持解析单层（802.1Q/802.1ad）及双层 QinQ VLAN Tag 报文，改写最外层 MAC 并保留 VLAN 封装直通网关 Pod。
 

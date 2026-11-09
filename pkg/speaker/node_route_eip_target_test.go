@@ -345,9 +345,11 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 
 	t.Run("fdbLookupInternal device name filtering", func(t *testing.T) {
 		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+		otherMac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x99}
 		neighs := []netlink.Neigh{
-			{LinkIndex: 1, HardwareAddr: mac}, // bond0 (物理口/bond口，应被跳过)
-			{LinkIndex: 2, HardwareAddr: mac}, // 119ec988_net1_h (Pod veth 口，应被选中)
+			{LinkIndex: 999, HardwareAddr: otherMac}, // 不相关 MAC，优先 MAC 比对时绝不能调用 linkByIndex
+			{LinkIndex: 1, HardwareAddr: mac},        // bond0 (物理口/bond口，应被跳过)
+			{LinkIndex: 2, HardwareAddr: mac},        // 119ec988_net1_h (Pod veth 口，应被选中)
 		}
 
 		links := map[int]string{
@@ -359,6 +361,9 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			return neighs, nil
 		}
 		linkByIndexMock := func(idx int) (netlink.Link, error) {
+			if idx == 999 {
+				t.Fatalf("linkByIndex should not be called for non-matching MAC %s", otherMac)
+			}
 			name, ok := links[idx]
 			if !ok {
 				return nil, errors.New("link not found")

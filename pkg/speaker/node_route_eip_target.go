@@ -19,40 +19,42 @@ import (
 )
 
 // isPodVethName 校验设备名称是否属于 Pod 在宿主机端的 host 端 veth 网卡设备：
-// 1. 以 "_net1_h" 结尾：Multus 辅助网卡（如网关业务直通外网口）在宿主机端的配对端；
-// 2. 以 "_h" 结尾：Kube-OVN/PTP 等 CNI 默认在宿主机端的 Pod 配对端；
-// 3. 以 "veth" 开头：通用或旧版 CNI 创建的宿主机端 veth 设备。
+// 1. 以 "_h" 结尾：Multus 辅助网卡（如 "_net1_h"）或 Kube-OVN/PTP 等 CNI 默认在宿主机端的 Pod 配对端；
+// 2. 以 "veth" 开头：通用或旧版 CNI 创建的宿主机端 veth 设备。
 // 用于在遍历 Linux 网桥 FDB 转发表时排除底层物理网卡（如 ens7f0）、Bond 聚合口（如 bond0）等非 Pod 设备。
 func isPodVethName(name string) bool {
-	return strings.HasSuffix(name, "_net1_h") ||
-		strings.HasSuffix(name, "_h") ||
+	return strings.HasSuffix(name, "_h") ||
 		strings.HasPrefix(name, "veth")
 }
 
 // fdbLookupInternal 通过 Linux 内核网桥 FDB 转发表（AF_BRIDGE），仅凭 Pod MAC 地址反查其在宿主机端挂载的 veth 接口 ifindex：
 // 1. 调用 netlink.NeighList(0, unix.AF_BRIDGE) 查询宿主机所有网桥接口的 FDB 记录（等价于 `bridge fdb show`）；
-// 2. 校验表项对应的设备名必须满足 isPodVethName（_net1_h / _h / veth...），直接排除 bond0、物理网卡等非 Pod 设备；
-// 3. 在符合规则的 Pod veth 接口表项中比对 HardwareAddr 是否与 Pod 的 MAC 精确一致。
+// 2. 优先进行内存级 MAC 地址匹配（bytes.Equal），过滤无关表项，避免不必要的 Netlink 系统调用；
+// 3. 对 MAC 匹配的表项通过 linkByIndex 查询设备属性，校验其设备名必须满足 isPodVethName（_h / veth...），
+//    排除上联口（bond0、物理网卡等）在同一 MAC 下的干扰；
+// 4. 注意：Bridge FDB 依赖 Pod 网卡入向流量（如启动时的 GARP/业务发包）动态学习。在 Pod 冷启动尚未发包或
+//    FDB 动态条目因超时老化被清除前，建议确保网关有主动发包或静态 FDB 规则。
 func fdbLookupInternal(mac net.HardwareAddr, neighList func(int, int) ([]netlink.Neigh, error), linkByIndex func(int) (netlink.Link, error)) (int, error) {
 	neighs, err := neighList(0, unix.AF_BRIDGE)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list bridge FDB entries: %w", err)
 	}
 	for _, neigh := range neighs {
+		// 1. 优先内存快速比对 MAC 地址（过滤掉绝大多数不相关的 FDB 条目）
+		if !bytes.Equal(neigh.HardwareAddr, mac) {
+			continue
+		}
+		// 2. 仅在 MAC 匹配时调用 Netlink 查询设备属性，避免 O(N) 系统调用放大
 		link, err := linkByIndex(neigh.LinkIndex)
 		if err != nil {
 			continue
 		}
-		// 1. 先判断网卡名称是否符合 Pod veth 规则
-		if !isPodVethName(link.Attrs().Name) {
-			continue
-		}
-		// 2. 规则符合后再比对 MAC 地址
-		if bytes.Equal(neigh.HardwareAddr, mac) {
+		// 3. 校验网卡名称必须符合 Pod host 端 veth 规则
+		if isPodVethName(link.Attrs().Name) {
 			return neigh.LinkIndex, nil
 		}
 	}
-	return 0, fmt.Errorf("no bridge FDB entry found on pod veth interfaces for MAC %s", mac)
+	return 0, fmt.Errorf("no bridge FDB entry found on pod veth interfaces for MAC %s (bridge FDB requires pod traffic to learn or static FDB entry)", mac)
 }
 
 // getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。
@@ -122,7 +124,9 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 		// 纯二层无 IP 依赖，彻底消除对 Pod IP (status.IPs[0]) 和路由表 (netlink.RouteGet) 的依赖。
 		// 1. 直接以 Pod 的 network-status 中的 status.Mac 为准；
 		// 2. 通过宿主机网桥 FDB 转发表（AF_BRIDGE）反查接入该网桥的 host 端 veth 网卡设备；
-		// 3. 严格限定匹配到的设备名属于 Pod host 端 veth（_net1_h / _h / veth...），防止误匹配到物理口/Bond 口。
+		// 3. 严格限定匹配到的设备名属于 Pod host 端 veth（_h / veth...），防止误匹配到物理口/Bond 口。
+		// 4. 解析结果会被外层 Controller 缓存在 gwTargetCache 中（按 Pod UID）；当 Pod 活跃但 FDB 暂未就绪或因老化短暂缺失时，
+		//    外层通过 retainStale 保持存量 TC 映射，平滑抵御 FDB 老化抖动。
 		fdbFind := func(m net.HardwareAddr) (int, error) {
 			return fdbLookupInternal(m, netlink.NeighList, netlink.LinkByIndex)
 		}
