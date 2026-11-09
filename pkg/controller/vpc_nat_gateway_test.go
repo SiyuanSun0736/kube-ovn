@@ -688,8 +688,8 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			wantOps: [][]string{
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATDisable},
-				{natGwTcpConnLimitSet, "50000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
+				{natGwTCPConnLimitSet, "50000", "stateful"},
+				{natGwTCPSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
 			},
 			wantStat: hairpinSNATDisable,
 		},
@@ -699,8 +699,8 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			wantOps: [][]string{
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATEnable},
-				{natGwTcpConnLimitSet, "50000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
+				{natGwTCPConnLimitSet, "50000", "stateful"},
+				{natGwTCPSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
 			},
 			wantStat: hairpinSNATEnable,
 		},
@@ -925,34 +925,34 @@ func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
 	}
 }
 
-func TestVpcNatGwDesiredTcpConnLimit(t *testing.T) {
+func TestVpcNatGwDesiredTCPConnLimit(t *testing.T) {
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{})
 	require.NoError(t, err)
 	ctrl := fc.fakeController
 
 	// 1. Default when unset: 50,000
 	gw := fakeGw("gw")
-	assert.Equal(t, util.DefaultNatGwTcpConnLimit, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
 
 	// 2. Custom annotation tcp-connlimit
-	gw.Annotations = map[string]string{util.VpcNatTcpConnLimitAnnotation: "15000"}
-	assert.Equal(t, 15000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
+	assert.Equal(t, 15000, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
 
 	// 3. Spec field overrides annotation
-	gw.Spec.TcpConnLimit = ptr.To(30000)
-	assert.Equal(t, 30000, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	gw.Spec.TCPConnLimit = ptr.To(30000)
+	assert.Equal(t, 30000, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
 
 	// 4. Spec field 0 disables connlimit
-	gw.Spec.TcpConnLimit = ptr.To(0)
-	assert.Equal(t, 0, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	gw.Spec.TCPConnLimit = ptr.To(0)
+	assert.Equal(t, 0, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
 
 	// 5. Removing spec field restores default (50000)
-	gw.Spec.TcpConnLimit = nil
-	delete(gw.Annotations, util.VpcNatTcpConnLimitAnnotation)
-	assert.Equal(t, util.DefaultNatGwTcpConnLimit, ctrl.getVpcNatGwDesiredTcpConnLimit(gw))
+	gw.Spec.TCPConnLimit = nil
+	delete(gw.Annotations, util.VpcNatTCPConnLimitAnnotation)
+	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
 }
 
-func TestSyncNatGwTcpConnLimit(t *testing.T) {
+func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	gw := fakeGw("gw")
 	pod := fakeNatGwPod("gw", true)
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
@@ -969,53 +969,53 @@ func TestSyncNatGwTcpConnLimit(t *testing.T) {
 	}
 
 	// 1. Initial sync programs default (50000, stateful)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, true))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "50000", "stateful"}}, calls)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, true))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "50000", "stateful"}}, calls)
 
 	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
 	require.NoError(t, err)
-	require.NotNil(t, patched.Status.TcpConnLimit)
-	require.Equal(t, 50000, *patched.Status.TcpConnLimit)
+	require.NotNil(t, patched.Status.TCPConnLimit)
+	require.Equal(t, 50000, *patched.Status.TCPConnLimit)
 
 	// 2. Converged: status matches desired, no re-exec
 	calls = nil
-	gw.Status.TcpConnLimit = ptr.To(50000)
+	gw.Status.TCPConnLimit = ptr.To(50000)
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
-	pod.Annotations[util.VpcNatTcpConnLimitAnnotation] = "50000"
+	pod.Annotations[util.VpcNatTCPConnLimitAnnotation] = "50000"
 	pod.Annotations[util.NatGatewayDataplaneModeAnnotation] = "stateful"
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Empty(t, calls)
 
 	// 3. Dynamic modification: spec changed to 20000
-	gw.Spec.TcpConnLimit = ptr.To(20000)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "20000", "stateful"}}, calls)
+	gw.Spec.TCPConnLimit = ptr.To(20000)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "20000", "stateful"}}, calls)
 
 	// 4. Disable: spec set to 0
 	calls = nil
-	gw.Status.TcpConnLimit = ptr.To(20000)
-	gw.Spec.TcpConnLimit = ptr.To(0)
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "0", "stateful"}}, calls)
+	gw.Status.TCPConnLimit = ptr.To(20000)
+	gw.Spec.TCPConnLimit = ptr.To(0)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "0", "stateful"}}, calls)
 
 	// 5. Stateless mode: pass dataplane mode to script and publish effective limit 0
 	calls = nil
-	gw.Status.TcpConnLimit = ptr.To(0)
-	gw.Spec.TcpConnLimit = ptr.To(15000)
+	gw.Status.TCPConnLimit = ptr.To(0)
+	gw.Spec.TCPConnLimit = ptr.To(15000)
 	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, pod, false))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "15000", "stateless"}}, calls)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "15000", "stateless"}}, calls)
 	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
 	require.NoError(t, getErr)
-	require.Equal(t, ptr.To(0), patchedGw.Status.TcpConnLimit)
+	require.Equal(t, ptr.To(0), patchedGw.Status.TCPConnLimit)
 }
 
-func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
+func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	gw := fakeGw("gw")
-	gw.Status.TcpConnLimit = ptr.To(10000)
-	gw.Spec.TcpConnLimit = ptr.To(10000)
+	gw.Status.TCPConnLimit = ptr.To(10000)
+	gw.Spec.TCPConnLimit = ptr.To(10000)
 
 	newPod := fakeNatGwPod("gw", true)
 	skewPod := fakeNatGwPod("gw-skew", true)
@@ -1034,24 +1034,24 @@ func TestSyncNatGwTcpConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	}
 
 	// Case 1: Replaced pod during init has force=true, must program even though status.tcpConnLimit == desired
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, newPod, true))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateful"}}, calls)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, newPod, true))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "10000", "stateful"}}, calls)
 
 	// Case 2: Dataplane mode change without threshold change triggers convergence
 	calls = nil
 	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, newPod, false))
-	require.Equal(t, [][]string{{natGwTcpConnLimitSet, "10000", "stateless"}}, calls)
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, newPod, false))
+	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "10000", "stateless"}}, calls)
 
 	// Case 3: Unsupported older image returns unknown command error -> handled gracefully
 	calls = nil
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
 	}
-	require.NoError(t, ctrl.syncNatGwTcpConnLimit(gw, skewPod, false))
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, skewPod, false))
 	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
 	require.NoError(t, getErr)
-	require.Nil(t, patchedGw.Status.TcpConnLimit, "status.tcpConnLimit must be cleared when pod image does not support the command")
+	require.Nil(t, patchedGw.Status.TCPConnLimit, "status.tcpConnLimit must be cleared when pod image does not support the command")
 }
 
 func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
@@ -1063,25 +1063,25 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 	}{
 		{
 			name:      "connlimit failure aborts initialization",
-			failOp:    natGwTcpConnLimitSet,
+			failOp:    natGwTCPConnLimitSet,
 			failErr:   errors.New("iptables rule installation failed"),
 			expectErr: true,
 		},
 		{
 			name:      "syn limit failure aborts initialization",
-			failOp:    natGwTcpSynLimitSet,
+			failOp:    natGwTCPSynLimitSet,
 			failErr:   errors.New("nftables rule installation failed"),
 			expectErr: true,
 		},
 		{
 			name:      "unsupported connlimit command tolerated during init",
-			failOp:    natGwTcpConnLimitSet,
+			failOp:    natGwTCPConnLimitSet,
 			failErr:   errors.New("exit status 1: Unknown command: tcp-connlimit-set"),
 			expectErr: false,
 		},
 		{
 			name:      "unsupported syn limit command tolerated during init",
-			failOp:    natGwTcpSynLimitSet,
+			failOp:    natGwTCPSynLimitSet,
 			failErr:   errors.New("exit status 1: Unknown command: tcp-syn-limit-set"),
 			expectErr: false,
 		},
@@ -1144,7 +1144,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	// 1. Default rate limits
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
-		natGwTcpSynLimitSet,
+		natGwTCPSynLimitSet,
 		util.DefaultNatGwSynSrcRate,
 		util.DefaultNatGwSynSrcBurst,
 		util.DefaultNatGwSynDstRate,
@@ -1166,7 +1166,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	}
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
-		natGwTcpSynLimitSet,
+		natGwTCPSynLimitSet,
 		"300/s",
 		"600",
 		"8000/s",
@@ -1184,9 +1184,9 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 }
 
 func TestIsUnsupportedCommandError(t *testing.T) {
-	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTcpConnLimitSet))
-	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTcpSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTcpSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTcpConnLimitSet))
-	require.False(t, isUnsupportedCommandError(nil, natGwTcpConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTCPSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTCPSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTCPConnLimitSet))
+	require.False(t, isUnsupportedCommandError(nil, natGwTCPConnLimitSet))
 }

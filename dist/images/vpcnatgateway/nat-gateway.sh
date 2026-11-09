@@ -575,17 +575,22 @@ function tcp_connlimit_set() {
 
     # 4. Nftables implementation in mangle PREROUTING (priority -150)
     if [ -n "$nft_cmd" ]; then
-        nft_transaction_ignore_errors \
-            "add table ip $NFT_TABLE" \
-            "add chain ip $NFT_TABLE connlimit { type filter hook prerouting priority -150; policy accept; }" \
-            "flush chain ip $NFT_TABLE connlimit" \
-            "add rule ip $NFT_TABLE connlimit iifname \"lo\" return" \
-            "add rule ip $NFT_TABLE connlimit tcp dport 179 return"
+        # If already configured with identical limit, avoid flushing to preserve connection accounting
+        if $nft_cmd list chain ip "$NFT_TABLE" connlimit 2>/dev/null | grep -q -- "ct count over $limit "; then
+            echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
+        else
+            nft_transaction_ignore_errors \
+                "add table ip $NFT_TABLE" \
+                "add chain ip $NFT_TABLE connlimit { type filter hook prerouting priority -150; policy accept; }" \
+                "flush chain ip $NFT_TABLE connlimit" \
+                "add rule ip $NFT_TABLE connlimit iifname \"lo\" return" \
+                "add rule ip $NFT_TABLE connlimit tcp dport 179 return"
 
-        # Propagate error if adding the ct count rule fails
-        if ! $nft_cmd add rule ip "$NFT_TABLE" connlimit tcp flags \& \(syn\|ack\) == syn ct count over "$limit" drop; then
-            echo "Failed to install nftables connlimit rule" >&2
-            return 1
+            # Propagate error if adding the ct count rule fails
+            if ! $nft_cmd add rule ip "$NFT_TABLE" connlimit tcp flags \& \(syn\|ack\) == syn ct count over "$limit" drop; then
+                echo "Failed to install nftables connlimit rule" >&2
+                return 1
+            fi
         fi
     fi
 }

@@ -2906,8 +2906,8 @@ func (in *VpcNatGatewaySpec) DeepCopyInto(out *VpcNatGatewaySpec) {
 		*out = new(bool)
 		**out = **in
 	}
-	if in.TcpConnLimit != nil {
-		in, out := &in.TcpConnLimit, &out.TcpConnLimit
+	if in.TCPConnLimit != nil {
+		in, out := &in.TCPConnLimit, &out.TCPConnLimit
 		*out = new(int)
 		**out = **in
 	}
@@ -2952,8 +2952,8 @@ func (in *VpcNatGatewayStatus) DeepCopyInto(out *VpcNatGatewayStatus) {
 		}
 	}
 	in.Affinity.DeepCopyInto(&out.Affinity)
-	if in.TcpConnLimit != nil {
-		in, out := &in.TcpConnLimit, &out.TcpConnLimit
+	if in.TCPConnLimit != nil {
+		in, out := &in.TCPConnLimit, &out.TCPConnLimit
 		*out = new(int)
 		**out = **in
 	}
