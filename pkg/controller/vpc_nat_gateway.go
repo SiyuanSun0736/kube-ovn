@@ -467,7 +467,8 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		util.NatGatewayDataplaneModeAnnotation: dataplaneMode,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
-		klog.Warningf("failed to patch pod %s/%s annotations for tcp connlimit: %v", pod.Namespace, pod.Name, err)
+		klog.Errorf("failed to patch pod %s/%s annotations for tcp connlimit: %v", pod.Namespace, pod.Name, err)
+		return err
 	}
 
 	return c.patchNatGwTCPConnLimitStatus(gw.Name, effectiveLimit)
@@ -510,7 +511,8 @@ func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		util.VpcNatSynRateLimitAnnotation: desiredKey,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
-		klog.Warningf("failed to patch pod %s/%s annotations for tcp syn limit: %v", pod.Namespace, pod.Name, err)
+		klog.Errorf("failed to patch pod %s/%s annotations for tcp syn limit: %v", pod.Namespace, pod.Name, err)
+		return err
 	}
 	return nil
 }

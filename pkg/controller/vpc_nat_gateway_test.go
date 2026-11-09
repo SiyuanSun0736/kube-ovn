@@ -815,12 +815,14 @@ func TestNatGwStatusWritersKeepHairpinSNAT(t *testing.T) {
 			gwClient := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways()
 
 			require.NoError(t, ctrl.patchNatGwHairpinSNATStatus("gw", hairpinSNATEnable))
-			// the lister snapshot these writers use has no hairpinSnat at all
+			require.NoError(t, ctrl.patchNatGwTCPConnLimitStatus("gw", 50000))
+			// the lister snapshot these writers use has neither hairpinSnat nor tcpConnLimit
 			require.NoError(t, tt.write(ctrl))
 
 			got, err := gwClient.Get(t.Context(), "gw", metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, hairpinSNATEnable, got.Status.HairpinSNAT)
+			require.Equal(t, ptr.To(50000), got.Status.TCPConnLimit)
 		})
 	}
 }
@@ -1188,6 +1190,24 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	err = ctrl.syncNatGwSynRateLimit(gw, pod, false)
 	require.Error(t, err)
 	require.NotEqual(t, synLimitUnsupported, pod.Annotations[util.VpcNatSynRateLimitAnnotation])
+
+	// 4. Disable SYN rate limit via "0"
+	calls = nil
+	ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, rules []string) error {
+		calls = append(calls, append([]string{operation}, rules...))
+		return nil
+	}
+	gw.Annotations = map[string]string{
+		util.VpcNatSynRateLimitAnnotation: "0",
+	}
+	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.Equal(t, [][]string{{
+		natGwTCPSynLimitSet,
+		"0",
+		util.DefaultNatGwSynSrcBurst,
+		util.DefaultNatGwSynDstRate,
+		util.DefaultNatGwSynDstBurst,
+	}}, calls)
 }
 
 func TestIsUnsupportedCommandError(t *testing.T) {
