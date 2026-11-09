@@ -81,5 +81,19 @@ assert_expire "20000/s" "40000" "10000"
 assert_expire "1/minute" "1" "60000"
 assert_expire "1/m" "5" "300000"
 assert_expire "2/hour" "1" "1800000"
+# Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
+assert_expire "0/s" "10" "10000"
+assert_expire "invalid" "10" "10000"
+
+# 4. Test rate pattern validation
+rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
+if [[ "0/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must reject 0/s" >&2
+    exit 1
+fi
+if ! [[ "100/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 100/s" >&2
+    exit 1
+fi
 
 echo "PASS: nat-gateway connlimit & stateless detection tests passed"
