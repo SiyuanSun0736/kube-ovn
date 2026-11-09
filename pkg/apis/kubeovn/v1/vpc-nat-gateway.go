@@ -92,12 +92,6 @@ type VpcNatGatewaySpec struct {
 	// Applied dynamically without Pod recreation.
 	// +kubebuilder:validation:Optional
 	TcpConnLimit *int `json:"tcpConnLimit,omitempty"`
-	// TcpSynRateLimit configures the raw PREROUTING SYN rate limit (e.g., "100/s", "5000/s").
-	// +kubebuilder:validation:Optional
-	TcpSynRateLimit string `json:"tcpSynRateLimit,omitempty"`
-	// TcpSynBurstLimit configures the raw PREROUTING SYN burst limit (e.g., "200", "10000").
-	// +kubebuilder:validation:Optional
-	TcpSynBurstLimit string `json:"tcpSynBurstLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`

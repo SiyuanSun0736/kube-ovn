@@ -689,7 +689,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATDisable},
 				{natGwTcpConnLimitSet, "50000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
+				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
 			},
 			wantStat: hairpinSNATDisable,
 		},
@@ -700,7 +700,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATEnable},
 				{natGwTcpConnLimitSet, "50000", "stateful"},
-				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst, util.DefaultNatGwSynHtableMax, util.DefaultNatGwSynHtableExpire},
+				{natGwTcpSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
 			},
 			wantStat: hairpinSNATEnable,
 		},
@@ -1146,15 +1146,13 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.DefaultNatGwSynSrcBurst,
 		util.DefaultNatGwSynDstRate,
 		util.DefaultNatGwSynDstBurst,
-		util.DefaultNatGwSynHtableMax,
-		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
 
-	// 2. Custom rate limits via annotations and spec
+	// 2. Custom rate limits via annotations
 	calls = nil
-	gw.Spec.TcpSynRateLimit = "300/s"
-	gw.Spec.TcpSynBurstLimit = "600"
 	gw.Annotations = map[string]string{
+		util.VpcNatSynSrcRateLimitAnnotation:  "300/s",
+		util.VpcNatSynSrcBurstLimitAnnotation: "600",
 		util.VpcNatSynDstRateLimitAnnotation:  "8000/s",
 		util.VpcNatSynDstBurstLimitAnnotation: "16000",
 	}
@@ -1165,7 +1163,5 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		"600",
 		"8000/s",
 		"16000",
-		util.DefaultNatGwSynHtableMax,
-		util.DefaultNatGwSynHtableExpire,
 	}}, calls)
 }

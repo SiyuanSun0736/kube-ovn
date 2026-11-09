@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -531,17 +530,6 @@ func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatG
 
 	if err := validateQoSPolicyRef(ctx, v.cache, gw.Spec.QoSPolicy); err != nil {
 		return err
-	}
-
-	if gw.Spec.TcpConnLimit != nil && *gw.Spec.TcpConnLimit < 0 {
-		return fmt.Errorf("spec.tcpConnLimit must be greater than or equal to 0, got %d", *gw.Spec.TcpConnLimit)
-	}
-
-	if val, ok := gw.Annotations[util.VpcNatTcpConnLimitAnnotation]; ok {
-		limit, err := strconv.Atoi(strings.TrimSpace(val))
-		if err != nil || limit < 0 {
-			return fmt.Errorf("annotation %s must be a non-negative integer, got %q", util.VpcNatTcpConnLimitAnnotation, val)
-		}
 	}
 
 	return nil

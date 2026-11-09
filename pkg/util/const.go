@@ -60,8 +60,6 @@ const (
 	VpcNatSynSrcBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
 	VpcNatSynDstRateLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
 	VpcNatSynDstBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
-	VpcNatSynHashlimitEntriesAnnotation = "ovn.kubernetes.io/tcp-syn-hashlimit-entries"
-	VpcNatSynHashlimitExpireAnnotation  = "ovn.kubernetes.io/tcp-syn-hashlimit-expire"
 	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
 	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
 	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
@@ -233,9 +231,6 @@ const (
 	DefaultNatGwSynSrcBurst     = "2000"
 	DefaultNatGwSynDstRate      = "20000/s"
 	DefaultNatGwSynDstBurst     = "40000"
-	DefaultNatGwSynHtableMax    = "262144"
-	DefaultNatGwSynDstHtableMax = "2048"
-	DefaultNatGwSynHtableExpire = "10000"
 	GeneveHeaderLength = 100
 	VxlanHeaderLength  = 50
 	SttHeaderLength    = 72

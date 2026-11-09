@@ -868,12 +868,6 @@ spec:
                   type: integer
                   minimum: 0
                   description: Maximum concurrent TCP connections allowed on the NAT gateway. Set to 0 to disable.
-                tcpSynRateLimit:
-                  type: string
-                  description: TCP SYN raw PREROUTING rate limit (e.g. 100/s)
-                tcpSynBurstLimit:
-                  type: string
-                  description: TCP SYN raw PREROUTING burst limit
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

@@ -592,9 +592,9 @@ function tcp_syn_limit_set() {
     local src_burst=${2:-${SYN_SRC_BURST:-"2000"}}
     local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
-    local htable_max=${5:-${SYN_HTABLE_MAX:-"262144"}}
-    local htable_expire=${6:-${SYN_HTABLE_EXPIRE:-"10000"}}
-    local dst_htable_max=${7:-${SYN_DST_HTABLE_MAX:-"2048"}}
+    local htable_max=262144
+    local htable_expire=10000
+    local dst_htable_max=2048
 
     check_inited
 
@@ -632,21 +632,8 @@ function tcp_syn_limit_set() {
         echo "Error: invalid SYN dst_burst '$dst_burst'" >&2
         return 1
     fi
-    if ! [[ "$htable_max" =~ $num_pattern ]] || [ "$htable_max" -le 0 ]; then
-        echo "Error: invalid SYN htable_max '$htable_max'" >&2
-        return 1
-    fi
-    if ! [[ "$dst_htable_max" =~ $num_pattern ]] || [ "$dst_htable_max" -le 0 ]; then
-        echo "Error: invalid SYN dst_htable_max '$dst_htable_max'" >&2
-        return 1
-    fi
-    # Bounded decimal integer validation before Bash arithmetic evaluation
-    if ! [[ "$htable_expire" =~ $num_pattern ]] || [ "$htable_expire" -lt 1000 ] || [ "$htable_expire" -gt 86400000 ]; then
-        echo "Warning: invalid or out-of-range SYN htable_expire '$htable_expire', falling back to 10000" >&2
-        htable_expire=10000
-    fi
 
-    echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate, src_burst=$src_burst, dst_rate=$dst_rate, dst_burst=$dst_burst, htable_max=$htable_max, htable_expire=$htable_expire"
+    echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate, src_burst=$src_burst, dst_rate=$dst_rate, dst_burst=$dst_burst"
 
     # 1. Iptables implementation in raw PREROUTING
     if [ -n "$iptables_cmd" ]; then

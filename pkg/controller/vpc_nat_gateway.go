@@ -343,15 +343,6 @@ func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	srcBurst := util.DefaultNatGwSynSrcBurst
 	dstRate := util.DefaultNatGwSynDstRate
 	dstBurst := util.DefaultNatGwSynDstBurst
-	htableMax := util.DefaultNatGwSynHtableMax
-	htableExpire := util.DefaultNatGwSynHtableExpire
-
-	if gw.Spec.TcpSynRateLimit != "" {
-		srcRate = gw.Spec.TcpSynRateLimit
-	}
-	if gw.Spec.TcpSynBurstLimit != "" {
-		srcBurst = gw.Spec.TcpSynBurstLimit
-	}
 
 	for _, key := range []string{util.VpcNatSynRateLimitAnnotation, util.VpcNatSynSrcRateLimitAnnotation} {
 		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
@@ -371,14 +362,8 @@ func (c *Controller) getVpcNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	if val, ok := gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
 		dstBurst = strings.TrimSpace(val)
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynHashlimitEntriesAnnotation]; ok && strings.TrimSpace(val) != "" {
-		htableMax = strings.TrimSpace(val)
-	}
-	if val, ok := gw.Annotations[util.VpcNatSynHashlimitExpireAnnotation]; ok && strings.TrimSpace(val) != "" {
-		htableExpire = strings.TrimSpace(val)
-	}
 
-	return []string{srcRate, srcBurst, dstRate, dstBurst, htableMax, htableExpire}
+	return []string{srcRate, srcBurst, dstRate, dstBurst}
 }
 
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
