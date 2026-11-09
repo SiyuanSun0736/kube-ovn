@@ -592,6 +592,7 @@ function tcp_syn_limit_set() {
     local src_burst=${2:-${SYN_SRC_BURST:-"2000"}}
     local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
+    # 底层固定哈希桶容量与老化窗口 (无需外部传参)
     local htable_max=262144
     local htable_expire=10000
     local dst_htable_max=2048
