@@ -479,6 +479,11 @@ function is_stateless_active() {
     return 1
 }
 
+# Unlike nftables base chains which attach directly to kernel hooks with explicit priority,
+# iptables user-defined chains cannot intercept traffic on their own and require an explicit
+# jump rule from a top-level built-in chain. This helper idempotently ensures the VPC_CONNLIMIT
+# chain exists in the mangle table and is hooked at position 1 of PREROUTING, allowing
+# tcp_connlimit_set to safely flush and populate the subchain without mutating PREROUTING.
 function ensure_iptables_connlimit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t mangle -N VPC_CONNLIMIT 2>/dev/null || true
@@ -487,6 +492,9 @@ function ensure_iptables_connlimit_chain() {
     fi
 }
 
+# Idempotently ensures the VPC_SYN_LIMIT chain exists in the raw table and incoming TCP SYN
+# packets from EXTERNAL_INTERFACE are redirected to it before connection tracking (conntrack).
+# In nftables, syn-limit is a self-contained base chain (priority -300) and requires no jump rule.
 function ensure_iptables_syn_limit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t raw -N VPC_SYN_LIMIT 2>/dev/null || true
