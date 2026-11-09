@@ -229,8 +229,8 @@ const (
 	DefaultMTU         = 1500
 
 	DefaultNatGwTcpConnLimit    = 50000
-	DefaultNatGwSynSrcRate      = "500/s"
-	DefaultNatGwSynSrcBurst     = "1000"
+	DefaultNatGwSynSrcRate      = "1000/s"
+	DefaultNatGwSynSrcBurst     = "2000"
 	DefaultNatGwSynDstRate      = "20000/s"
 	DefaultNatGwSynDstBurst     = "40000"
 	DefaultNatGwSynHtableMax    = "262144"
