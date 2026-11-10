@@ -54,7 +54,7 @@ func (c *Controller) enqueueUpdateVpc(oldObj, newObj any) {
 	// Dependency recovery is event-driven (CODE_STYLE.md): once a VPC key is in the cache, wake
 	// the pods waiting for it instead of leaving them to queue backoff. Imported VPCs included.
 	if !util.IsValidTunnelKey(oldVpc.Status.TunnelKey) && util.IsValidTunnelKey(newVpc.Status.TunnelKey) {
-		c.wakePodsWaitingForVpcTunnelKey()
+		c.notifyVpcTunnelKeySynced()
 	}
 
 	if newVpc.Labels != nil && newVpc.Labels[util.VpcExternalLabel] == "true" {
@@ -1558,10 +1558,32 @@ func (c *Controller) vpcTunnelKey(subnet *kubeovnv1.Subnet) int {
 	return vpc.Status.TunnelKey
 }
 
-// wakePodsWaitingForVpcTunnelKey re-enqueues pods that a missing VPC key may hold back: pods not
-// allocated yet (allocation gate) and allocated pods whose annotation needs repair. A pending pod
-// does not record its subnet yet, so pods are not filtered by VPC; both handlers are idempotent
-// and the transition happens once per VPC. Retries with backoff remain the fallback.
+// notifyVpcTunnelKeySynced requests a pod sweep without blocking the informer callback. A pending
+// signal already covers this transition: the sweep it starts reads the cache after this key is in.
+func (c *Controller) notifyVpcTunnelKeySynced() {
+	select {
+	case c.vpcTunnelKeySyncedCh <- struct{}{}:
+	default:
+	}
+}
+
+// runVpcTunnelKeyWaker runs one sweep per coalesced signal until ctx is done.
+func (c *Controller) runVpcTunnelKeyWaker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.vpcTunnelKeySyncedCh:
+			c.wakePodsWaitingForVpcTunnelKey()
+		}
+	}
+}
+
+// wakePodsWaitingForVpcTunnelKey re-enqueues pods that a missing VPC key may hold back: pods with
+// any requested provider not allocated yet (allocation gate, including a hot-plugged attachment
+// of an allocated pod) and allocated pods whose annotation needs repair. A pending provider does
+// not record its subnet yet, so pods are not filtered by VPC; both handlers are idempotent and the
+// transition happens once per VPC. Retries with backoff remain the fallback.
 func (c *Controller) wakePodsWaitingForVpcTunnelKey() {
 	pods, err := c.podsLister.List(labels.Everything())
 	if err != nil {
@@ -1573,7 +1595,8 @@ func (c *Controller) wakePodsWaitingForVpcTunnelKey() {
 			continue
 		}
 		key := cache.MetaObjectToName(pod).String()
-		if pod.Annotations[util.AllocatedAnnotation] != "true" {
+		// Same predicate as handleAddOrUpdatePod; a resolution error is left to that handler.
+		if podNets, err := c.getPodKubeovnNets(pod); err != nil || len(needAllocateSubnets(pod, podNets)) != 0 {
 			c.addOrUpdatePodQueue.Add(key)
 		}
 		if len(c.podProvidersNeedingTunnelKeyRepair(pod)) != 0 {

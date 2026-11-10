@@ -89,15 +89,24 @@ That asynchronous fallback is necessary because InitIPAM runs before
 inside InitIPAM would block the worker that produces it. On the first start
 after upgrading to the VPC scope, every OVN VPC pod is in this state: the VPC
 keys are not persisted yet, so all repairs are deferred and land once the VPC
-workers sync the keys. The deferred repairs drain through the repair queue's
-token bucket (10 qps, burst 100), so the first upgrade of a large cluster takes
-roughly `(pods - 100) / 10` seconds after the VPC keys are synced, e.g. about
-8 minutes for 5000 OVN VPC pods, plus one pod annotation patch per pod against
-the API server. Deferred repairs run
-with rate limiting after workers start. When a VPC key first reaches the
-informer cache, pods waiting for it (not yet allocated, or needing repair) are
-re-enqueued immediately instead of waiting for their backoff; there is no other
-periodic task or pod-update fallback. Detection and successful repair are
+workers sync the keys. When a VPC key first reaches the informer cache, pods
+waiting for it (any requested provider not allocated yet, or an annotation
+needing repair) are re-enqueued with a plain `Add`, bypassing their backoff.
+The VPC informer callback only signals; one goroutine runs the pod sweep, and
+a burst of VPCs syncing their keys (as on the first upgrade) coalesces into a
+few sweeps instead of one per VPC.
+The repair queue's limiter (per-item exponential backoff of 1 s to 1 min,
+combined with a shared 10 qps / burst 100 bucket) paces only retries after a
+failed repair, so it does not bound the backfill rate. The backfill is one
+annotation patch per pod when the keys of all its providers' VPCs are ready (a
+multi-NIC pod whose VPCs sync in batches is patched once per batch), run by `--worker-num` (default 3) repair workers in
+parallel under the controller's client-side API limit (1000 qps, burst 2000);
+its duration therefore depends on the worker count and the API server's patch
+latency rather than on a fixed rate. Coalescing only merges notifications that
+overlap a pending sweep, so the number of sweeps depends on how the VPC events
+arrive; each sweep still lists every subnet once per pod with attachments. Measured: 8 pods in about 3 s after the key
+sync on a single-node cluster. There is no other periodic task or pod-update
+fallback. Detection and successful repair are
 logged at Warning level, including what Cilium needs afterwards: a restart for
 a backfilled (previously missing) key, a pod recreation for a changed key.
 
@@ -158,7 +167,7 @@ Upgrading from a subnet-scoped release:
    key, so upgrading the controller first blocks CNI ADD of new pods on every
    node whose daemon is not upgraded yet.
 3. Upgrade kube-ovn-controller. Flow 2 rewrites every OVN VPC pod annotation
-   to its VPC key (see the duration estimate above).
+   to its VPC key (see the backfill duration notes above).
 4. Recreate the pods of each VPC. Existing Cilium endpoints keep their subnet
    scope, even across a Cilium restart (see "Compatibility and rolling
    upgrade").

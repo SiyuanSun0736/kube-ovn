@@ -318,6 +318,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		podKeyMutex:             keymutex.NewHashed(0),
 		addOrUpdateSubnetQueue:  newTypedRateLimitingQueue[string]("AddOrUpdateSubnet", nil),
 		repairTunnelKeyQueue:    newTypedRateLimitingQueue[string]("RepairTunnelKey", nil),
+		vpcTunnelKeySyncedCh:    make(chan struct{}, 1),
 		syncVirtualPortsQueue:   newTypedRateLimitingQueue[string]("SyncVirtualPort", nil),
 		updateSubnetStatusQueue: newTypedRateLimitingQueue[string]("UpdateSubnetStatus", nil),
 	}

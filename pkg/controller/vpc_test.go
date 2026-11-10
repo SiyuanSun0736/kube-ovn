@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
+	"time"
 
+	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/keymutex"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
@@ -560,9 +564,21 @@ func Test_handleAddOrUpdateVpc_tunnelKeyErrorKeepsStandbyFalse(t *testing.T) {
 func Test_enqueueUpdateVpc_wakesPodsWhenTunnelKeySynced(t *testing.T) {
 	t.Parallel()
 
-	subnet := &kubeovnv1.Subnet{
-		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
-		Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "vpc-a"},
+	subnets := []*kubeovnv1.Subnet{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "10.0.1.0/24", Provider: util.OvnProvider, Vpc: "vpc-a", Default: true},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "net1-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "10.0.2.0/24", Provider: "net1.default.ovn", Vpc: "vpc-b"},
+		},
+	}
+	nad := &nadv1.NetworkAttachmentDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "net1", Namespace: "default"},
+		Spec: nadv1.NetworkAttachmentDefinitionSpec{
+			Config: `{"cniVersion": "0.3.1", "name": "net1", "type": "kube-ovn", "provider": "net1.default.ovn"}`,
+		},
 	}
 	pod := func(name string, annotations map[string]string, hostNetwork bool) *corev1.Pod {
 		return &corev1.Pod{
@@ -578,30 +594,70 @@ func Test_enqueueUpdateVpc_wakesPodsWhenTunnelKeySynced(t *testing.T) {
 		}
 		return a
 	}
+	// Primary NIC converged; a hot-plugged attachment still waits for vpc-b's key.
+	hotplug := allocated("4")
+	hotplug[nadv1.NetworkAttachmentAnnot] = "default/net1"
 	pods := []*corev1.Pod{
 		pod("pending", nil, false),
+		pod("attachment-pending", hotplug, false),
 		pod("needs-repair", allocated(""), false),
 		pod("converged", allocated("4"), false),
 		pod("host", nil, true),
 	}
-	synced := &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "vpc-a"}, Status: kubeovnv1.VpcStatus{TunnelKey: 4}}
+	synced := &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "vpc-b"}, Status: kubeovnv1.VpcStatus{TunnelKey: 5}}
 	unsynced := synced.DeepCopy()
 	unsynced.Status.TunnelKey = 0
 
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Subnets: []*kubeovnv1.Subnet{subnet}, Vpcs: []*kubeovnv1.Vpc{synced}, Pods: pods})
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces:         []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:            subnets,
+		NetworkAttachments: []*nadv1.NetworkAttachmentDefinition{nad},
+		Vpcs: []*kubeovnv1.Vpc{
+			{ObjectMeta: metav1.ObjectMeta{Name: "vpc-a"}, Status: kubeovnv1.VpcStatus{TunnelKey: 4}},
+			synced,
+		},
+		Pods: pods,
+	})
 	require.NoError(t, err)
 	c := fc.fakeController
 	c.addOrUpdatePodQueue = newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil)
 
-	c.enqueueUpdateVpc(synced, synced.DeepCopy())
-	require.Zero(t, c.addOrUpdatePodQueue.Len(), "no transition, no wake")
-	require.Zero(t, c.repairTunnelKeyQueue.Len())
+	drain := func(q workqueue.TypedRateLimitingInterface[string]) []string {
+		var keys []string
+		for q.Len() != 0 {
+			key, _ := q.Get()
+			q.Done(key)
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		return keys
+	}
 
+	c.enqueueUpdateVpc(synced, synced.DeepCopy())
+	require.Empty(t, c.vpcTunnelKeySyncedCh, "no transition, no wake")
+
+	// The callback only signals; a burst of transitions coalesces into one sweep.
 	c.enqueueUpdateVpc(unsynced, synced)
-	require.Equal(t, 1, c.addOrUpdatePodQueue.Len())
-	key, _ := c.addOrUpdatePodQueue.Get()
-	require.Equal(t, "default/pending", key)
-	require.Equal(t, 1, c.repairTunnelKeyQueue.Len())
-	key, _ = c.repairTunnelKeyQueue.Get()
-	require.Equal(t, "default/needs-repair", key)
+	c.enqueueUpdateVpc(unsynced, synced)
+	require.Len(t, c.vpcTunnelKeySyncedCh, 1)
+	require.Zero(t, c.addOrUpdatePodQueue.Len(), "the sweep must not run in the informer callback")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.runVpcTunnelKeyWaker(ctx)
+	require.Eventually(t, func() bool {
+		return c.addOrUpdatePodQueue.Len() == 2 && c.repairTunnelKeyQueue.Len() == 1
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, []string{"default/attachment-pending", "default/pending"}, drain(c.addOrUpdatePodQueue))
+	require.Equal(t, []string{"default/needs-repair"}, drain(c.repairTunnelKeyQueue))
+
+	// The waker consumes the signal before it sweeps, so a key that syncs after a sweep started
+	// queues another sweep instead of being absorbed by the running one.
+	require.Empty(t, c.vpcTunnelKeySyncedCh)
+	late := pod("late", nil, false)
+	require.NoError(t, fc.fakeInformers.podInformer.Informer().GetStore().Add(late))
+	c.enqueueUpdateVpc(unsynced, synced)
+	require.Eventually(t, func() bool { return c.addOrUpdatePodQueue.Len() == 3 }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.Equal(t, []string{"default/attachment-pending", "default/late", "default/pending"}, drain(c.addOrUpdatePodQueue))
 }

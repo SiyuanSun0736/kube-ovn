@@ -128,7 +128,11 @@ type Controller struct {
 	// synchronously in InitIPAM because a subnet worker must still produce the
 	// key or a transient error needs retry. Workers start afterward and serialize
 	// with pod reconciliation via podKeyMutex. See the guarantee document.
-	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
+	repairTunnelKeyQueue workqueue.TypedRateLimitingInterface[string]
+	// vpcTunnelKeySyncedCh signals that a VPC key reached the cache. Capacity 1
+	// coalesces a burst of VPC transitions into one pod sweep that runs outside
+	// the informer callback (see wakePodsWaitingForVpcTunnelKey).
+	vpcTunnelKeySyncedCh   chan struct{}
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]
 	updatePodSecurityQueue workqueue.TypedRateLimitingInterface[string]
@@ -625,6 +629,7 @@ func Run(ctx context.Context, config *Configuration) {
 		// token bucket caps the aggregate requeue rate: a subnet whose tunnel
 		// key stays 0 makes the queued pods requeue in a loop, and a 5ms base
 		// with no bucket would hammer the shared podKeyMutex buckets.
+		vpcTunnelKeySyncedCh: make(chan struct{}, 1),
 		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey",
 			workqueue.NewTypedMaxOfRateLimiter[string](
 				workqueue.NewTypedItemExponentialFailureRateLimiter[string](time.Second, time.Minute),
@@ -1566,6 +1571,8 @@ func (c *Controller) startWorkers(ctx context.Context) {
 			klog.Errorf("inspection error: %v", err)
 		}
 	}, time.Duration(c.config.InspectInterval)*time.Second, ctx.Done())
+
+	go c.runVpcTunnelKeyWaker(ctx)
 
 	if c.config.EnableExternalVpc {
 		go wait.Until(func() {

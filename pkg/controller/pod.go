@@ -2050,6 +2050,11 @@ func (c *Controller) getPodAttachmentNet(pod *v1.Pod) ([]*kubeovnNet, error) {
 		}
 		multusNets = append(multusNets, attachments...)
 	}
+	if len(multusNets) == 0 {
+		// Cheap path for pods without attachments: the subnet list below is only used to
+		// resolve attachment providers.
+		return []*kubeovnNet{}, nil
+	}
 	subnets, err := c.subnetsLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list subnets: %v", err)
