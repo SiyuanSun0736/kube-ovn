@@ -122,10 +122,15 @@ type VpcStatus struct {
 	// +patchStrategy=merge
 	Conditions []Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
-	Standby                 bool     `json:"standby"`
-	Default                 bool     `json:"default"`
-	DefaultLogicalSwitch    string   `json:"defaultLogicalSwitch"`
-	Router                  string   `json:"router"`
+	Standby              bool   `json:"standby"`
+	Default              bool   `json:"default"`
+	DefaultLogicalSwitch string `json:"defaultLogicalSwitch"`
+	Router               string `json:"router"`
+	// TunnelKey is the OVN logical router tunnel_key (VNI) from Datapath_Binding. Pods on the
+	// VPC's non-vlan OVN subnets carry it as their tunnel_key annotation.
+	// omitempty is required: whole-status merge patches built from a stale cache must not
+	// overwrite an already-synced key with 0.
+	TunnelKey               int      `json:"tunnelKey,omitempty"`
 	TCPLoadBalancer         string   `json:"tcpLoadBalancer"`
 	UDPLoadBalancer         string   `json:"udpLoadBalancer"`
 	SctpLoadBalancer        string   `json:"sctpLoadBalancer"`

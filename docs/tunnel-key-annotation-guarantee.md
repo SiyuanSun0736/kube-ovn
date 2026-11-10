@@ -1,12 +1,29 @@
 # tunnel_key (VNI) annotation guarantee
 
 Every non-hostNetwork pod on a non-vlan OVN VPC subnet carries a valid
-`ovn.kubernetes.io/tunnel_key` (VNI) annotation by the time its network is
-configured (CNI ADD). This includes both the default cluster-router VPC and
+`ovn.kubernetes.io/tunnel_key` annotation by the time its network is
+configured (CNI ADD). Its value is the tunnel key of the pod's **VPC**, i.e.
+the OVN logical router `Datapath_Binding.tunnel_key` recorded in
+`Vpc.Status.TunnelKey`, not the subnet's logical switch key.
+
+Why the VPC key: Cilium (native-vpc mode) scopes pod identities by this
+value. A VPC is the IP uniqueness boundary (subnets inside one VPC cannot
+overlap, different VPCs can), so a per-VPC scope lets Cilium resolve a peer
+in any subnet of the same VPC with a single `(scope, IP)` lookup. A per-subnet
+scope would need an extra subnet-to-subnet translation on every packet, whose
+size grows with the square of the subnets per VPC. northd allocates switch and
+router keys from one 24-bit namespace, so a VPC key never equals a subnet key.
+
+`Subnet.Status.TunnelKey` (the logical switch key) is still synced before a
+subnet is Ready and kept for observation; it no longer defines the pod
+annotation. This includes both the default cluster-router VPC and
 custom VPCs. The exact scope predicate is
 `isOvnSubnet(subnet) && subnet.Spec.Vlan == ""`. VLAN/underlay and non-OVN
 subnets keep the default
-`status.tunnelKey=0` and do not carry the pod annotation. Cilium
+`status.tunnelKey=0` and do not carry the pod annotation. `Vpc.Status.TunnelKey`
+is synced for every VPC because every VPC owns a logical router; VPCs imported
+with `--enable-external-vpc` get it from the periodic external-VPC sync, which
+only reads OVN SB. Cilium
 (native-vpc mode) keys pod identities by this annotation, so a missing
 annotation makes the pod fall back to the non-VPC scheme and collide with
 overlapping VPC subnets.
@@ -15,13 +32,21 @@ The guarantee is upheld by two flows:
 
 ## Flow 1: normal pod creation
 
+`handleAddOrUpdateVpc` (pkg/controller/vpc.go) reads the logical router key
+from OVN SB and persists it in the same status patch that marks the VPC
+`Standby`; subnets wait for `Standby`, so a VPC with subnets always has a key
+in normal operation.
+
 `reconcileAllocateSubnets` (pkg/controller/pod.go) refuses to complete the
 allocation (requeues, persisting no pod annotations) while the resolved
-subnet's tunnel key is not valid (`Status.TunnelKey` is outside
-`1..16777215`), and writes the tunnel_key annotation in the same
-atomic patch as `allocated=true`. For a non-vlan OVN VPC subnet, the
-kube-ovn CNI server blocks until `allocated=true` and the pod annotation is
-a valid value equal to `Subnet.Status.TunnelKey`. Cilium (chained after
+subnet's VPC (`subnet.Spec.Vpc`) is unknown or its tunnel key is not valid
+(`Vpc.Status.TunnelKey` is outside `1..16777215`), and writes the
+tunnel_key annotation in the same atomic patch as `allocated=true`. For a
+non-vlan OVN VPC subnet, the kube-ovn CNI server blocks until
+`allocated=true` and the pod annotation is a valid value equal to
+`Vpc.Status.TunnelKey` of the subnet's VPC. As an upgrade transition the
+daemon also accepts the subnet's own key, which a controller predating the
+VPC scope writes (see "Intended upgrade sequence"). Cilium (chained after
 kube-ovn, the primary CNI) only runs once kube-ovn's CNI ADD has succeeded,
 so by the time Cilium reads the pod, the annotation is correct.
 
@@ -33,7 +58,7 @@ the earlier objects again.
 
 Why flow 1 cannot produce a missing annotation: `reconcileAllocateSubnets`
 returns an error without persisting pod annotations while any requested
-OVN VPC subnet's tunnel key is not ready; `tunnel_key` and `allocated=true`
+OVN VPC subnet's VPC tunnel key is not ready; `tunnel_key` and `allocated=true`
 are written in the same atomic patch; and the CNI server verifies both before
 returning success. So under the current code a pod either carries the correct
 annotation or is still waiting at CNI ADD - a missing annotation therefore
@@ -44,27 +69,37 @@ the population flow 2 repairs.
 
 - Pods created after the restart follow flow 1 (the gate lives in the
   allocation path and is unrelated to restarts).
-- Pods whose persisted annotation is valid and matches subnet status keep it.
-- Legacy pods allocated before the subnet tunnel key was synced (or before
+- Pods whose persisted annotation is valid and matches their VPC status keep it.
+- Legacy pods allocated before the VPC tunnel key was synced (or before
   this code existed) can have a missing, non-numeric or out-of-range
-  annotation (valid OVN tunnel keys are `1..16777215`). On startup,
+  annotation (valid OVN tunnel keys are `1..16777215`), or the subnet key
+  written by controllers that predate the VPC scope. On startup,
   `InitIPAM` calls `repairPodTunnelKeyOnStartup`, which invokes
-  `handleRepairTunnelKey` synchronously using `subnet.Status.TunnelKey`.
+  `handleRepairTunnelKey` synchronously using the VPC's `Status.TunnelKey`.
   If it cannot finish, the dedicated queue retries indefinitely with
   exponential backoff capped at one minute and an aggregate 10-qps token
-  bucket (subnet reconcile may still be syncing the key).
+  bucket (VPC reconcile may still be syncing the key).
 
 InitIPAM first attempts every eligible repair synchronously, using persisted
 pod annotations (`podProvidersNeedingTunnelKeyRepair`) before NAD/default-
-subnet resolution. If subnet status is already valid, the pod is fixed before
+subnet resolution. If VPC status is already valid, the pod is fixed before
 InitIPAM continues. Only an unavailable key or transient API error is queued.
 That asynchronous fallback is necessary because InitIPAM runs before
-`startWorkers`; a missing key may require the subnet worker, so waiting for it
-inside InitIPAM would block the worker that produces it. Deferred repairs run
-with rate limiting after workers start. There is no periodic task or pod-update
-fallback. Detection and successful repair are logged at Warning level,
-including the instruction to restart Cilium after backfill so already-created
-endpoints reload the corrected VNI.
+`startWorkers`; a missing key may require the VPC worker, so waiting for it
+inside InitIPAM would block the worker that produces it. On the first start
+after upgrading to the VPC scope, every OVN VPC pod is in this state: the VPC
+keys are not persisted yet, so all repairs are deferred and land once the VPC
+workers sync the keys. The deferred repairs drain through the repair queue's
+token bucket (10 qps, burst 100), so the first upgrade of a large cluster takes
+roughly `(pods - 100) / 10` seconds after the VPC keys are synced, e.g. about
+8 minutes for 5000 OVN VPC pods, plus one pod annotation patch per pod against
+the API server. Deferred repairs run
+with rate limiting after workers start. When a VPC key first reaches the
+informer cache, pods waiting for it (not yet allocated, or needing repair) are
+re-enqueued immediately instead of waiting for their backoff; there is no other
+periodic task or pod-update fallback. Detection and successful repair are
+logged at Warning level, including what Cilium needs afterwards: a restart for
+a backfilled (previously missing) key, a pod recreation for a changed key.
 
 The deferred asynchronous repair is fallback recovery only; it is not part of
 normal pod allocation. Normal allocation writes IP/network, tunnel_key and
@@ -73,7 +108,7 @@ normal pod allocation. Normal allocation writes IP/network, tunnel_key and
 Repair is multi-NIC aware and driven by the per-provider annotations the
 allocation wrote (`allocated` + `logical_switch`). A provider is repaired
 only when its logical switch resolves to a non-vlan OVN VPC subnet and its
-key is missing, invalid or different from `subnet.Status.TunnelKey`.
+key is missing, invalid or different from its VPC's `Status.TunnelKey`.
 Providers managed by another CNI have no `logical_switch`; OVN
 vlan/underlay subnets have one but are filtered by `isOvnVpcSubnet`. Both keep no pod tunnel_key annotation;
 startup repair removes stale keys written by older controller versions.
@@ -82,50 +117,88 @@ writing a wrong VNI is worse than a missing one (nothing would correct it
 afterwards); a `logical_switch` that does not resolve is counted by
 `pod_tunnel_key_repair_skipped_total` as the anomaly it is. Progress is
 not all-or-nothing: ready providers are patched in one call even when
-another provider's subnet key is still 0 (the handler then returns an
+another provider's VPC key is still 0 (the handler then returns an
 error to requeue for the remainder).
 
 ## Failure mode and diagnosis
 
-The allocation gate is intentionally fail-closed. If a non-vlan OVN VPC
-subnet's tunnel key cannot be observed (for example, OVN SB is unreachable
-or northd has not created the logical switch's `Datapath_Binding`), new
-pods on that subnet are not allocated with a guessed or zero VNI:
+The allocation gate is intentionally fail-closed. If the VPC tunnel key of a
+non-vlan OVN VPC subnet cannot be observed (for example, OVN SB is
+unreachable or northd has not created the logical router's
+`Datapath_Binding`), new pods on that subnet are not allocated with a guessed
+or zero VNI:
 
 - the pod remains in `ContainerCreating`;
 - kube-ovn CNI waits for `allocated=true`, fails after its wait loop, and the
   kubelet retries CNI ADD;
 - the pod receives an `AcquireAddressFailed` event containing
-  `subnet <name> tunnel key not observed on allocation`.
+  `vpc <vpc> tunnel key of subnet <name> not observed on allocation`.
 
-Check the subnet status with:
+Check the VPC status with:
 
 ```bash
-kubectl get subnet <name> -o jsonpath='{.status.tunnelKey}'
+kubectl get vpc <vpc> -o jsonpath='{.status.tunnelKey}'
 ```
 
 A value outside `1..16777215` is invalid and triggers fail-closed
-re-synchronization. Check OVN SB reachability and whether the logical switch
-has a `Datapath_Binding` in SB.
+re-synchronization. Check OVN SB reachability and whether the logical router
+has a `Datapath_Binding` in SB (`ovn-sbctl find Datapath_Binding
+external_ids:name=<vpc>`).
 VLAN/underlay subnets are not subject to this gate and keep the default
 TunnelKey value.
 
 ## Intended upgrade sequence
 
-Restart kube-ovn-controller first (flow 2 backfills the annotations), then
-restart cilium so it re-reads them for already-created endpoints. Every CNI
-ADD waits for `allocated=true`; when the persisted logical_switch resolves to
-a non-vlan OVN VPC subnet, it additionally waits for a valid annotation equal
-to `Subnet.Status.TunnelKey`. If backfill has not completed within the wait
-loop, ADD fails and kubelet retries. The Cilium restart is still required for
-endpoints created before the backfill logic existed.
+Upgrading from a subnet-scoped release:
+
+1. Apply the CRD (`Vpc.status.tunnelKey`) and RBAC (`vpcs` for kube-ovn-cni).
+2. Upgrade kube-ovn-cni on every node. The new daemon accepts both the VPC key
+   and the subnet key an older controller writes, so CNI ADD keeps working
+   while the controller is still old. An old daemon accepts only the subnet
+   key, so upgrading the controller first blocks CNI ADD of new pods on every
+   node whose daemon is not upgraded yet.
+3. Upgrade kube-ovn-controller. Flow 2 rewrites every OVN VPC pod annotation
+   to its VPC key (see the duration estimate above).
+4. Recreate the pods of each VPC. Existing Cilium endpoints keep their subnet
+   scope, even across a Cilium restart (see "Compatibility and rolling
+   upgrade").
+
+Restarting Cilium is only enough for legacy pods whose annotation was
+missing (0 -> N backfill), not for a changed key. Every CNI ADD waits for
+`allocated=true`; when the persisted logical_switch resolves to a non-vlan OVN
+VPC subnet, it additionally waits for a valid annotation. If backfill has not
+completed within the wait loop, ADD fails and kubelet retries.
 
 ## Compatibility and rolling upgrade
 
-The Subnet API is unchanged: `status.tunnelKey` remains an optional integer,
-and pod annotation keys keep their existing provider-based format. Normal
-non-vlan OVN VPC allocation remains compatible with controllers that already
-wrote the annotation atomically.
+The Vpc API gains an optional `status.tunnelKey` integer; the Subnet API is
+unchanged and pod annotation keys keep their existing provider-based format.
+The kube-ovn-cni ClusterRole gains `get/list/watch` on `vpcs`: the daemon
+waits for its VPC cache at startup, so apply the CRD and RBAC before rolling
+out the new daemon.
+
+Switching the annotation value from the subnet key to the VPC key changes
+the identity scope of every OVN VPC pod in Cilium. Cilium adopts a key only
+when an endpoint is created; an existing endpoint keeps the scope it was
+admitted with, **including across a Cilium restart** (restore accepts only a
+first key, 0 -> N, and logs `Ignoring native-vpc VNI change on an existing
+endpoint; recreate the pod to move it between VPCs` for N -> M). Measured on a
+single-node cluster (kube-ovn upgrade, then Cilium restart):
+
+- the controller rewrote every OVN VPC pod annotation within ~6 s of
+  starting; CiliumEndpoints, identities, CNPs and the policy revision did not
+  change, and already-allowed flows saw no packet loss, neither during the
+  kube-ovn upgrade nor during the Cilium restart;
+- a pod created after the backfill gets the VPC scope and a new identity.
+  Traffic between it and any not-yet-recreated pod, **even in the same
+  subnet**, resolves the peer as world and is denied by security-group rules
+  that select endpoints;
+- recreating the old pods moves them to the VPC scope; afterwards all pods of
+  the VPC with the same labels share one identity and cross-subnet
+  security-group rules match.
+
+Migrate one VPC at a time: upgrade kube-ovn, then recreate every pod of the
+VPC (rolling restart of its workloads) before new pods depend on old ones.
 
 Two behavior changes are intentional:
 
@@ -139,12 +212,15 @@ Two behavior changes are intentional:
   CNI failure. A provider without logical_switch is not classified as VPC and
   keeps the old no-key behavior (required by NoDefaultEIP/IPAM-only networks).
 
-For rolling upgrades, restart/upgrade kube-ovn-controller first, wait for the
-startup repair warnings to complete, then restart/upgrade kube-ovn-daemon and
-Cilium. An old daemon does not enforce the new CNI key gate; a new daemon is
-compatible with a controller that already performs the atomic VPC annotation
-patch. Rollback is safe: an older controller may repopulate VLAN tunnel-key
-status, and a subsequent new-controller startup cleans it again.
+For rolling upgrades follow "Intended upgrade sequence": daemon before
+controller, then recreate pods. The daemon's acceptance of the subnet key is a
+transition aid; it can be removed once no controller writes subnet keys.
+Rolling the controller back to a subnet-scoped version rewrites the
+annotations to subnet keys on its next startup, and pods must be recreated
+again to converge. An older controller does not know `Vpc.status.tunnelKey`
+and drops it when it replaces a VPC status; the new controller re-syncs it on
+its next start; an older controller may also repopulate VLAN tunnel-key status, which
+a subsequent new-controller startup cleans again.
 
 Non-primary-CNI remains compatible: non-vlan OVN attachment providers use the
 same per-provider annotation contract. IPAM-only and NoDefaultEIP attachments
@@ -153,24 +229,29 @@ provider naming.
 
 ## Known gaps (documented, not closed by code)
 
-- `Subnet.Status.TunnelKey` is not periodically compared with OVN SB. This is
-  intentional because a `Datapath_Binding` key is stable during the normal
-  lifecycle. After a destructive SB rebuild or an inconsistent DR restore,
-  northd may assign a different key while the persisted status still contains
-  an otherwise valid old value; `reconcileSubnetTunnelKey` will not re-read SB
-  until that status is invalidated. Recover every affected subnet as follows:
+- `Vpc.Status.TunnelKey` and `Subnet.Status.TunnelKey` are not periodically
+  compared with OVN SB. This is intentional because a `Datapath_Binding` key
+  is stable during the normal lifecycle. After a destructive SB rebuild or an
+  inconsistent DR restore, northd may assign a different key while the
+  persisted status still contains an otherwise valid old value;
+  `reconcileVpcTunnelKey` and `reconcileSubnetTunnelKey` will not re-read SB
+  until that status is invalidated. Recover every affected VPC (pod
+  annotations) and subnet (observation only) as follows:
 
   1. Clear its persisted key:
 
      ```bash
+     kubectl patch vpc <name> --subresource=status --type=merge \
+       -p '{"status":{"tunnelKey":0}}'
      kubectl patch subnet <name> --subresource=status --type=merge \
        -p '{"status":{"tunnelKey":0}}'
      ```
 
-  2. Restart kube-ovn-controller. InitIPAM detects affected pods; after subnet
+  2. Restart kube-ovn-controller. InitIPAM detects affected pods; after VPC
      workers re-read the new SB key, the deferred repair queue updates their
      annotations. Wait for the startup repair Warning logs to complete.
-  3. Restart Cilium so existing endpoints reload the new VNI.
+  3. Recreate the affected pods. A changed key is not adopted by an existing
+     Cilium endpoint, not even after a Cilium restart.
 
   A controller restart without first invalidating status is insufficient.
 - Repair progress is observable via `pod_tunnel_key_repair_patch_total`
@@ -192,6 +273,7 @@ provider naming.
   usually cannot survive its subnet's deletion anyway, and accidental manual
   deletion is outside this guarantee.
 - The upgrade sequence above is operator discipline, not enforced by code:
-  restarting cilium before the backfill completes leaves already-created
-  endpoints on the non-VPC scheme until the next cilium restart. This affects
+  upgrading the controller before the daemons blocks CNI ADD on nodes with an
+  old daemon, and restarting cilium before the backfill completes leaves
+  already-created endpoints on the non-VPC scheme until the next cilium restart. This affects
   only endpoints that already exist; CNI ADD itself is fail-closed on the key.

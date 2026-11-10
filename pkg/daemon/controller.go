@@ -53,6 +53,10 @@ type Controller struct {
 	subnetsSynced cache.InformerSynced
 	subnetQueue   workqueue.TypedRateLimitingInterface[*subnetEvent]
 
+	// vpcsLister resolves the VPC tunnel key the CNI ADD gate compares against.
+	vpcsLister kubeovnlister.VpcLister
+	vpcsSynced cache.InformerSynced
+
 	macvlanSubnetQueue workqueue.TypedRateLimitingInterface[*subnetEvent]
 
 	ovnEipsLister kubeovnlister.OvnEipLister
@@ -118,6 +122,7 @@ func NewController(config *Configuration,
 	providerNetworkInformer := kubeovnInformerFactory.Kubeovn().V1().ProviderNetworks()
 	vlanInformer := kubeovnInformerFactory.Kubeovn().V1().Vlans()
 	subnetInformer := kubeovnInformerFactory.Kubeovn().V1().Subnets()
+	vpcInformer := kubeovnInformerFactory.Kubeovn().V1().Vpcs()
 	ovnEipInformer := kubeovnInformerFactory.Kubeovn().V1().OvnEips()
 	iptablesEipInformer := kubeovnInformerFactory.Kubeovn().V1().IptablesEIPs()
 	podInformer := podInformerFactory.Core().V1().Pods()
@@ -139,6 +144,9 @@ func NewController(config *Configuration,
 		subnetsLister: subnetInformer.Lister(),
 		subnetsSynced: subnetInformer.Informer().HasSynced,
 		subnetQueue:   newTypedRateLimitingQueue[*subnetEvent]("Subnet", nil),
+
+		vpcsLister: vpcInformer.Lister(),
+		vpcsSynced: vpcInformer.Informer().HasSynced,
 
 		macvlanSubnetQueue: newTypedRateLimitingQueue[*subnetEvent]("MacvlanSubnet", nil),
 
@@ -188,7 +196,7 @@ func NewController(config *Configuration,
 	caSecretInformerFactory.Start(stopCh)
 
 	if !cache.WaitForCacheSync(stopCh,
-		controller.providerNetworksSynced, controller.vlansSynced, controller.subnetsSynced,
+		controller.providerNetworksSynced, controller.vlansSynced, controller.subnetsSynced, controller.vpcsSynced,
 		controller.podsSynced, controller.nodesSynced, controller.servicesSynced, controller.caSecretSynced,
 		controller.iptablesEipsSynced) {
 		util.LogFatalAndExit(nil, "failed to wait for caches to sync")

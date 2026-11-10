@@ -2,11 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/keymutex"
 
@@ -92,6 +94,7 @@ func Test_handleAddOrUpdateVpc_staticRoutes(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(existingKubeOvnRoutes, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -115,6 +118,12 @@ func Test_handleAddOrUpdateVpc_staticRoutes(t *testing.T) {
 		mockOvnClient.EXPECT().DeleteHAChassisGroup(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
 		err = ctrl.handleAddOrUpdateVpc(vpcName)
 		require.NoError(t, err)
+
+		// The router tunnel key is persisted together with Standby.
+		persisted, err := ctrl.config.KubeOvnClient.KubeovnV1().Vpcs().Get(context.Background(), vpcName, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, 7, persisted.Status.TunnelKey)
+		require.True(t, persisted.Status.Standby)
 	})
 
 	t.Run("delete orphaned kube-ovn routes", func(t *testing.T) {
@@ -161,6 +170,7 @@ func Test_handleAddOrUpdateVpc_staticRoutes(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(existingKubeOvnRoutes, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -214,6 +224,7 @@ func Test_handleAddOrUpdateVpc_staticRoutes(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(existingKubeOvnRoutes, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -270,6 +281,7 @@ func Test_handleAddOrUpdateVpc_staticRoutes(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -339,6 +351,7 @@ func Test_handleAddOrUpdateVpc_policyRoutes_ecmpNextHops(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -403,6 +416,7 @@ func Test_handleAddOrUpdateVpc_policyRoutes_ecmpNextHops(t *testing.T) {
 		externalIDs := map[string]string{"vendor": util.CniTypeName}
 
 		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(7, nil)
 		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
 		mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
 		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
@@ -473,4 +487,121 @@ func TestDiffPolicyRouteWithLogical_HandlesLegacyNextHopField(t *testing.T) {
 	dels, adds := diffPolicyRouteWithLogical(existing, target)
 	require.Empty(t, dels)
 	require.Empty(t, adds)
+}
+
+func Test_reconcileVpcTunnelKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		persisted int
+		sbKey     int
+		sbErr     error
+		callSB    bool
+		want      int
+		wantErr   string
+	}{
+		{name: "syncs missing key from SB", sbKey: 7, callSB: true, want: 7},
+		{name: "keeps valid persisted key without SB call", persisted: 5, want: 5},
+		{name: "resyncs out-of-range persisted key", persisted: util.MaxTunnelKey + 1, sbKey: 7, callSB: true, want: 7},
+		{name: "SB error requeues", sbErr: errors.New("datapath binding not found"), callSB: true, wantErr: "datapath binding not found"},
+		{name: "invalid SB key requeues", sbKey: 0, callSB: true, wantErr: "invalid tunnel key 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fc := newFakeController(t)
+			if tt.callSB {
+				fc.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey("vpc-a").Return(tt.sbKey, tt.sbErr)
+			}
+			vpc := &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "vpc-a"}, Status: kubeovnv1.VpcStatus{TunnelKey: tt.persisted}}
+			err := fc.fakeController.reconcileVpcTunnelKey(vpc)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Equal(t, tt.persisted, vpc.Status.TunnelKey, "an invalid key must never be recorded")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, vpc.Status.TunnelKey)
+		})
+	}
+}
+
+// Subnets wait for Standby, so a VPC whose router key cannot be read must not become Standby.
+func Test_handleAddOrUpdateVpc_tunnelKeyErrorKeepsStandbyFalse(t *testing.T) {
+	t.Parallel()
+
+	vpcName := "test-vpc"
+	fakeController := newFakeController(t)
+	ctrl := fakeController.fakeController
+	mockOvnClient := fakeController.mockOvnClient
+	ctrl.vpcKeyMutex = keymutex.NewHashed(500)
+
+	vpc := &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: vpcName}}
+	_, err := ctrl.config.KubeOvnClient.KubeovnV1().Vpcs().Create(context.Background(), vpc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, fakeController.fakeInformers.vpcInformer.Informer().GetStore().Add(vpc))
+
+	mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+	mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{Name: vpcName}, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", gomock.Any()).Return(nil, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(vpcName, -1, nil, true).Return(nil, nil)
+	fakeController.mockOvnSbClient.EXPECT().GetLogicalRouterTunnelKey(vpcName).Return(0, errors.New("datapath binding not found"))
+
+	require.ErrorContains(t, ctrl.handleAddOrUpdateVpc(vpcName), "datapath binding not found")
+
+	persisted, err := ctrl.config.KubeOvnClient.KubeovnV1().Vpcs().Get(context.Background(), vpcName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, persisted.Status.Standby)
+	require.Zero(t, persisted.Status.TunnelKey)
+}
+
+func Test_enqueueUpdateVpc_wakesPodsWhenTunnelKeySynced(t *testing.T) {
+	t.Parallel()
+
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+		Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "vpc-a"},
+	}
+	pod := func(name string, annotations map[string]string, hostNetwork bool) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Annotations: annotations},
+			Spec:       corev1.PodSpec{HostNetwork: hostNetwork},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+	allocated := func(key string) map[string]string {
+		a := map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet"}
+		if key != "" {
+			a[util.TunnelKeyAnnotation] = key
+		}
+		return a
+	}
+	pods := []*corev1.Pod{
+		pod("pending", nil, false),
+		pod("needs-repair", allocated(""), false),
+		pod("converged", allocated("4"), false),
+		pod("host", nil, true),
+	}
+	synced := &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: "vpc-a"}, Status: kubeovnv1.VpcStatus{TunnelKey: 4}}
+	unsynced := synced.DeepCopy()
+	unsynced.Status.TunnelKey = 0
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Subnets: []*kubeovnv1.Subnet{subnet}, Vpcs: []*kubeovnv1.Vpc{synced}, Pods: pods})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.addOrUpdatePodQueue = newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil)
+
+	c.enqueueUpdateVpc(synced, synced.DeepCopy())
+	require.Zero(t, c.addOrUpdatePodQueue.Len(), "no transition, no wake")
+	require.Zero(t, c.repairTunnelKeyQueue.Len())
+
+	c.enqueueUpdateVpc(unsynced, synced)
+	require.Equal(t, 1, c.addOrUpdatePodQueue.Len())
+	key, _ := c.addOrUpdatePodQueue.Get()
+	require.Equal(t, "default/pending", key)
+	require.Equal(t, 1, c.repairTunnelKeyQueue.Len())
+	key, _ = c.repairTunnelKeyQueue.Get()
+	require.Equal(t, "default/needs-repair", key)
 }

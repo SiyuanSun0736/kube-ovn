@@ -85,30 +85,33 @@ func TestIsOvnVpcSubnet(t *testing.T) {
 }
 
 func TestIsTunnelKeyAnnotationValidForSubnet(t *testing.T) {
+	// The subnet's own logical switch key must no longer be accepted: pods carry the VPC key.
 	vpcSubnet := &kubeovnv1.Subnet{
 		Spec:   kubeovnv1.SubnetSpec{Provider: OvnProvider},
 		Status: kubeovnv1.SubnetStatus{TunnelKey: 1234},
 	}
 	vlanSubnet := &kubeovnv1.Subnet{Spec: kubeovnv1.SubnetSpec{Provider: OvnProvider, Vlan: "vlan-a"}}
 	tests := []struct {
-		name        string
-		annotations map[string]string
-		provider    string
-		subnet      *kubeovnv1.Subnet
-		want        bool
+		name         string
+		annotations  map[string]string
+		provider     string
+		subnet       *kubeovnv1.Subnet
+		vpcTunnelKey int
+		want         bool
 	}{
-		{name: "matching default provider key", annotations: map[string]string{TunnelKeyAnnotation: "1234"}, provider: OvnProvider, subnet: vpcSubnet, want: true},
-		{name: "matching custom provider key", annotations: map[string]string{"net1.default.ovn.kubernetes.io/tunnel_key": "1234"}, provider: "net1.default.ovn", subnet: vpcSubnet, want: true},
-		{name: "missing key", annotations: map[string]string{}, provider: OvnProvider, subnet: vpcSubnet},
-		{name: "invalid key", annotations: map[string]string{TunnelKeyAnnotation: "invalid"}, provider: OvnProvider, subnet: vpcSubnet},
-		{name: "stale key", annotations: map[string]string{TunnelKeyAnnotation: "999"}, provider: OvnProvider, subnet: vpcSubnet},
+		{name: "matching default provider VPC key", annotations: map[string]string{TunnelKeyAnnotation: "5678"}, provider: OvnProvider, subnet: vpcSubnet, vpcTunnelKey: 5678, want: true},
+		{name: "matching custom provider VPC key", annotations: map[string]string{"net1.default.ovn.kubernetes.io/tunnel_key": "5678"}, provider: "net1.default.ovn", subnet: vpcSubnet, vpcTunnelKey: 5678, want: true},
+		{name: "subnet key is stale", annotations: map[string]string{TunnelKeyAnnotation: "1234"}, provider: OvnProvider, subnet: vpcSubnet, vpcTunnelKey: 5678},
+		{name: "missing key", annotations: map[string]string{}, provider: OvnProvider, subnet: vpcSubnet, vpcTunnelKey: 5678},
+		{name: "invalid key", annotations: map[string]string{TunnelKeyAnnotation: "invalid"}, provider: OvnProvider, subnet: vpcSubnet, vpcTunnelKey: 5678},
+		{name: "VPC key not synced", annotations: map[string]string{TunnelKeyAnnotation: "0"}, provider: OvnProvider, subnet: vpcSubnet},
 		{name: "vlan requires no key", annotations: map[string]string{}, provider: OvnProvider, subnet: vlanSubnet, want: true},
 		{name: "non-OVN or unidentified subnet requires no key", annotations: map[string]string{}, provider: "net1.default", subnet: nil, want: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsTunnelKeyAnnotationValidForSubnet(tt.annotations, tt.provider, tt.subnet); got != tt.want {
+			if got := IsTunnelKeyAnnotationValidForSubnet(tt.annotations, tt.provider, tt.subnet, tt.vpcTunnelKey); got != tt.want {
 				t.Errorf("IsTunnelKeyAnnotationValidForSubnet() = %v, want %v", got, tt.want)
 			}
 		})

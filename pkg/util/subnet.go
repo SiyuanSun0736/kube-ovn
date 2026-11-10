@@ -23,14 +23,15 @@ func IsOvnVpcSubnet(subnet *kubeovnv1.Subnet) bool {
 }
 
 // IsTunnelKeyAnnotationValidForSubnet reports whether a provider annotation
-// carries the exact valid key required by a non-vlan OVN VPC subnet. Other
-// subnet types do not require the annotation and therefore return true.
-func IsTunnelKeyAnnotationValidForSubnet(annotations map[string]string, provider string, subnet *kubeovnv1.Subnet) bool {
+// carries the exact valid tunnel key of the VPC (logical router) owning a
+// non-vlan OVN VPC subnet. Other subnet types do not require the annotation
+// and therefore return true.
+func IsTunnelKeyAnnotationValidForSubnet(annotations map[string]string, provider string, subnet *kubeovnv1.Subnet, vpcTunnelKey int) bool {
 	if !IsOvnVpcSubnet(subnet) {
 		return true
 	}
 	tunnelKey, err := strconv.Atoi(annotations[fmt.Sprintf(TunnelKeyAnnotationTemplate, provider)])
-	return err == nil && IsValidTunnelKey(tunnelKey) && tunnelKey == subnet.Status.TunnelKey
+	return err == nil && IsValidTunnelKey(tunnelKey) && tunnelKey == vpcTunnelKey
 }
 
 func IsOvnProvider(provider string) bool {

@@ -6045,6 +6045,21 @@ func (mr *MockSbClientMockRecorder) GetChassisByHost(nodeName any) *gomock.Call 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetChassisByHost", reflect.TypeOf((*MockSbClient)(nil).GetChassisByHost), nodeName)
 }
 
+// GetLogicalRouterTunnelKey mocks base method.
+func (m *MockSbClient) GetLogicalRouterTunnelKey(lrName string) (int, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetLogicalRouterTunnelKey", lrName)
+	ret0, _ := ret[0].(int)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetLogicalRouterTunnelKey indicates an expected call of GetLogicalRouterTunnelKey.
+func (mr *MockSbClientMockRecorder) GetLogicalRouterTunnelKey(lrName any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLogicalRouterTunnelKey", reflect.TypeOf((*MockSbClient)(nil).GetLogicalRouterTunnelKey), lrName)
+}
+
 // GetLogicalSwitchTunnelKey mocks base method.
 func (m *MockSbClient) GetLogicalSwitchTunnelKey(lsName string) (int, error) {
 	m.ctrl.T.Helper()

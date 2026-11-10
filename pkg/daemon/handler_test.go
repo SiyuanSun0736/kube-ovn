@@ -14,28 +14,44 @@ import (
 )
 
 func TestPodTunnelKeyReady(t *testing.T) {
-	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	subnetIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	for _, subnet := range []*kubeovnv1.Subnet{
 		{
+			// Status.TunnelKey is the subnet's own logical switch key; pods must carry the VPC key.
 			ObjectMeta: metav1.ObjectMeta{Name: "vpc-subnet"},
-			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
-			Status:     kubeovnv1.SubnetStatus{TunnelKey: 1234},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "vpc-a"},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 99},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "pending-vpc-subnet"},
-			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "pending-vpc"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "orphan-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "missing-vpc"},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 77},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"},
-			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a", Vpc: "missing-vpc"},
 		},
 	} {
-		if err := indexer.Add(subnet); err != nil {
+		if err := subnetIndexer.Add(subnet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vpcIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, vpc := range []*kubeovnv1.Vpc{
+		{ObjectMeta: metav1.ObjectMeta{Name: "vpc-a"}, Status: kubeovnv1.VpcStatus{TunnelKey: 1234}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pending-vpc"}},
+	} {
+		if err := vpcIndexer.Add(vpc); err != nil {
 			t.Fatal(err)
 		}
 	}
 	csh := cniServerHandler{Controller: &Controller{
-		subnetsLister: kubeovnlister.NewSubnetLister(indexer),
+		subnetsLister: kubeovnlister.NewSubnetLister(subnetIndexer),
+		vpcsLister:    kubeovnlister.NewVpcLister(vpcIndexer),
 	}}
 	pod := func(provider, subnet, tunnelKey string) *corev1.Pod {
 		annotations := map[string]string{}
@@ -57,14 +73,17 @@ func TestPodTunnelKeyReady(t *testing.T) {
 	}{
 		{name: "OVN provider without logical switch needs no VPC key", pod: pod(util.OvnProvider, "", ""), provider: util.OvnProvider, want: true},
 		{name: "non-OVN provider without logical switch", pod: pod("net1.default", "", ""), provider: "net1.default", want: true},
-		{name: "VPC key matches subnet status", pod: pod(util.OvnProvider, "vpc-subnet", "1234"), provider: util.OvnProvider, want: true},
+		{name: "key matches VPC status", pod: pod(util.OvnProvider, "vpc-subnet", "1234"), provider: util.OvnProvider, want: true},
 		{name: "custom OVN provider key matches", pod: pod("net1.default.ovn", "vpc-subnet", "1234"), provider: "net1.default.ovn", want: true},
+		{name: "subnet key from a pre-upgrade controller is accepted", pod: pod(util.OvnProvider, "vpc-subnet", "99"), provider: util.OvnProvider, want: true},
+		{name: "subnet key accepted without a resolvable VPC", pod: pod(util.OvnProvider, "orphan-subnet", "77"), provider: util.OvnProvider, want: true},
 		{name: "VPC key missing", pod: pod(util.OvnProvider, "vpc-subnet", ""), provider: util.OvnProvider, want: false},
 		{name: "VPC key zero", pod: pod(util.OvnProvider, "vpc-subnet", "0"), provider: util.OvnProvider, want: false},
 		{name: "VPC key non-numeric", pod: pod(util.OvnProvider, "vpc-subnet", "invalid"), provider: util.OvnProvider, want: false},
-		{name: "VPC key differs from subnet status", pod: pod(util.OvnProvider, "vpc-subnet", "999"), provider: util.OvnProvider, want: false},
-		{name: "VPC subnet status not ready", pod: pod(util.OvnProvider, "pending-vpc-subnet", "1234"), provider: util.OvnProvider, want: false},
-		{name: "vlan subnet needs no key", pod: pod(util.OvnProvider, "vlan-subnet", ""), provider: util.OvnProvider, want: true},
+		{name: "VPC key differs from VPC status", pod: pod(util.OvnProvider, "vpc-subnet", "999"), provider: util.OvnProvider, want: false},
+		{name: "VPC status not ready", pod: pod(util.OvnProvider, "pending-vpc-subnet", "1234"), provider: util.OvnProvider, want: false},
+		{name: "missing VPC", pod: pod(util.OvnProvider, "orphan-subnet", "1234"), provider: util.OvnProvider, want: false, wantErr: true},
+		{name: "vlan subnet needs no key or VPC", pod: pod(util.OvnProvider, "vlan-subnet", ""), provider: util.OvnProvider, want: true},
 		{name: "vlan stale key does not block CNI", pod: pod(util.OvnProvider, "vlan-subnet", "1234"), provider: util.OvnProvider, want: true},
 		{name: "missing subnet", pod: pod(util.OvnProvider, "missing-subnet", "1234"), provider: util.OvnProvider, want: false, wantErr: true},
 	}

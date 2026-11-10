@@ -58,7 +58,21 @@ func (csh cniServerHandler) podTunnelKeyReady(pod *v1.Pod, provider string) (boo
 	if err != nil {
 		return false, fmt.Errorf("failed to get subnet %s: %w", lsName, err)
 	}
-	return util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet), nil
+	if !util.IsOvnVpcSubnet(subnet) {
+		return true, nil
+	}
+	// Upgrade transition: a controller that predates the VPC scope writes the subnet key. The
+	// daemon is upgraded first and accepts it, so CNI ADD keeps working until the controller is
+	// upgraded and rewrites annotations to the VPC key. Northd allocates switch and router keys
+	// from one namespace, so the two can never be confused.
+	if util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet, subnet.Status.TunnelKey) {
+		return true, nil
+	}
+	vpc, err := csh.Controller.vpcsLister.Get(subnet.Spec.Vpc)
+	if err != nil {
+		return false, fmt.Errorf("failed to get vpc %s of subnet %s: %w", subnet.Spec.Vpc, lsName, err)
+	}
+	return util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet, vpc.Status.TunnelKey), nil
 }
 
 func (csh cniServerHandler) providerExists(provider string) (*kubeovnv1.Subnet, bool) {

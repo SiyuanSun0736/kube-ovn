@@ -17,6 +17,7 @@ rules:
       - "kubeovn.io"
     resources:
       - subnets
+      - vpcs
       - vlans
       - provider-networks
       - iptables-eips

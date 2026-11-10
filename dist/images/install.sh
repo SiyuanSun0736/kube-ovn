@@ -2867,6 +2867,11 @@ spec:
                   type: string
                 router:
                   type: string
+                tunnelKey:
+                  description: OVN logical router tunnel key (VNI) from Datapath_Binding. 0 means not synced.
+                  type: integer
+                  minimum: 0
+                  maximum: 16777215
                 standby:
                   type: boolean
                 enableExternal:
@@ -4536,6 +4541,7 @@ rules:
       - "kubeovn.io"
     resources:
       - subnets
+      - vpcs
       - vlans
       - provider-networks
       - iptables-eips

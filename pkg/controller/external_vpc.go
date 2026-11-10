@@ -34,6 +34,7 @@ func (c *Controller) syncExternalVpc() {
 			for _, ls := range logicalRouters[vpc.Name].LogicalSwitches {
 				vpc.Status.Subnets = append(vpc.Status.Subnets, ls.Name)
 			}
+			c.syncExternalVpcTunnelKey(vpc)
 			_, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().UpdateStatus(context.Background(), vpc, metav1.UpdateOptions{})
 			if err != nil {
 				klog.Errorf("failed to update vpc %s status: %v", vpc.Name, err)
@@ -69,6 +70,7 @@ func (c *Controller) syncExternalVpc() {
 			vpc.Status.Router = routerName
 			vpc.Status.Standby = true
 			vpc.Status.Default = false
+			c.syncExternalVpcTunnelKey(vpc)
 
 			_, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().UpdateStatus(context.Background(), vpc, metav1.UpdateOptions{})
 			if err != nil {
@@ -137,4 +139,13 @@ func (c *Controller) getNonKubeovnRouterStatus() (logicalRouters map[string]util
 		logicalRouters[routerName] = tmpRouter
 	}
 	return logicalRouters, nil
+}
+
+// syncExternalVpcTunnelKey records the router key of an imported VPC so pods on its subnets pass
+// the tunnel_key gate. It only reads OVN SB; the external router stays unmanaged. A failure keeps
+// the key unset (pods stay fail-closed) and is retried by the next periodic sync.
+func (c *Controller) syncExternalVpcTunnelKey(vpc *v1.Vpc) {
+	if err := c.reconcileVpcTunnelKey(vpc); err != nil {
+		klog.Warningf("external vpc %s tunnel key not synced, retrying on next sync: %v", vpc.Name, err)
+	}
 }

@@ -306,4 +306,5 @@ type Chassis interface {
 
 type DatapathBinding interface {
 	GetLogicalSwitchTunnelKey(lsName string) (int, error)
+	GetLogicalRouterTunnelKey(lrName string) (int, error)
 }

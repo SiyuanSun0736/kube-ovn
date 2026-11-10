@@ -2,7 +2,6 @@ package ovs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnsb"
@@ -10,8 +9,22 @@ import (
 
 // GetLogicalSwitchTunnelKey retrieves the tunnel_key for a logical switch from OVN SB Datapath_Binding.
 func (c *OVNSbClient) GetLogicalSwitchTunnelKey(lsName string) (int, error) {
-	if lsName == "" {
-		return 0, errors.New("logical switch name is empty")
+	return c.getDatapathTunnelKey("logical switch", "logical-switch", lsName)
+}
+
+// GetLogicalRouterTunnelKey retrieves the tunnel_key for a logical router (VPC) from OVN SB
+// Datapath_Binding. northd allocates switch and router keys from one namespace.
+func (c *OVNSbClient) GetLogicalRouterTunnelKey(lrName string) (int, error) {
+	return c.getDatapathTunnelKey("logical router", "logical-router", lrName)
+}
+
+// getDatapathTunnelKey matches Datapath_Binding by external_ids:name and the external ID northd
+// sets for the datapath kind (logical-switch/logical-router = NB UUID). Matching the kind keeps a
+// same-named datapath of the other kind from being accepted while the wanted one is not
+// published yet.
+func (c *OVNSbClient) getDatapathTunnelKey(kind, kindID, name string) (int, error) {
+	if name == "" {
+		return 0, fmt.Errorf("%s name is empty", kind)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
@@ -22,20 +35,18 @@ func (c *OVNSbClient) GetLogicalSwitchTunnelKey(lsName string) (int, error) {
 		if dp.ExternalIDs == nil {
 			return false
 		}
-		return dp.ExternalIDs["name"] == lsName
+		return dp.ExternalIDs["name"] == name && dp.ExternalIDs[kindID] != ""
 	}).List(ctx, &dpList); err != nil {
-		return 0, fmt.Errorf("failed to list datapath binding for logical switch %s: %w", lsName, err)
+		return 0, fmt.Errorf("failed to list datapath binding for %s %s: %w", kind, name, err)
 	}
 
 	if len(dpList) == 0 {
-		return 0, fmt.Errorf("datapath binding not found for logical switch %s", lsName)
+		return 0, fmt.Errorf("datapath binding not found for %s %s", kind, name)
 	}
 
 	if len(dpList) > 1 {
-		// This indicates a critical OVN SB database inconsistency.
-		// Each logical switch should have exactly one datapath binding.
-		// Multiple bindings suggest NB/SB sync issues or database corruption.
-		return 0, fmt.Errorf("found %d datapath bindings for logical switch %s, expected exactly one: OVN SB database may be inconsistent", len(dpList), lsName)
+		// Each datapath has exactly one binding; more means an NB/SB inconsistency.
+		return 0, fmt.Errorf("found %d datapath bindings for %s %s, expected exactly one: OVN SB database may be inconsistent", len(dpList), kind, name)
 	}
 
 	return dpList[0].TunnelKey, nil

@@ -1127,6 +1127,10 @@ func (suite *OvnClientTestSuite) Test_GetLogicalSwitchTunnelKey() {
 	suite.testGetLogicalSwitchTunnelKey()
 }
 
+func (suite *OvnClientTestSuite) Test_GetLogicalRouterTunnelKey() {
+	suite.testGetLogicalRouterTunnelKey()
+}
+
 // ovn ic
 func (suite *OvnClientTestSuite) Test_OvnIcNbCommand() {
 	suite.testOvnIcNbCommand()
