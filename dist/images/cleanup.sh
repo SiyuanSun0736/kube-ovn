@@ -3,6 +3,10 @@ set -eux
 export PS4='+ $(date "+%Y-%m-%d %H:%M:%S")\011 '
 
 kubectl delete --ignore-not-found -n kube-system ds kube-ovn-pinger
+# --ignore-not-found does not cover a resource type the cluster does not serve.
+if [[ "$(kubectl get --raw /apis/admissionregistration.k8s.io/v1 2>/dev/null || true)" == *'"name":"validatingadmissionpolicies"'* ]]; then
+  kubectl delete --ignore-not-found validatingadmissionpolicybinding,validatingadmissionpolicy kube-ovn-tunnel-key-annotation
+fi
 # ensure kube-ovn-pinger has been deleted
 while :; do
   if [ $(kubectl get pod -n kube-system -l app=kube-ovn-pinger -o name | wc -l) -eq 0 ]; then

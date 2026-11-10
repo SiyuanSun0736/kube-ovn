@@ -1,0 +1,41 @@
+{{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-ovn-tunnel-key-annotation
+spec:
+  # Cilium native-vpc scopes pod identities by these annotations. Only
+  # kube-ovn-controller may add, change or remove them on an existing pod;
+  # see docs/tunnel-key-annotation-guarantee.md.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        # pods/status: a status update also persists metadata.annotations.
+        resources: ["pods", "pods/status"]
+  matchConditions:
+    - name: not-kube-ovn-controller
+      expression: "request.userInfo.username != 'system:serviceaccount:{{ .Values.namespace }}:ovn'"
+  variables:
+    - name: oldKeys
+      expression: "oldObject.metadata.?annotations.orValue({}).filter(k, k.endsWith('.kubernetes.io/tunnel_key'))"
+    - name: newKeys
+      expression: "object.metadata.?annotations.orValue({}).filter(k, k.endsWith('.kubernetes.io/tunnel_key'))"
+  validations:
+    - expression: >-
+        variables.oldKeys.size() == variables.newKeys.size() &&
+        variables.newKeys.all(k, k in variables.oldKeys &&
+          oldObject.metadata.annotations[k] == object.metadata.annotations[k])
+      message: "only kube-ovn-controller may add, change or remove *.kubernetes.io/tunnel_key pod annotations"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-ovn-tunnel-key-annotation
+spec:
+  policyName: kube-ovn-tunnel-key-annotation
+  validationActions: [Deny]
+{{- end }}

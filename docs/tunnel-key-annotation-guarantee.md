@@ -129,6 +129,32 @@ not all-or-nothing: ready providers are patched in one call even when
 another provider's VPC key is still 0 (the handler then returns an
 error to requeue for the remainder).
 
+## Annotation protection
+
+The annotation defines which VPC a pod's identity belongs to in Cilium, so a
+user who can update pods must not be able to rewrite it: moving a pod into
+another VPC's scope could take over the identity of an address in that VPC.
+The ValidatingAdmissionPolicy `kube-ovn-tunnel-key-annotation` (installed by
+both charts and install.sh when the API is available, Kubernetes >= 1.30)
+rejects any pod UPDATE, including through the `pods/status` subresource (which
+also persists annotations), that adds, changes or removes a
+`*.kubernetes.io/tunnel_key` annotation unless the request comes from the
+kube-ovn-controller service account (`system:serviceaccount:<namespace>:ovn`).
+Writing the same value and changing other annotations or labels stay allowed.
+
+Pod creation is not covered by the policy. For pods kube-ovn allocates, the
+allocation patch overwrites any supplied value, and CNI ADD requires the key of
+the VPC of the persisted logical switch. A creator who pre-sets `allocated`,
+`logical_switch` and a matching key is the pre-existing trust question of all
+kube-ovn network annotations (static IPs, subnets), outside this policy.
+Without the policy (older Kubernetes) the annotation of a running pod is
+unprotected. To repair an annotation manually, delete the
+binding temporarily:
+
+```bash
+kubectl delete validatingadmissionpolicybinding kube-ovn-tunnel-key-annotation
+```
+
 ## Failure mode and diagnosis
 
 The allocation gate is intentionally fail-closed. If the VPC tunnel key of a

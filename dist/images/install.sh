@@ -6097,6 +6097,53 @@ spec:
 EOF
 
 kubectl apply -f kube-ovn.yaml
+# The manifests below need the v1 kind; discovery may only offer v1beta1.
+if [[ "$(kubectl get --raw /apis/admissionregistration.k8s.io/v1 2>/dev/null || true)" == *'"name":"validatingadmissionpolicies"'* ]]; then
+cat <<EOF > kube-ovn-tunnel-key-policy.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-ovn-tunnel-key-annotation
+spec:
+  # Cilium native-vpc scopes pod identities by these annotations. Only
+  # kube-ovn-controller may add, change or remove them on an existing pod;
+  # see docs/tunnel-key-annotation-guarantee.md.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        # pods/status: a status update also persists metadata.annotations.
+        resources: ["pods", "pods/status"]
+  matchConditions:
+    - name: not-kube-ovn-controller
+      expression: "request.userInfo.username != 'system:serviceaccount:kube-system:ovn'"
+  variables:
+    - name: oldKeys
+      expression: "oldObject.metadata.?annotations.orValue({}).filter(k, k.endsWith('.kubernetes.io/tunnel_key'))"
+    - name: newKeys
+      expression: "object.metadata.?annotations.orValue({}).filter(k, k.endsWith('.kubernetes.io/tunnel_key'))"
+  validations:
+    - expression: >-
+        variables.oldKeys.size() == variables.newKeys.size() &&
+        variables.newKeys.all(k, k in variables.oldKeys &&
+          oldObject.metadata.annotations[k] == object.metadata.annotations[k])
+      message: "only kube-ovn-controller may add, change or remove *.kubernetes.io/tunnel_key pod annotations"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-ovn-tunnel-key-annotation
+spec:
+  policyName: kube-ovn-tunnel-key-annotation
+  validationActions: [Deny]
+EOF
+kubectl apply -f kube-ovn-tunnel-key-policy.yaml
+else
+  echo "[WARNING] ValidatingAdmissionPolicy is not available (Kubernetes < 1.30): pod tunnel_key annotations are not protected"
+fi
 kubectl rollout status deployment/kube-ovn-controller -n kube-system --timeout 300s
 kubectl rollout status daemonset/kube-ovn-cni -n kube-system --timeout 300s
 
