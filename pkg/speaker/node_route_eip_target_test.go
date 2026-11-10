@@ -42,26 +42,6 @@ func (f *fakeSubnetLister) Get(name string) (*kubeovnv1.Subnet, error) {
 	return nil, apierrors.NewNotFound(kubeovnv1.Resource("subnet"), name)
 }
 
-// fakeNatGatewayLister 模拟测试用的 VpcNatGatewayLister
-type fakeNatGatewayLister struct {
-	gateways map[string]*kubeovnv1.VpcNatGateway
-}
-
-func (f *fakeNatGatewayLister) List(_ labels.Selector) ([]*kubeovnv1.VpcNatGateway, error) {
-	var list []*kubeovnv1.VpcNatGateway
-	for _, gw := range f.gateways {
-		list = append(list, gw)
-	}
-	return list, nil
-}
-
-func (f *fakeNatGatewayLister) Get(name string) (*kubeovnv1.VpcNatGateway, error) {
-	if gw, ok := f.gateways[name]; ok {
-		return gw, nil
-	}
-	return nil, apierrors.NewNotFound(kubeovnv1.Resource("vpcnatgateway"), name)
-}
-
 // TestGetNatGwTCRedirectTarget 验证 Controller.getNatGwTCRedirectTarget 对 EIP ExternalSubnet 的校验与定位
 func TestGetNatGwTCRedirectTarget(t *testing.T) {
 	t.Run("empty external subnet", func(t *testing.T) {
@@ -101,7 +81,7 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 			},
 		}
 
-		lookup := func(actual string) (netlink.Link, error) {
+		lookup := func(_ string) (netlink.Link, error) {
 			return nil, errors.New("should not be called")
 		}
 

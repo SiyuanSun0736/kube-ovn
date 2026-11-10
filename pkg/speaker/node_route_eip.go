@@ -305,10 +305,10 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 
 // resolveEipRedirectTarget 解析当前 EIP 在本地网关 Pod 的重定向直通目标。
 // 返回值：
-// - target: 解析成功的直通目标（解析失败或不适用时为 nil）
-// - retainStale: 当活跃 Pod 仅因元数据短暂就绪延迟（如 Multus NetworkStatus 写入中）时为 true，
-//   指示声明式保留存量 TC BPF 映射，避免流量被瞬时中断
-// - err: 解析异常错误
+//   - target: 解析成功的直通目标（解析失败或不适用时为 nil）
+//   - retainStale: 当活跃 Pod 仅因元数据短暂就绪延迟（如 Multus NetworkStatus 写入中）时为 true，
+//     指示声明式保留存量 TC BPF 映射，避免流量被瞬时中断
+//   - err: 解析异常错误
 func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRedirectTarget, bool, error) {
 	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
