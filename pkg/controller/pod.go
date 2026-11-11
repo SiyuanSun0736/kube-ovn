@@ -631,8 +631,9 @@ func (c *Controller) repairPodTunnelKeyOnStartup(pod *v1.Pod, providers []string
 	// This is a startup fallback, never the normal allocation path. Keep the
 	// warning visible so operators know this cluster contained legacy/stale
 	// tunnel_key data. Cilium adopts a backfilled (previously missing) key on
-	// restart, but a changed key only when the pod is recreated.
-	klog.Warningf("detected pod %s with inconsistent tunnel_key annotations for providers %v; attempting synchronous startup repair; after the backfill restart Cilium for a missing key, recreate the pod for a changed key", key, providers)
+	// restart; running endpoints follow a changed key, while Cilium before
+	// qiniu/cilium#70 adopts it only when the pod is recreated.
+	klog.Warningf("detected pod %s with inconsistent tunnel_key annotations for providers %v; attempting synchronous startup repair; after the backfill restart Cilium for a missing key; running Cilium endpoints follow a changed key (recreate the pod if Cilium predates qiniu/cilium#70)", key, providers)
 	if err := c.handleRepairTunnelKey(key); err != nil {
 		// InitIPAM runs before subnet/repair workers. Deferral is necessary only
 		// when those workers must first produce the key or retry a transient
@@ -730,7 +731,7 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 			return err
 		}
 		metricPodTunnelKeyRepairPatches.Inc()
-		klog.Warningf("startup fallback reconciled tunnel_key annotations for pod %s/%s; if an endpoint already exists, restart Cilium for a missing key or recreate the pod for a changed key", namespace, name)
+		klog.Warningf("startup fallback reconciled tunnel_key annotations for pod %s/%s; if an endpoint already exists, restart Cilium for a missing key; running Cilium endpoints follow a changed key (recreate the pod if Cilium predates qiniu/cilium#70)", namespace, name)
 	}
 	if keyNotReady {
 		return fmt.Errorf("tunnel key not observed for pod %s/%s, requeuing", namespace, name)

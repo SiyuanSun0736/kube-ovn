@@ -108,7 +108,8 @@ arrive; each sweep still lists every subnet once per pod with attachments. Measu
 sync on a single-node cluster. There is no other periodic task or pod-update
 fallback. Detection and successful repair are
 logged at Warning level, including what Cilium needs afterwards: a restart for
-a backfilled (previously missing) key, a pod recreation for a changed key.
+a backfilled (previously missing) key; a changed key is followed by running
+endpoints (Cilium before qiniu/cilium#70 needs a pod recreation instead).
 
 The deferred asynchronous repair is fallback recovery only; it is not part of
 normal pod allocation. Normal allocation writes IP/network, tunnel_key and
@@ -186,6 +187,32 @@ TunnelKey value.
 
 Upgrading from a subnet-scoped release:
 
+0. Protect the annotation, then upgrade Cilium. A Cilium that follows
+   tunnel_key changes on running endpoints (qiniu/cilium#70) trusts the
+   annotation, so the protection must be enforced first (see "Annotation
+   protection"):
+
+   1. Apply the policy of the new release and check that it is enforced. It
+      works with the current controller: only kube-ovn-controller writes the
+      annotation, and the policy exempts its service account (`ovn`).
+
+      ```bash
+      # namespace: where kube-ovn-controller runs (its service account is exempt)
+      helm template kube-ovn ./charts/kube-ovn --set namespace=kube-system \
+        --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy \
+        -s templates/tunnel-key-policy.yaml | kubectl apply -f -
+      # must be denied (Forbidden): only kube-ovn-controller may change the key
+      kubectl -n <ns> annotate pod <pod> ovn.kubernetes.io/tunnel_key=4095 \
+        --overwrite --dry-run=server
+      ```
+
+      Kubernetes < 1.30 cannot install the policy. There, use a Cilium that
+      follows key changes only if no untrusted user can update pods (RBAC);
+      otherwise keep the older Cilium and recreate the pods after step 3.
+   2. Upgrade Cilium to a release that follows tunnel_key changes on running
+      endpoints. An older Cilium keeps existing endpoints in their subnet
+      scope, even across a restart, so they would need to be recreated (see
+      "Compatibility and rolling upgrade").
 1. Apply the CRD (`Vpc.status.tunnelKey`) and RBAC (`vpcs` for kube-ovn-cni).
 2. Upgrade kube-ovn-cni on every node. The new daemon accepts both the VPC key
    and the subnet key an older controller writes, so CNI ADD keeps working
@@ -193,13 +220,10 @@ Upgrading from a subnet-scoped release:
    key, so upgrading the controller first blocks CNI ADD of new pods on every
    node whose daemon is not upgraded yet.
 3. Upgrade kube-ovn-controller. Flow 2 rewrites every OVN VPC pod annotation
-   to its VPC key (see the backfill duration notes above).
-4. Recreate the pods of each VPC. Existing Cilium endpoints keep their subnet
-   scope, even across a Cilium restart (see "Compatibility and rolling
-   upgrade").
+   to its VPC key (see the backfill duration notes above), and Cilium moves
+   each running endpoint to the new scope; no pod is recreated.
 
-Restarting Cilium is only enough for legacy pods whose annotation was
-missing (0 -> N backfill), not for a changed key. Every CNI ADD waits for
+Every CNI ADD waits for
 `allocated=true`; when the persisted logical_switch resolves to a non-vlan OVN
 VPC subnet, it additionally waits for a valid annotation. If backfill has not
 completed within the wait loop, ADD fails and kubelet retries.
@@ -213,27 +237,28 @@ waits for its VPC cache at startup, so apply the CRD and RBAC before rolling
 out the new daemon.
 
 Switching the annotation value from the subnet key to the VPC key changes
-the identity scope of every OVN VPC pod in Cilium. Cilium adopts a key only
-when an endpoint is created; an existing endpoint keeps the scope it was
-admitted with, **including across a Cilium restart** (restore accepts only a
-first key, 0 -> N, and logs `Ignoring native-vpc VNI change on an existing
-endpoint; recreate the pod to move it between VPCs` for N -> M). Measured on a
-single-node cluster (kube-ovn upgrade, then Cilium restart):
+the identity scope of every OVN VPC pod in Cilium. Cilium with
+qiniu/cilium#70 follows the change on running endpoints, at runtime and on
+restore if the agent was down: the endpoint's VNI, identity, ipcache entry,
+CiliumEndpoint and datapath configuration all move to the VPC key. Measured
+(single node and two-node kind, subnet keys 11/12 -> VPC key 10):
 
-- the controller rewrote every OVN VPC pod annotation within ~6 s of
-  starting; CiliumEndpoints, identities, CNPs and the policy revision did not
-  change, and already-allowed flows saw no packet loss, neither during the
-  kube-ovn upgrade nor during the Cilium restart;
-- a pod created after the backfill gets the VPC scope and a new identity.
-  Traffic between it and any not-yet-recreated pod, **even in the same
-  subnet**, resolves the peer as world and is denied by security-group rules
-  that select endpoints;
-- recreating the old pods moves them to the VPC scope; afterwards all pods of
-  the VPC with the same labels share one identity and cross-subnet
-  security-group rules match.
+- the controller rewrote every OVN VPC pod annotation within ~3-6 s of the VPC
+  key sync, and every endpoint moved within ~5-12 s of its annotation;
+- no CiliumEndpoint ever paired the new VNI with an identity of the old scope,
+  and no entry stayed under a subnet key;
+- afterwards all pods of the VPC with the same labels share one identity and
+  cross-subnet security-group rules match.
 
-Migrate one VPC at a time: upgrade kube-ovn, then recreate every pod of the
-VPC (rolling restart of its workloads) before new pods depend on old ones.
+Until both ends of a connection have moved, a lookup of one in the other's
+scope misses and security-group rules that select endpoints deny the traffic,
+for a few seconds per VPC.
+
+An older Cilium adopts a key only when an endpoint is created; an existing
+endpoint keeps the scope it was admitted with, including across a Cilium
+restart. With it, a pod created after the backfill cannot reach not-yet-
+recreated pods of its VPC, even in the same subnet, until every old pod is
+recreated; protect the annotation and upgrade Cilium first (step 0) instead.
 
 Two behavior changes are intentional:
 
@@ -247,15 +272,16 @@ Two behavior changes are intentional:
   CNI failure. A provider without logical_switch is not classified as VPC and
   keeps the old no-key behavior (required by NoDefaultEIP/IPAM-only networks).
 
-For rolling upgrades follow "Intended upgrade sequence": daemon before
-controller, then recreate pods. The daemon's acceptance of the subnet key is a
-transition aid; it can be removed once no controller writes subnet keys.
-Rolling the controller back to a subnet-scoped version rewrites the
-annotations to subnet keys on its next startup, and pods must be recreated
-again to converge. An older controller does not know `Vpc.status.tunnelKey`
-and drops it when it replaces a VPC status; the new controller re-syncs it on
-its next start; an older controller may also repopulate VLAN tunnel-key status, which
-a subsequent new-controller startup cleans again.
+For rolling upgrades follow "Intended upgrade sequence": annotation protection
+and Cilium first, then the kube-ovn daemon before the controller. The daemon's acceptance of the subnet
+key is a transition aid; it can be removed once no controller writes subnet
+keys. Rolling the controller back to a subnet-scoped version rewrites the
+annotations to subnet keys on its next startup, and Cilium endpoints follow
+them back (an older Cilium needs the pods recreated again). An older controller
+does not know `Vpc.status.tunnelKey` and drops it when it replaces a VPC
+status; the new controller re-syncs it on its next start; an older controller
+may also repopulate VLAN tunnel-key status, which a subsequent new-controller
+startup cleans again.
 
 Non-primary-CNI remains compatible: non-vlan OVN attachment providers use the
 same per-provider annotation contract. IPAM-only and NoDefaultEIP attachments
@@ -285,8 +311,10 @@ provider naming.
   2. Restart kube-ovn-controller. InitIPAM detects affected pods; after VPC
      workers re-read the new SB key, the deferred repair queue updates their
      annotations. Wait for the startup repair Warning logs to complete.
-  3. Recreate the affected pods. A changed key is not adopted by an existing
-     Cilium endpoint, not even after a Cilium restart.
+  3. Cilium moves the running endpoints of the affected pods to the new key.
+     With Cilium before qiniu/cilium#70, recreate the affected pods instead:
+     an existing endpoint does not adopt a changed key, not even after a
+     Cilium restart.
 
   A controller restart without first invalidating status is insufficient.
 - Repair progress is observable via `pod_tunnel_key_repair_patch_total`
