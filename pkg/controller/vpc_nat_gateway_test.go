@@ -689,7 +689,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATDisable},
 				{natGwTCPConnLimitSet, "50000", "stateful"},
-				{natGwTCPSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
+				{natGwTCPSynLimitSet, util.DefaultNatGwTCPSynSrcRate, util.DefaultNatGwTCPSynSrcBurst, util.DefaultNatGwTCPSynDstRate, util.DefaultNatGwTCPSynDstBurst},
 			},
 			wantStat: hairpinSNATDisable,
 		},
@@ -700,7 +700,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 				{natGwInit},
 				{natGwHairpinSNATSet, hairpinSNATEnable},
 				{natGwTCPConnLimitSet, "50000", "stateful"},
-				{natGwTCPSynLimitSet, util.DefaultNatGwSynSrcRate, util.DefaultNatGwSynSrcBurst, util.DefaultNatGwSynDstRate, util.DefaultNatGwSynDstBurst},
+				{natGwTCPSynLimitSet, util.DefaultNatGwTCPSynSrcRate, util.DefaultNatGwTCPSynSrcBurst, util.DefaultNatGwTCPSynDstRate, util.DefaultNatGwTCPSynDstBurst},
 			},
 			wantStat: hairpinSNATEnable,
 		},
@@ -1134,7 +1134,7 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 	}
 }
 
-func TestSyncNatGwSynRateLimit(t *testing.T) {
+func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	gw := fakeGw("gw")
 	pod := fakeNatGwPod("gw", true)
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
@@ -1151,32 +1151,32 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	}
 
 	// 1. Default rate limits (must not mutate caller's cached pod object in-place)
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
-	require.Empty(t, pod.Annotations[util.VpcNatSynRateLimitAnnotation], "caller pod object must not be mutated in-place")
+	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
+	require.Empty(t, pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation], "caller pod object must not be mutated in-place")
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
-		util.DefaultNatGwSynSrcRate,
-		util.DefaultNatGwSynSrcBurst,
-		util.DefaultNatGwSynDstRate,
-		util.DefaultNatGwSynDstBurst,
+		util.DefaultNatGwTCPSynSrcRate,
+		util.DefaultNatGwTCPSynSrcBurst,
+		util.DefaultNatGwTCPSynDstRate,
+		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
 
 	// Repeated reconcile without changes (using updated pod from apiserver) must skip reprogramming to preserve buckets
 	pod, err = ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	calls = nil
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
 
 	// 2. Custom rate limits via annotations
 	calls = nil
 	gw.Annotations = map[string]string{
-		util.VpcNatSynSrcRateLimitAnnotation:  "300/s",
-		util.VpcNatSynSrcBurstLimitAnnotation: "600",
-		util.VpcNatSynDstRateLimitAnnotation:  "8000/s",
-		util.VpcNatSynDstBurstLimitAnnotation: "16000",
+		util.VpcNatTCPSynSrcRateLimitAnnotation:  "300/s",
+		util.VpcNatTCPSynSrcBurstLimitAnnotation: "600",
+		util.VpcNatTCPSynDstRateLimitAnnotation:  "8000/s",
+		util.VpcNatTCPSynDstBurstLimitAnnotation: "16000",
 	}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
 		"300/s",
@@ -1189,10 +1189,10 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Error: invalid SYN src_rate 'unknown command'")
 	}
-	gw.Annotations[util.VpcNatSynSrcRateLimitAnnotation] = "unknown command"
-	err = ctrl.syncNatGwSynRateLimit(gw, pod, false)
+	gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation] = "unknown command"
+	err = ctrl.syncNatGwTCPSynRateLimit(gw, pod, false)
 	require.Error(t, err)
-	require.NotEqual(t, tcpSynLimitUnsupported, pod.Annotations[util.VpcNatSynRateLimitAnnotation])
+	require.NotEqual(t, tcpSynLimitUnsupported, pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation])
 
 	// 4. Disable SYN rate limit via "0"
 	calls = nil
@@ -1201,15 +1201,15 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		return nil
 	}
 	gw.Annotations = map[string]string{
-		util.VpcNatSynRateLimitAnnotation: "0",
+		util.VpcNatTCPSynRateLimitAnnotation: "0",
 	}
-	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
 		"0",
-		util.DefaultNatGwSynSrcBurst,
-		util.DefaultNatGwSynDstRate,
-		util.DefaultNatGwSynDstBurst,
+		util.DefaultNatGwTCPSynSrcBurst,
+		util.DefaultNatGwTCPSynDstRate,
+		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
 }
 
