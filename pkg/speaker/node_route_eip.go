@@ -382,6 +382,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	type targetResolution struct {
 		target      *TCRedirectTarget
 		retainStale bool
+		err         error
 	}
 	targetCache := make(map[string]targetResolution)
 
@@ -402,11 +403,13 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			cacheKey := eip.Spec.NatGwDp
 			if cached, ok := targetCache[cacheKey]; ok {
 				redirectTarget, retainStale = cached.target, cached.retainStale
+				if cached.err != nil && redirectTarget == nil {
+					targetErrors = append(targetErrors, cached.err)
+				}
 			} else {
 				var err error
 				redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-				targetCache[cacheKey] = targetResolution{target: redirectTarget, retainStale: retainStale}
-				// 仅在首次解析网关时记录错误；共享同一网关的后续 EIP 直接复用缓存，避免错误日志按受影响 EIP 数量被重复放大
+				targetCache[cacheKey] = targetResolution{target: redirectTarget, retainStale: retainStale, err: err}
 				if err != nil && redirectTarget == nil {
 					targetErrors = append(targetErrors, err)
 				}
@@ -456,12 +459,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	if err := c.reconcileRoutes(expectedPrefixes); err != nil {
-		klog.Errorf("failed to reconcile routes: %v", err)
-		targetErrors = append(targetErrors, err)
-	}
-
-	return errors.Join(targetErrors...)
+	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(targetErrors...))
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.

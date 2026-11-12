@@ -4,9 +4,7 @@ package speaker
 
 import (
 	"errors"
-	"fmt"
 	"net"
-	"strings"
 	"testing"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
@@ -21,7 +19,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
-	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -295,67 +292,4 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
 		require.ErrorContains(t, err, "has no network status for kube-system/wan")
 	})
-}
-
-// TestSyncNodeRouteEIPsDeduplicatesGatewayErrors 验证多个 EIP 共享同一个失败的 NAT 网关时，
-// 错误日志与返回值仅记录一次，不因受影响 EIP 数量被重复放大累积 (O6 观察项)
-func TestSyncNodeRouteEIPsDeduplicatesGatewayErrors(t *testing.T) {
-	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-
-	// 共享同一个 NatGwDp "gw-shared" 的 3 个 EIP
-	for i := 1; i <= 3; i++ {
-		eip := &kubeovnv1.IptablesEIP{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: fmt.Sprintf("eip-%d", i),
-				Annotations: map[string]string{
-					util.BgpAnnotation: "true",
-				},
-			},
-			Spec: kubeovnv1.IptablesEIPSpec{
-				NatGwDp:        "gw-shared",
-				ExternalSubnet: "ext-subnet-notfound",
-				V4ip:           fmt.Sprintf("1.1.1.%d", i),
-			},
-			Status: kubeovnv1.IptablesEIPStatus{
-				Ready: true,
-			},
-		}
-		require.NoError(t, eipIndexer.Add(eip))
-	}
-
-	podName := util.GenNatGwPodName("gw-shared")
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: "kube-system",
-		},
-		Spec: corev1.PodSpec{
-			NodeName: "node1",
-		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
-		},
-	}
-	require.NoError(t, podIndexer.Add(pod))
-
-	c := &Controller{
-		config: &Configuration{
-			NodeName:            "node1",
-			VpcNatGwNamespace:   "kube-system",
-			EnableTcBpfRedirect: true,
-		},
-		eipLister:     kubeovnlister.NewIptablesEIPLister(eipIndexer),
-		gwPodsLister:  listerv1.NewPodLister(podIndexer),
-		subnetsLister: &fakeSubnetLister{subnets: map[string]*kubeovnv1.Subnet{}},
-		gwTargetCache: make(map[string]gwTargetCacheEntry),
-		tcManager:     &failingTCManager{},
-	}
-
-	err := c.syncNodeRouteEIPs()
-	require.Error(t, err)
-	// 验证包含失败错误，且因网关去重机制，该网关的解析失败信息在聚合错误中仅出现 1 次
-	expectedErrMsg := "failed to get external subnet ext-subnet-notfound for EIP"
-	count := strings.Count(err.Error(), expectedErrMsg)
-	require.Equal(t, 1, count, "同一个 NatGwDp 解析失败时在聚合错误中应只出现 1 次，避免按 EIP 数量放大")
 }
