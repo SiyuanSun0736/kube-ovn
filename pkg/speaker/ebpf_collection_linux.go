@@ -3,8 +3,10 @@
 package speaker
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,13 +40,16 @@ func pruneBPFHashMap(targetMap *ebpf.Map, wanted map[string]bool) error {
 		}
 		key = next
 	}
-	var errs []error
 	for _, key := range stale {
 		if err := targetMap.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			errs = append(errs, err)
+			keyDesc := hex.EncodeToString(key)
+			if len(key) == net.IPv4len || len(key) == net.IPv6len {
+				keyDesc = net.IP(key).String()
+			}
+			klog.Errorf("failed to delete stale entry %s from BPF map %s: %v", keyDesc, targetMap, err)
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 type bpfPinOps interface {
