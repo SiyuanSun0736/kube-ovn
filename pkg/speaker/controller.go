@@ -26,6 +26,12 @@ import (
 
 const controllerAgentName = "ovn-speaker"
 
+// gwTargetCacheEntry 缓存网关 Pod 的 TC 重定向目标（生命周期与网关 Pod UID 绑定）。
+//
+// 注意（刻意不含 err / retainStale）：
+// 1. gwTargetCache 是跨 sync 周期的长效缓存，只要 Pod.UID 不变即假定网卡不变；
+// 2. 一旦解析失败，决不缓存 err，以确保下一次对账能够重试并自愈，防止瞬时网络故障被持久化；
+// 3. 带有 err 与 retainStale 字段的 eipTargetResolution 仅用于单次 sync 周期内部的局部防抖缓存。
 type gwTargetCacheEntry struct {
 	podUID           types.UID
 	gwRedirectTarget TCRedirectTarget

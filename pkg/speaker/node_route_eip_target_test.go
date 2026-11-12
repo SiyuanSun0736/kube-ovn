@@ -147,11 +147,12 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 	}
 
 	// 2. 调用 resolveEipRedirectTarget，应直接命中 UID 缓存并返回，完全不调用 getNatGwTCRedirectTarget
-	target, retainStale, err := c.resolveEipRedirectTarget(eip)
-	require.NoError(t, err)
-	require.False(t, retainStale)
-	require.NotNil(t, target)
-	require.Equal(t, expectedTarget, *target)
+	res := c.resolveEipRedirectTarget(eip)
+	require.NoError(t, res.err)
+	require.False(t, res.retainStale)
+	require.True(t, res.usable())
+	require.NotNil(t, res.eipRedirectTarget)
+	require.Equal(t, expectedTarget, *res.eipRedirectTarget)
 
 	// 3. Pod 被删除重建，UID 变为 pod-uid-2222
 	podRebuilt := &corev1.Pod{
@@ -168,8 +169,9 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 	require.NoError(t, err)
 
 	// 调用时因 UID 不匹配，缓存失效，尝试重新解析（因为未 mock netlink 会报错，证明没有走旧缓存）
-	_, _, err = c.resolveEipRedirectTarget(eip)
-	require.Error(t, err)
+	res = c.resolveEipRedirectTarget(eip)
+	require.Error(t, res.err)
+	require.False(t, res.usable())
 
 	// 4. Pod 处于 Terminating 状态（带有 DeletionTimestamp），清理缓存并返回 nil
 	now := metav1.Now()
@@ -191,10 +193,11 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 	err = podIndexer.Update(podDeleting)
 	require.NoError(t, err)
 
-	target, retainStale, err = c.resolveEipRedirectTarget(eip)
-	require.NoError(t, err)
-	require.False(t, retainStale)
-	require.Nil(t, target)
+	res = c.resolveEipRedirectTarget(eip)
+	require.NoError(t, res.err)
+	require.False(t, res.retainStale)
+	require.False(t, res.usable())
+	require.Nil(t, res.eipRedirectTarget)
 	// 验证缓存已被清理
 	_, exists := c.gwTargetCache["gw-test"]
 	require.False(t, exists)

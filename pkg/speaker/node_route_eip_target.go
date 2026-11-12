@@ -71,7 +71,11 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
-			gwRedirectTarget := TCRedirectTarget{TargetIfindex: link.Attrs().Index, ParentIfindex: link.Attrs().ParentIndex, TargetMAC: gwNet1Mac}
+			gwRedirectTarget := TCRedirectTarget{
+				TargetIfindex: link.Attrs().Index,
+				ParentIfindex: link.Attrs().ParentIndex,
+				TargetMAC:     gwNet1Mac,
+			}
 			if !validTCRedirectTarget(gwRedirectTarget) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
@@ -92,8 +96,12 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 				continue
 			}
 			routes, err := netlink.RouteGet(podIP)
-			if err != nil || len(routes) == 0 {
+			// 守卫：确保路由查询成功且返回切片非空，避免空切片索引越界访问 routes[0]
+			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("failed to get route for pod IP %s: %w", podIP, err)
+			}
+			if len(routes) == 0 {
+				return TCRedirectTarget{}, fmt.Errorf("no route found for pod IP %s", podIP)
 			}
 			// 拒绝经由外部网关的路由（例如默认路由或间接路由）。
 			// 本地 Pod 的直连 veth 路由必须是直连路由，不能携带下一跳网关。
@@ -111,7 +119,11 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 				}
 			}
 			// veth 设备无父设备（ParentIfindex 为 0）
-			gwRedirectTarget := TCRedirectTarget{TargetIfindex: gwHostIfindex, ParentIfindex: 0, TargetMAC: gwNet1Mac}
+			gwRedirectTarget := TCRedirectTarget{
+				TargetIfindex: gwHostIfindex,
+				ParentIfindex: 0,
+				TargetMAC:     gwNet1Mac,
+			}
 			if !validTCRedirectTarget(gwRedirectTarget) {
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}

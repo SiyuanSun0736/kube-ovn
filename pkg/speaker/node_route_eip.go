@@ -52,6 +52,19 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+// eipTargetResolution 封装 EIP 对应的 TC 重定向直通目标解析结果及其降级策略。
+// 仅作为 resolveEipRedirectTarget 的返回值以及单次 sync 内部的局部防抖缓存 (eipResolutionCache)。
+type eipTargetResolution struct {
+	eipRedirectTarget *TCRedirectTarget
+	retainStale       bool
+	err               error
+}
+
+// usable 判定解析结果是否包含合法且可立即投入 TC 重定向的直通目标。
+func (r eipTargetResolution) usable() bool {
+	return r.eipRedirectTarget != nil && validTCRedirectTarget(*r.eipRedirectTarget)
+}
+
 // initNodeRouteEIPMode initializes the EIP informer handlers for node route mode.
 // This should be called during controller initialization when NodeRouteEIPMode is enabled.
 func (c *Controller) initNodeRouteEIPMode() {
@@ -238,12 +251,13 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 
 	// Announce routes only if not already announced (idempotent)
 	var errs []error
-	var eipRedirectTarget *TCRedirectTarget
+	var res eipTargetResolution
 	if c.config.EnableTcBpfRedirect {
-		var err error
-		eipRedirectTarget, _, err = c.resolveEipRedirectTarget(eip)
-		if err != nil {
-			errs = append(errs, err)
+		// 增量事件路径仅执行 AddEIP（按需写入），不涉及全量对账阶段的孤儿清理（GC）。
+		// 解析未就绪或报错时跳过 AddEIP 即可自然保留存量映射，因此此处无需处理 retainStale。
+		res = c.resolveEipRedirectTarget(eip)
+		if res.err != nil {
+			errs = append(errs, res.err)
 		}
 	}
 
@@ -253,11 +267,11 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 			continue
 		}
 		if c.config.EnableTcBpfRedirect {
-			if eipRedirectTarget == nil || !validTCRedirectTarget(*eipRedirectTarget) {
+			if !res.usable() {
 				klog.V(3).Infof("deferring BGP route announcement for EIP %s until TC redirect target is ready", ip)
 				continue
 			}
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), *eipRedirectTarget); err != nil {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), *res.eipRedirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 				continue
@@ -304,24 +318,20 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 }
 
 // resolveEipRedirectTarget 解析当前 EIP 在本地网关 Pod 的重定向直通目标。
-// 返回值：
-//   - target: 解析成功的直通目标（解析失败或不适用时为 nil）
-//   - retainStale: 当活跃 Pod 仅因元数据短暂就绪延迟（如 Multus NetworkStatus 写入中）时为 true，
-//     指示声明式保留存量 TC BPF 映射，避免流量被瞬时中断
-//   - err: 解析异常错误
-func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRedirectTarget, bool, error) {
+// 返回封装了解析目标、降级保留标志与错误的 eipTargetResolution 结构体。
+func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) eipTargetResolution {
 	podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
 	pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			// 非 NotFound 的瞬时缓存或 API 抖动：声明式保留存量映射以防网络中断
-			return nil, true, fmt.Errorf("failed to get NAT GW pod %s: %w", podName, err)
+			return eipTargetResolution{retainStale: true, err: fmt.Errorf("failed to get NAT GW pod %s: %w", podName, err)}
 		}
 		// Pod 已不存在，清理对应的 UID 缓存
 		c.gwTargetCacheMu.Lock()
 		delete(c.gwTargetCache, eip.Spec.NatGwDp)
 		c.gwTargetCacheMu.Unlock()
-		return nil, false, err
+		return eipTargetResolution{err: err}
 	}
 
 	// 若 Pod 处于删除中或非 Running 阶段，属于确定性失效：绝不保留旧映射，并清理 UID 缓存
@@ -330,7 +340,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 		c.gwTargetCacheMu.Lock()
 		delete(c.gwTargetCache, eip.Spec.NatGwDp)
 		c.gwTargetCacheMu.Unlock()
-		return nil, false, nil
+		return eipTargetResolution{}
 	}
 
 	// 1. 尝试从长效 UID 缓存读取（只要 Pod.UID 未变，网卡 ifindex 和 MAC 恒定，无需重复查询 Netlink）
@@ -338,7 +348,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	cached, ok := c.gwTargetCache[eip.Spec.NatGwDp]
 	c.gwTargetCacheMu.RUnlock()
 	if ok && cached.podUID == pod.UID {
-		return &cached.gwRedirectTarget, false, nil
+		return eipTargetResolution{eipRedirectTarget: &cached.gwRedirectTarget}
 	}
 
 	// 2. 缓存未命中或 Pod 重建（UID 变更），实时解析网卡目标
@@ -346,7 +356,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	if err != nil {
 		// Pod 正常活跃，但网卡/子网元数据暂未就绪（如 NetworkStatus 写入延迟），保留存量映射
 		klog.Warningf("failed to resolve redirect target for EIP %s while pod %s is active: %v", eip.Name, podName, err)
-		return nil, true, err
+		return eipTargetResolution{retainStale: true, err: err}
 	}
 
 	// 3. 解析成功，存入长效 UID 缓存
@@ -357,7 +367,7 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	}
 	c.gwTargetCacheMu.Unlock()
 
-	return &gwRedirectTarget, false, nil
+	return eipTargetResolution{eipRedirectTarget: &gwRedirectTarget}
 }
 
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
@@ -379,11 +389,6 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
-	type eipTargetResolution struct {
-		eipRedirectTarget *TCRedirectTarget
-		retainStale       bool
-		err               error
-	}
 	eipResolutionCache := make(map[string]eipTargetResolution)
 
 	for _, eip := range eips {
@@ -397,21 +402,16 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
-		var eipRedirectTarget *TCRedirectTarget
-		var retainStale bool
+		var res eipTargetResolution
 		if c.config.EnableTcBpfRedirect {
 			cacheKey := eip.Spec.NatGwDp
-			if cached, ok := eipResolutionCache[cacheKey]; ok {
-				eipRedirectTarget, retainStale = cached.eipRedirectTarget, cached.retainStale
-				if cached.err != nil && eipRedirectTarget == nil {
-					redirectErrors = append(redirectErrors, cached.err)
-				}
-			} else {
-				var err error
-				eipRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale, err: err}
-				if err != nil && eipRedirectTarget == nil {
-					redirectErrors = append(redirectErrors, err)
+			var ok bool
+			if res, ok = eipResolutionCache[cacheKey]; !ok {
+				res = c.resolveEipRedirectTarget(eip)
+				eipResolutionCache[cacheKey] = res
+				// 仅在首次解析网关时记录错误；共享同一网关的后续 EIP 直接复用缓存，避免聚合错误按受影响 EIP 数量被重复放大
+				if res.err != nil && res.eipRedirectTarget == nil {
+					redirectErrors = append(redirectErrors, res.err)
 				}
 			}
 		}
@@ -419,9 +419,9 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if eipRedirectTarget != nil {
-					expectedEipTargets[ip] = *eipRedirectTarget
-				} else if retainStale {
+				if res.usable() {
+					expectedEipTargets[ip] = *res.eipRedirectTarget
+				} else if res.retainStale {
 					retainedEIPs = append(retainedEIPs, ip)
 				}
 			}
