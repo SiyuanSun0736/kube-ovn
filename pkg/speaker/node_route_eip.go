@@ -141,7 +141,6 @@ func (c *Controller) enqueueDeleteNodeRouteEIP(obj any) {
 // This is called when an EIP is deleted, becomes non-ready, loses BGP annotation,
 // or when the NAT gateway pod moves to another node.
 func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
-	var errs []error
 	var withdrawn []string
 	for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 		if ip == "" {
@@ -149,7 +148,7 @@ func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
 		}
 		if c.config.EnableTcBpfRedirect {
 			if err := c.tcManager.DeleteEIP(net.ParseIP(ip)); err != nil {
-				errs = append(errs, err)
+				klog.Errorf("failed to delete EIP %s (%s) from TC BPF map: %v", eip.Name, ip, err)
 			}
 		}
 		if !c.isRouteAnnounced(ip) {
@@ -157,8 +156,7 @@ func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
 			continue
 		}
 		if err := c.delRoute(ip); err != nil {
-			klog.Errorf("failed to withdraw BGP route for EIP %s: %v", ip, err)
-			errs = append(errs, err)
+			klog.Errorf("failed to withdraw BGP route for EIP %s (%s): %v", eip.Name, ip, err)
 		} else {
 			withdrawn = append(withdrawn, ip)
 		}
@@ -166,9 +164,6 @@ func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
 
 	if len(withdrawn) > 0 {
 		klog.Infof("withdrawn BGP routes for iptables-eip %s: %v", eip.Name, withdrawn)
-	}
-	if len(errs) > 0 {
-		klog.Errorf("errors withdrawing BGP routes for EIP %s: %v", eip.Name, errors.Join(errs...))
 	}
 }
 
@@ -382,7 +377,6 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	type eipTargetResolution struct {
 		eipRedirectTarget *TCRedirectTarget
 		retainStale       bool
-		err               error
 	}
 	eipResolutionCache := make(map[string]eipTargetResolution)
 
@@ -403,13 +397,11 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			cacheKey := eip.Spec.NatGwDp
 			if cached, ok := eipResolutionCache[cacheKey]; ok {
 				eipRedirectTarget, retainStale = cached.eipRedirectTarget, cached.retainStale
-				if cached.err != nil && eipRedirectTarget == nil {
-					redirectErrors = append(redirectErrors, cached.err)
-				}
 			} else {
 				var err error
 				eipRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale, err: err}
+				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale}
+				// 仅在首次解析网关时记录错误；共享同一网关的后续 EIP 直接复用缓存，避免聚合错误按受影响 EIP 数量被重复放大 (O6)
 				if err != nil && eipRedirectTarget == nil {
 					redirectErrors = append(redirectErrors, err)
 				}
@@ -459,7 +451,12 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(redirectErrors...))
+	if err := c.reconcileRoutes(expectedPrefixes); err != nil {
+		klog.Errorf("failed to reconcile routes: %v", err)
+		redirectErrors = append(redirectErrors, err)
+	}
+
+	return errors.Join(redirectErrors...)
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.
