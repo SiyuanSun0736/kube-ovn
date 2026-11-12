@@ -20,8 +20,7 @@ Speaker 必须运行在宿主机网络空间（hostNetwork），具备加载 BPF
 未解析或非法的目标会被拒绝，并在全量对账过程中从旁路 Map 中剔除并按需重试。
 支持解析单层（802.1Q/802.1ad）及双层 QinQ VLAN Tag 报文，改写最外层 MAC 并保留 VLAN 封装直通网关 Pod。
 
-`--tc-bpf-map-path` 指定 IPv4 Pinned Map 挂载路径，默认为 `/sys/fs/bpf/kube_ovn_eip_v4_map`。
-IPv6 沿用该路径，将其中的 `_v4_map` 替换为 `_v6_map`（若无此后缀则直接追加 `_v6_map`）。
+IPv4 和 IPv6 Pinned Map 固定使用默认路径 `/sys/fs/bpf/kube_ovn_eip_v4_map` 和 `/sys/fs/bpf/kube_ovn_eip_v6_map`。
 Speaker 仅加载并固化（Pin）当前附加程序实际使用的 Map，不会按名称随意探测其它已存在的 Pinned Map。
 
 TC 过滤器挂载在 Ingress 方向，设置优先级 priority 5（可通过 `--tc-bpf-priority` 自定义，默认 5；预留 1-4 给更高优先级防护）、handle 1，名称为 `kube-ovn-eip`。

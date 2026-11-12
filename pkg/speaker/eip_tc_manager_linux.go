@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -16,10 +15,15 @@ import (
 )
 
 const (
-	tcEIPFilterName       = "kube-ovn-eip"
+	tcEIPFilterName = "kube-ovn-eip"
+	// tcEIPLegacyFilterName 是 tc_eip.o 以旧格式（BPF 对象文件名 + 段名）加载时内核分配的 Filter.Name。
+	// 仅用于升级兼容：isMatchingTCFilter 识别历史遗留规则，以便在 priority 变更时主动清理，避免旧规则与新规则共存。
 	tcEIPLegacyFilterName = "tc_eip.o:[classifier]"
 	tcEIPv4MapName        = "kube_ovn_eip_v4_map"
 	tcEIPv6MapName        = "kube_ovn_eip_v6_map"
+	defaultTcEIPv4MapPath = "/sys/fs/bpf/" + tcEIPv4MapName
+	defaultTcEIPv6MapPath = "/sys/fs/bpf/" + tcEIPv6MapName
+	defaultTcBpfProgPath  = "/etc/kube-ovn/tc_eip.o"
 )
 
 var tcEIPFilterNames = []string{tcEIPFilterName, tcEIPLegacyFilterName}
@@ -49,16 +53,6 @@ func newTCManager(cfg *Configuration) TCManager {
 		cfg = &Configuration{}
 	}
 	return &linuxTCManager{cfg: cfg}
-}
-
-// mapPaths 根据配置的 IPv4 Pinned Map 路径推导，IPv6 Map 为其同级同名映射文件
-func (m *linuxTCManager) mapPaths() (string, string) {
-	v4 := m.cfg.TcBpfMapPath
-	if v4 == "" {
-		v4 = "/sys/fs/bpf/kube_ovn_eip_v4_map"
-	}
-	v6 := strings.TrimSuffix(v4, "_v4_map") + "_v6_map"
-	return v4, v6
 }
 
 func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
@@ -126,7 +120,7 @@ func (m *linuxTCManager) Attach(linkName string) error {
 func (m *linuxTCManager) load() error {
 	path := m.cfg.TcBpfProgPath
 	if path == "" {
-		path = "/etc/kube-ovn/tc_eip.o"
+		path = defaultTcBpfProgPath
 	}
 	spec, err := ebpf.LoadCollectionSpec(path)
 	if err != nil {
@@ -136,8 +130,7 @@ func (m *linuxTCManager) load() error {
 		return errors.New("TC object is missing its EIP classifier or maps")
 	}
 
-	v4Path, v6Path := m.mapPaths()
-	mapPaths := map[string]string{tcEIPv4MapName: v4Path, tcEIPv6MapName: v6Path}
+	mapPaths := map[string]string{tcEIPv4MapName: defaultTcEIPv4MapPath, tcEIPv6MapName: defaultTcEIPv6MapPath}
 	coll, err := loadCollectionWithPinnedMaps(spec, mapPaths)
 	if err != nil {
 		return fmt.Errorf("load TC program: %w", err)
@@ -390,11 +383,10 @@ func (m *linuxTCManager) Clean() error {
 	m.v6Map = nil
 	m.progID = 0
 	m.progTag = ""
-	v4, v6 := m.mapPaths()
-	if err := removeBPFPin(v4); err != nil {
+	if err := removeBPFPin(defaultTcEIPv4MapPath); err != nil {
 		errs = append(errs, err)
 	}
-	if err := removeBPFPin(v6); err != nil {
+	if err := removeBPFPin(defaultTcEIPv6MapPath); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) == 0 {

@@ -301,3 +301,16 @@ func TestTCLoadCollectionWithPinnedMapsMissingMap(t *testing.T) {
 	require.ErrorContains(t, err, "missing_map not found in collection")
 	require.Nil(t, coll)
 }
+
+func testTCPinPath(t *testing.T) string {
+	t.Helper()
+	requireBPFIntegration(t)
+	// bpffs 作用域限定在此一次性测试容器的挂载命名空间内
+	if err := unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
+		require.ErrorIs(t, err, unix.EBUSY)
+	}
+	dir, err := os.MkdirTemp("/sys/fs/bpf", "eip-test-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	return filepath.Join(dir, "eip_v4_map")
+}
