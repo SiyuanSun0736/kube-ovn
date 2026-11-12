@@ -41,6 +41,7 @@ struct eip_target {
     __u8  pad[2];           // 2 字节填充，对齐到 4 字节
     __u32 parent_ifindex;   // macvlan 父设备接口索引（Master ifindex）
 };
+_Static_assert(sizeof(struct eip_target) == 16, "struct eip_target size must be 16 bytes");
 
 // VLAN 报文头结构体（IEEE 802.1Q / 802.1ad，共 4 字节）
 struct vlan_hdr {

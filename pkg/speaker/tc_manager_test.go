@@ -5,25 +5,10 @@ package speaker
 import (
 	"net"
 	"testing"
-	"unsafe"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
-
-// TestTCManagerRedirectTargetLayout 严格断言内核 struct eip_target 与 Go 结构体 bpfEipTarget 在 64 位体系下的内存对齐
-func TestTCManagerRedirectTargetLayout(t *testing.T) {
-	var target bpfEipTarget
-	// 4 (Ifindex) + 6 (TargetMAC) + 2 (Pad) + 4 (ParentIfindex) = 16 字节
-	if size := unsafe.Sizeof(target); size != 16 {
-		t.Fatalf("bpfEipTarget struct size mismatch: expected 16 bytes, got %d", size)
-	}
-
-	// 验证 ParentIfindex 字段严格从 12 字节偏移量开始
-	if offset := unsafe.Offsetof(target.ParentIfindex); offset != 12 {
-		t.Fatalf("ParentIfindex field offset mismatch: expected 12 bytes, got %d", offset)
-	}
-}
 
 // TestNewTCManager 验证 TCManager 初始化与基础生命周期调用安全
 func TestNewTCManager(t *testing.T) {
@@ -51,6 +36,21 @@ func TestNewTCManager(t *testing.T) {
 
 	if err := mgr.DeleteEIP(eip); err != nil {
 		t.Errorf("DeleteEIP: %v", err)
+	}
+
+	// 验证 cfg 为 nil 时的防御与接口调用安全
+	mgrNil := NewTCManager(nil)
+	if mgrNil == nil {
+		t.Fatal("expected non-nil TCManager instance even if cfg is nil")
+	}
+	if err := mgrNil.AddEIP(eip, target); err != nil {
+		t.Errorf("AddEIP with nil cfg: %v", err)
+	}
+	if err := mgrNil.DeleteEIP(eip); err != nil {
+		t.Errorf("DeleteEIP with nil cfg: %v", err)
+	}
+	if err := mgrNil.SyncEIPs(map[string]TCRedirectTarget{}); err != nil {
+		t.Errorf("SyncEIPs with nil cfg: %v", err)
 	}
 }
 

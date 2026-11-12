@@ -19,9 +19,6 @@ type TCManager interface {
 	// Attach 在指定的物理网卡上附加 clsact qdisc 并在 Ingress 钩子上挂载配置优先级的 eBPF TC 分类器
 	Attach(linkName string) error
 
-	// Detach 从指定网卡上卸载 eBPF TC 分类器
-	Detach(linkName string) error
-
 	// AddEIP 向内核 BPF Map (kube_ovn_eip_v4_map / kube_ovn_eip_v6_map) 中原子写入或更新 EIP ➔ 目标网卡重定向条目
 	AddEIP(eip net.IP, target TCRedirectTarget) error
 
@@ -32,10 +29,14 @@ type TCManager interface {
 	// retainedIPs 可选指定当前属于本节点活跃范围、但因 Pod 元数据短暂就绪延迟而需声明式保留存量映射的 EIP 列表。
 	SyncEIPs(expected map[string]TCRedirectTarget, retainedIPs ...string) error
 
-	// Close 关闭并释放已打开的 BPF 文件描述符与相关句柄，但保留内核中的 TC Filter 规则与 Pinned Map 数据面，支持热更新无损重启
+	// Close 仅释放用户态内存对象与 Map/Prog 的本地 FD 句柄，保留内核态已挂载的 Filter 与 Pinned Map。
+	// 专为 Speaker 进程重启 / 热更新设计，实现数据面 0 丢包。
+	// See also: Clean()
 	Close() error
 
-	// Clean 彻底清理内核中的 TC Filter 挂载与 Pinned Map（通常在显式停用该特性时调用）
+	// Clean 彻底销毁网卡 TC 过滤器并移除 Pinned Map 文件（仅在节点下线或功能彻底禁用时调用）。
+	// 警告：此操作具有破坏性，会导致数据面直通中断，不可用于平滑热重启。
+	// See also: Close()
 	Clean() error
 }
 
