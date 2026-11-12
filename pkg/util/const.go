@@ -52,7 +52,8 @@ const (
 	VpcEipAnnotation                        = "ovn.kubernetes.io/vpc_eip"
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
-	NatGatewayDataplaneModeAnnotation       = "ovn.kubernetes.io/nat-dataplane-mode"
+	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
+	NatGatewayDataplaneModeAnnotation       = VpcNatGatewayDataplaneModeAnnotation
 	VpcNatTCPConnLimitAnnotation            = "ovn.kubernetes.io/tcp-connlimit"
 	VpcNatSynRateLimitAnnotation            = "ovn.kubernetes.io/tcp-syn-ratelimit"
 	VpcNatSynBurstLimitAnnotation           = "ovn.kubernetes.io/tcp-syn-burstlimit"
