@@ -3,6 +3,7 @@
 package speaker
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -27,6 +28,16 @@ func requireBPFIntegration(t *testing.T) {
 	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
 		t.Skip("requires an isolated privileged Linux network namespace")
 	}
+}
+
+func requireBPFObject(t *testing.T) string {
+	t.Helper()
+	requireBPFIntegration(t)
+	path := os.Getenv("KUBE_OVN_BPF_OBJECT")
+	if path == "" {
+		t.Skip("requires KUBE_OVN_BPF_OBJECT environment variable pointing to compiled tc_eip.o")
+	}
+	return path
 }
 
 // newTestTCManager 构建测试专用的 linuxTCManager 实例并注入预设大小的 BPF Hash Map。
@@ -86,9 +97,7 @@ func TestTCAttachMissingObject(t *testing.T) {
 }
 
 func TestTCNonEIPContinuesClassification(t *testing.T) {
-	requireBPFIntegration(t)
-	path := os.Getenv("KUBE_OVN_BPF_OBJECT")
-	require.NotEmpty(t, path)
+	path := requireBPFObject(t)
 	spec, err := ebpf.LoadCollectionSpec(path)
 	require.NoError(t, err)
 	for _, m := range spec.Maps {
@@ -139,14 +148,20 @@ func testTCPinPath(t *testing.T) string {
 }
 
 func TestTCRetryRestartAndDisable(t *testing.T) {
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eip-retry0"}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { require.NoError(t, netlink.LinkDel(link)) })
-	cfg := &Configuration{EnableTcBpfRedirect: true, TcBpfProgPath: "/missing.o", TcBpfMapPath: pin}
+	cfg := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link.Name,
+		TcBpfProgPath:       "/missing.o",
+		TcBpfMapPath:        pin,
+	}
 	m := NewTCManager(cfg)
 	require.Error(t, m.Attach(link.Name))
-	cfg.TcBpfProgPath = os.Getenv("KUBE_OVN_BPF_OBJECT")
+	cfg.TcBpfProgPath = bpfObj
 	require.NoError(t, m.Attach(link.Name), "retry must load the object after it becomes available")
 	require.NoError(t, m.Attach(link.Name), "attachment must be idempotent")
 	ip := net.ParseIP("2001:db8::1")
@@ -164,7 +179,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	foreign := &netlink.MatchAll{FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Index, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 2, Priority: 10, Protocol: unix.ETH_P_ALL}}
 	require.NoError(t, netlink.FilterAdd(foreign))
 	disabled := NewTCManager(&Configuration{TcBpfMapPath: pin})
-	require.NoError(t, disabled.Close())
+	require.NoError(t, disabled.Clean())
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
@@ -220,6 +235,7 @@ func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
 }
 
 func TestTCMacvlanDelivery(t *testing.T) {
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	run := func(command string) {
 		t.Helper()
@@ -250,7 +266,7 @@ ip -n eip-outside link set lo up
 ip -n eip-outside link set eip-external up
 ip -n eip-outside addr add 198.18.0.3/24 dev eip-external
 ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
-	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfProgPath: os.Getenv("KUBE_OVN_BPF_OBJECT"), TcBpfMapPath: pin})
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: bpfObj, TcBpfMapPath: pin})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	require.NoError(t, m.Attach("eip-uplink"))
 	host, err := netlink.LinkByName("eip-host")
@@ -264,7 +280,7 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 }
 
 func TestTCPriorityMigrationAndCleanup(t *testing.T) {
-	requireBPFIntegration(t)
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-prio-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(link))
@@ -273,23 +289,29 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	// 1. 模拟旧实例：使用 Priority 5 挂载
 	cfg1 := &Configuration{
 		EnableTcBpfRedirect: true,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfInterface:      link.Name,
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       5,
 	}
 	m1 := NewTCManager(cfg1)
 	require.NoError(t, m1.Attach(link.Name))
 
-	// 验证 Priority 5 过滤器已就绪
+	// 验证 Priority 5 过滤器已就绪，并显式重命名为历史版本命名 "tc_eip.o:[classifier]"，模拟 B1 场景（跨 Priority 与旧规则名迁移）
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
-	require.Equal(t, uint16(5), filters[0].Attrs().Priority)
+	oldFilter := filters[0].(*netlink.BpfFilter)
+	require.Equal(t, uint16(5), oldFilter.Attrs().Priority)
+	oldFilter.Name = "tc_eip.o:[classifier]"
+	oldFilter.Fd = m1.(*linuxTCManager).collection.Programs["tc_eip_ingress"].FD()
+	require.NoError(t, netlink.FilterReplace(oldFilter))
 
 	// 2. 模拟运维调整 priority 为 7 并重启新实例
 	cfg2 := &Configuration{
 		EnableTcBpfRedirect: true,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfInterface:      link.Name,
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       7,
 	}
@@ -316,7 +338,22 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	require.True(t, foundPrio7, "必须成功挂载新 Priority 7 规则")
 	require.True(t, foundPrio10, "必须保留第三方 Priority 10 规则")
 
-	// 4. 模拟停用功能执行 Clean()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
+	// 4. 模拟外部异常或误删导致内核 Filter 丢失，验证显式 Attach() 能够绕过 attachedDev 内存缓存自愈恢复
+	for _, f := range filters {
+		if f.Attrs().Priority == 7 {
+			require.NoError(t, netlink.FilterDel(f))
+		}
+	}
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 1, "删除后应仅剩第三方规则")
+
+	require.NoError(t, m2.Attach(link.Name))
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 2, "显式 Attach 必须能够成功自愈恢复被删除的 Filter")
+
+	// 5. 模拟停用功能执行 Clean()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
 	require.NoError(t, m2.Clean())
 	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
@@ -325,15 +362,16 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 }
 
 func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
-	requireBPFIntegration(t)
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
-	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-reload-%d", time.Now().UnixNano()%100000)}}
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-rl-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { _ = netlink.LinkDel(link) })
 
 	cfg := &Configuration{
 		EnableTcBpfRedirect: true,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfInterface:      link.Name,
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 	}
 
@@ -366,4 +404,162 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	require.Empty(t, filters, "TC filter must be removed after Clean")
 	_, err = os.Stat(pin)
 	require.True(t, os.IsNotExist(err), "pinned map must be removed after Clean")
+}
+
+func TestTCSyncEmptyUninitialized(t *testing.T) {
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "isolated-dummy0"})
+	// 未初始化且无期望 EIP，SyncEIPs 应安全返回 nil 而不报错 "EIP BPF maps are not loaded"
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}))
+	require.NoError(t, m.SyncEIPs(nil))
+}
+
+func TestBPFEipTargetMemoryLayout(t *testing.T) {
+	var target bpfEipTarget
+
+	// 1. 结构体总体大小必须严格为 16 字节，保证与 tc_eip.c 中的 struct eip_target 二进制对齐
+	require.Equal(t, uintptr(16), unsafe.Sizeof(target), "bpfEipTarget total size mismatch with C struct eip_target")
+
+	// 2. 字段偏移严格对齐
+	require.Equal(t, uintptr(0), unsafe.Offsetof(target.Ifindex), "Ifindex offset mismatch")
+	require.Equal(t, uintptr(4), unsafe.Offsetof(target.TargetMAC), "TargetMAC offset mismatch")
+	require.Equal(t, uintptr(10), unsafe.Offsetof(target.Pad), "Pad offset mismatch")
+	require.Equal(t, uintptr(12), unsafe.Offsetof(target.ParentIfindex), "ParentIfindex offset mismatch")
+}
+
+func TestTCDeleteEIPUninitialized(t *testing.T) {
+	origOps := netlinkOps
+	netlinkOps = &mockTCNetlinkOps{
+		linkByNameFunc: func(_ string) (netlink.Link, error) {
+			return nil, errors.New("isolated link not found")
+		},
+	}
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	m := NewTCManager(&Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      "isolated-dummy0",
+		TcBpfProgPath:       "/nonexistent/tc_eip.o",
+		TcBpfMapPath:        "/sys/fs/bpf/kube-ovn-isolated-test-nonexistent",
+	})
+	// 未加载 Map 且延迟挂载失败时，必须透出真实的网卡/挂载错误与原始状态，不能掩盖失败原因或误报成功。
+	errV4 := m.DeleteEIP(net.ParseIP("1.2.3.4"))
+	require.ErrorContains(t, errV4, "ensure TC attached for delete: isolated link not found")
+	require.ErrorContains(t, errV4, "EIP BPF maps are not loaded")
+
+	errV6 := m.DeleteEIP(net.ParseIP("2001:db8::1"))
+	require.ErrorContains(t, errV6, "ensure TC attached for delete: isolated link not found")
+	require.ErrorContains(t, errV6, "EIP BPF maps are not loaded")
+}
+
+func TestTCCleanMarksClosed(t *testing.T) {
+	// Only exercise the manager state machine; never enumerate or delete real TC filters.
+	origOps := netlinkOps
+	netlinkOps = &mockTCNetlinkOps{}
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	tmpDir := t.TempDir()
+	m := NewTCManager(&Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      "bond0",
+		TcBpfMapPath:        filepath.Join(tmpDir, "v4_map"),
+	}).(*linuxTCManager)
+	require.NoError(t, m.Clean())
+	require.True(t, m.closed)
+
+	// Clean 之后，数据面写入操作必须明确返回 closed 错误
+	ip := net.ParseIP("1.2.3.4")
+	require.ErrorContains(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 1}), "TC manager is closed")
+	require.ErrorContains(t, m.DeleteEIP(ip), "TC manager is closed")
+	require.ErrorContains(t, m.SyncEIPs(map[string]TCRedirectTarget{}), "TC manager is closed")
+	require.ErrorContains(t, m.Attach("bond0"), "TC manager is closed")
+
+	// 但 Clean 自身仍可幂等调用支持重试
+	require.NoError(t, m.Clean())
+}
+
+func TestTCDataOpsAfterClose(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			m := NewTCManager(&Configuration{EnableTcBpfRedirect: enabled})
+			require.NoError(t, m.Close())
+			ip := net.ParseIP("1.2.3.4")
+			require.ErrorContains(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 1}), "TC manager is closed")
+			require.ErrorContains(t, m.DeleteEIP(ip), "TC manager is closed")
+			require.ErrorContains(t, m.SyncEIPs(map[string]TCRedirectTarget{}), "TC manager is closed")
+		})
+	}
+}
+
+func TestTCCleanupFiltersSpecificLink(t *testing.T) {
+	origOps := netlinkOps
+	defer func() { netlinkOps = origOps }()
+
+	mock := &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			if name == "eth0" {
+				return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "eth0"}}, nil
+			}
+			return nil, errors.New("not found")
+		},
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+
+	m := &linuxTCManager{}
+	err := m.cleanupFilters("eth0")
+	require.NoError(t, err)
+	require.Len(t, mock.deletedFilters, 1)
+	require.Equal(t, 10, mock.deletedFilters[0].Attrs().LinkIndex)
+}
+
+func TestTCManagerAttachUsesNetlinkOps(t *testing.T) {
+	origOps := netlinkOps
+	var queriedLink string
+	mock := &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			queriedLink = name
+			return nil, errors.New("link not found by mock ops")
+		},
+	}
+	netlinkOps = mock
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "test-bond"}).(*linuxTCManager)
+	err := m.Attach("test-bond")
+	require.ErrorContains(t, err, "link not found by mock ops")
+	require.Equal(t, "test-bond", queriedLink)
+}
+
+func TestTCManagerOpsLinkByIndex(t *testing.T) {
+	origOps := netlinkOps
+	var queriedIndex int
+	mock := &mockTCNetlinkOps{
+		linkByIndexFunc: func(index int) (netlink.Link, error) {
+			queriedIndex = index
+			return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: index, Name: "dummy-test"}}, nil
+		},
+	}
+	netlinkOps = mock
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	m, v4, _ := newTestTCManager(t)
+	ip := net.ParseIP("192.0.2.1")
+	target := TCRedirectTarget{TargetIfindex: 42, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
+	require.NoError(t, m.addEIP(ip, target))
+
+	// 调用 SyncEIPs 传入 retainedIPs，存量 IP 应通过 netlinkOps.LinkByIndex 校验网卡存活性
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}, ip.String()))
+	require.Equal(t, 42, queriedIndex)
+
+	var found bpfEipTarget
+	require.NoError(t, v4.Lookup(ip.To4(), &found))
+	require.Equal(t, uint32(42), found.Ifindex)
 }
