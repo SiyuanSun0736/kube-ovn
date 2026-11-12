@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	tcEIPFilterName       = "kube-ovn-eip"
+	tcEIPFilterName = "kube-ovn-eip"
+	// tcEIPLegacyFilterName 是 tc_eip.o 以旧格式（BPF 对象文件名 + 段名）加载时内核分配的 Filter.Name。
+	// 仅用于升级兼容：isMatchingTCFilter 识别历史遗留规则，以便在 priority 变更时主动清理，避免旧规则与新规则共存。
 	tcEIPLegacyFilterName = "tc_eip.o:[classifier]"
 	tcEIPv4MapName        = "kube_ovn_eip_v4_map"
 	tcEIPv6MapName        = "kube_ovn_eip_v6_map"
@@ -129,7 +131,7 @@ func (m *linuxTCManager) Attach(linkName string) error {
 func (m *linuxTCManager) load() error {
 	path := m.cfg.TcBpfProgPath
 	if path == "" {
-		path = "/etc/kube-ovn/tc_eip.o"
+		path = defaultTcBpfProgPath
 	}
 	spec, err := ebpf.LoadCollectionSpec(path)
 	if err != nil {
