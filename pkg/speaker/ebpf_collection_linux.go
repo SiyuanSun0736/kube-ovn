@@ -52,36 +52,36 @@ func pruneBPFHashMap(targetMap *ebpf.Map, wanted map[string]bool) error {
 	return nil
 }
 
-type bpfPinOps interface {
+type bpfMapPinOps interface {
 	MkdirAll(path string, perm os.FileMode) error
 	Pin(m *ebpf.Map, path string) error
 	Rename(oldpath, newpath string) error
 	Remove(path string) error
 }
 
-type defaultBPFPinOps struct{}
+type defaultBPFMapPinOps struct{}
 
-func (defaultBPFPinOps) MkdirAll(path string, perm os.FileMode) error {
+func (defaultBPFMapPinOps) MkdirAll(path string, perm os.FileMode) error {
 	return os.MkdirAll(path, perm)
 }
 
-func (defaultBPFPinOps) Pin(m *ebpf.Map, path string) error {
+func (defaultBPFMapPinOps) Pin(m *ebpf.Map, path string) error {
 	return m.Pin(path)
 }
 
-func (defaultBPFPinOps) Rename(oldpath, newpath string) error {
+func (defaultBPFMapPinOps) Rename(oldpath, newpath string) error {
 	return os.Rename(oldpath, newpath)
 }
 
-func (defaultBPFPinOps) Remove(path string) error {
+func (defaultBPFMapPinOps) Remove(path string) error {
 	return os.Remove(path)
 }
 
-var pinOps bpfPinOps = defaultBPFPinOps{}
+var mapPinOps bpfMapPinOps = defaultBPFMapPinOps{}
 
 // removeBPFPin 安全清理 Pinned Map 文件。
 func removeBPFPin(path string) error {
-	if err := pinOps.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := mapPinOps.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -150,7 +150,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		if reused[name] {
 			continue
 		}
-		if err = pinOps.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err = mapPinOps.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			cleanupTmp()
 			coll.Close()
 			return nil, fmt.Errorf("create map dir %s: %w", filepath.Dir(path), err)
@@ -164,7 +164,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		// bpffs 保留含点的文件名，使用不含点的后缀避免 Pin 返回 EPERM。
 		tmpPath := path + "_tmp"
 		_ = removeBPFPin(tmpPath)
-		if err = pinOps.Pin(targetMap, tmpPath); err != nil {
+		if err = mapPinOps.Pin(targetMap, tmpPath); err != nil {
 			_ = removeBPFPin(tmpPath)
 			cleanupTmp()
 			coll.Close()
@@ -179,7 +179,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	// 已成功覆盖的目标路径无法回滚至旧 Pin 文件。鉴于所有待重命名文件均位于同一 bpffs 挂载点内且权限目录均已验证就绪，
 	// 内核 VFS rename(2) 操作在同文件系统内失败概率极低，此两阶段设计可在极小复杂度下杜绝绝大多数中间态。
 	for _, p := range pending {
-		if err = pinOps.Rename(p.tmpPath, p.dstPath); err != nil {
+		if err = mapPinOps.Rename(p.tmpPath, p.dstPath); err != nil {
 			cleanupTmp()
 			coll.Close()
 			return nil, fmt.Errorf("atomic swap pinned map %s: %w", p.dstPath, err)

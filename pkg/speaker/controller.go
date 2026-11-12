@@ -27,8 +27,8 @@ import (
 const controllerAgentName = "ovn-speaker"
 
 type gwTargetCacheEntry struct {
-	podUID types.UID
-	target TCRedirectTarget
+	podUID           types.UID
+	gwRedirectTarget TCRedirectTarget
 }
 
 type Controller struct {
