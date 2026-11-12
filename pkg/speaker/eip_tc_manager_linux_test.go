@@ -8,8 +8,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -134,22 +132,18 @@ func TestTCNonEIPContinuesClassification(t *testing.T) {
 	}
 }
 
-func testTCPinPath(t *testing.T) string {
+// prepareTCPinPaths mounts a fresh bpffs in the isolated test container so fixed
+// production paths never reuse or remove maps from an existing mount.
+func prepareTCPinPaths(t *testing.T) {
 	t.Helper()
 	requireBPFIntegration(t)
-	// bpffs 作用域限定在此一次性测试容器的挂载命名空间内
-	if err := unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
-		require.ErrorIs(t, err, unix.EBUSY)
-	}
-	dir, err := os.MkdirTemp("/sys/fs/bpf", "eip-test-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-	return filepath.Join(dir, "eip_v4_map")
+	require.NoError(t, unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""))
+	t.Cleanup(func() { require.NoError(t, unix.Unmount("/sys/fs/bpf", 0)) })
 }
 
 func TestTCRetryRestartAndDisable(t *testing.T) {
 	bpfObj := requireBPFObject(t)
-	pin := testTCPinPath(t)
+	prepareTCPinPaths(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eip-retry0"}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { require.NoError(t, netlink.LinkDel(link)) })
@@ -157,7 +151,6 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       "/missing.o",
-		TcBpfMapPath:        pin,
 	}
 	m := NewTCManager(cfg)
 	require.Error(t, m.Attach(link.Name))
@@ -170,7 +163,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	restarted := NewTCManager(cfg)
 	require.NoError(t, restarted.Attach(link.Name))
 	require.NoError(t, restarted.SyncEIPs(map[string]TCRedirectTarget{}))
-	v6, err := ebpf.LoadPinnedMap(strings.TrimSuffix(pin, "_v4_map")+"_v6_map", nil)
+	v6, err := ebpf.LoadPinnedMap(defaultTcEIPv6MapPath, nil)
 	require.NoError(t, err)
 	var value bpfEipTarget
 	require.ErrorIs(t, v6.Lookup(ip.To16(), &value), ebpf.ErrKeyNotExist)
@@ -178,13 +171,13 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	// 停用 EIP 旁路时，必须保留挂载在其他 priority 上的无关过滤器
 	foreign := &netlink.MatchAll{FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Index, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 2, Priority: 10, Protocol: unix.ETH_P_ALL}}
 	require.NoError(t, netlink.FilterAdd(foreign))
-	disabled := NewTCManager(&Configuration{TcBpfMapPath: pin})
+	disabled := NewTCManager(&Configuration{})
 	require.NoError(t, disabled.Clean())
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
 	require.Equal(t, uint16(10), filters[0].Attrs().Priority)
-	_, err = os.Stat(pin)
+	_, err = os.Stat(defaultTcEIPv4MapPath)
 	require.ErrorIs(t, err, os.ErrNotExist)
 	require.NoError(t, restarted.Close())
 	require.NoError(t, m.Close())
@@ -236,7 +229,7 @@ func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
 
 func TestTCMacvlanDelivery(t *testing.T) {
 	bpfObj := requireBPFObject(t)
-	pin := testTCPinPath(t)
+	prepareTCPinPaths(t)
 	run := func(command string) {
 		t.Helper()
 		output, err := exec.Command("sh", "-ec", command).CombinedOutput()
@@ -266,7 +259,7 @@ ip -n eip-outside link set lo up
 ip -n eip-outside link set eip-external up
 ip -n eip-outside addr add 198.18.0.3/24 dev eip-external
 ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
-	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: bpfObj, TcBpfMapPath: pin})
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: bpfObj})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	require.NoError(t, m.Attach("eip-uplink"))
 	host, err := netlink.LinkByName("eip-host")
@@ -281,7 +274,7 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 
 func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	bpfObj := requireBPFObject(t)
-	pin := testTCPinPath(t)
+	prepareTCPinPaths(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-prio-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { _ = netlink.LinkDel(link) })
@@ -291,7 +284,6 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       bpfObj,
-		TcBpfMapPath:        pin,
 		TcBpfPriority:       5,
 	}
 	m1 := NewTCManager(cfg1)
@@ -312,7 +304,6 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       bpfObj,
-		TcBpfMapPath:        pin,
 		TcBpfPriority:       7,
 	}
 	m2 := NewTCManager(cfg2)
@@ -363,7 +354,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 
 func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	bpfObj := requireBPFObject(t)
-	pin := testTCPinPath(t)
+	prepareTCPinPaths(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-reload-%d", time.Now().UnixNano()%10000)}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { _ = netlink.LinkDel(link) })
@@ -372,7 +363,6 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
 		TcBpfProgPath:       bpfObj,
-		TcBpfMapPath:        pin,
 	}
 
 	// 1. 启动第一代实例并写入条目
@@ -402,7 +392,7 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Empty(t, filters, "TC filter must be removed after Clean")
-	_, err = os.Stat(pin)
+	_, err = os.Stat(defaultTcEIPv4MapPath)
 	require.True(t, os.IsNotExist(err), "pinned map must be removed after Clean")
 }
 
@@ -439,7 +429,6 @@ func TestTCDeleteEIPUninitialized(t *testing.T) {
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      "isolated-dummy0",
 		TcBpfProgPath:       "/nonexistent/tc_eip.o",
-		TcBpfMapPath:        "/sys/fs/bpf/kube-ovn-isolated-test-nonexistent",
 	})
 	// 未加载 Map 且延迟挂载失败时，必须透出真实的网卡/挂载错误与原始状态，不能掩盖失败原因或误报成功。
 	errV4 := m.DeleteEIP(net.ParseIP("1.2.3.4"))
@@ -457,11 +446,10 @@ func TestTCCleanMarksClosed(t *testing.T) {
 	netlinkOps = &mockTCNetlinkOps{}
 	t.Cleanup(func() { netlinkOps = origOps })
 
-	tmpDir := t.TempDir()
+	prepareTCPinPaths(t)
 	m := NewTCManager(&Configuration{
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      "bond0",
-		TcBpfMapPath:        filepath.Join(tmpDir, "v4_map"),
 	}).(*linuxTCManager)
 	require.NoError(t, m.Clean())
 	require.True(t, m.closed)

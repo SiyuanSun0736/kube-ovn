@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -54,16 +53,6 @@ func newTCManager(cfg *Configuration) TCManager {
 		cfg = &Configuration{}
 	}
 	return &linuxTCManager{cfg: cfg}
-}
-
-// mapPaths 返回 IPv4 和 IPv6 Pinned Map 路径。
-func (m *linuxTCManager) mapPaths() (string, string) {
-	if m.cfg.TcBpfMapPath == "" || m.cfg.TcBpfMapPath == defaultTcEIPv4MapPath {
-		return defaultTcEIPv4MapPath, defaultTcEIPv6MapPath
-	}
-	v4 := m.cfg.TcBpfMapPath
-	v6 := strings.TrimSuffix(v4, tcEIPv4MapName) + tcEIPv6MapName
-	return v4, v6
 }
 
 func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
@@ -141,8 +130,7 @@ func (m *linuxTCManager) load() error {
 		return errors.New("TC object is missing its EIP classifier or maps")
 	}
 
-	v4Path, v6Path := m.mapPaths()
-	mapPaths := map[string]string{tcEIPv4MapName: v4Path, tcEIPv6MapName: v6Path}
+	mapPaths := map[string]string{tcEIPv4MapName: defaultTcEIPv4MapPath, tcEIPv6MapName: defaultTcEIPv6MapPath}
 	coll, err := loadCollectionWithPinnedMaps(spec, mapPaths)
 	if err != nil {
 		return fmt.Errorf("load TC program: %w", err)
@@ -395,11 +383,10 @@ func (m *linuxTCManager) Clean() error {
 	m.v6Map = nil
 	m.progID = 0
 	m.progTag = ""
-	v4, v6 := m.mapPaths()
-	if err := removeBPFPin(v4); err != nil {
+	if err := removeBPFPin(defaultTcEIPv4MapPath); err != nil {
 		errs = append(errs, err)
 	}
-	if err := removeBPFPin(v6); err != nil {
+	if err := removeBPFPin(defaultTcEIPv6MapPath); err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) == 0 {
