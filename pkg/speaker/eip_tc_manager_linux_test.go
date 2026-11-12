@@ -364,7 +364,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
-	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-rl-%d", time.Now().UnixNano()%100000)}}
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-reload-%d", time.Now().UnixNano()%10000)}}
 	require.NoError(t, netlink.LinkAdd(link))
 	t.Cleanup(func() { _ = netlink.LinkDel(link) })
 
