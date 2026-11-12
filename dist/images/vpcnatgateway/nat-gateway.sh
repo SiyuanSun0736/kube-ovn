@@ -579,7 +579,7 @@ function apply_nft_connlimit() {
 function tcp_connlimit_set() {
     local limit=$1
     local mode=$2
-    local backend=${LIMITER_BACKEND:-"auto"}
+    local backend=${TCP_LIMITER_BACKEND:-"auto"}
 
     check_inited
 
@@ -634,7 +634,7 @@ function tcp_connlimit_set() {
             return 1
             ;;
         *)
-            echo "Error: invalid LIMITER_BACKEND '$backend' (expected auto|nft|iptables)" >&2
+            echo "Error: invalid TCP_LIMITER_BACKEND '$backend' (expected auto|nft|iptables)" >&2
             return 1
             ;;
     esac
@@ -702,7 +702,7 @@ function apply_iptables_syn_limit() {
     local dst_rate=$6
     local dst_burst=$7
     local dst_htable_expire=$8
-    local htable_max=$9
+    local src_htable_max=$9
     local dst_htable_max=${10}
 
     [ -z "$iptables_cmd" ] && return 1
@@ -721,7 +721,7 @@ function apply_iptables_syn_limit() {
             --hashlimit-burst "$src_burst" \
             --hashlimit-mode srcip \
             --hashlimit-name vpc_syn_src \
-            --hashlimit-htable-max "$htable_max" \
+            --hashlimit-htable-max "$src_htable_max" \
             --hashlimit-htable-expire "$src_htable_expire" \
             -j DROP; then
             echo "Failed to install iptables VPC_SYN_LIMIT source rate limit rule" >&2
@@ -759,7 +759,7 @@ function apply_nft_syn_limit() {
     local nft_dst_rate=$6
     local dst_burst=$7
     local dst_htable_expire=$8
-    local htable_max=$9
+    local src_htable_max=$9
     local dst_htable_max=${10}
 
     [ -z "$nft_cmd" ] && return 1
@@ -781,7 +781,7 @@ function apply_nft_syn_limit() {
     if [ "$src_enabled" -eq 1 ]; then
         local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
         [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
-        tx_cmds=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $htable_max; timeout ${src_expire_sec}s; }" "${tx_cmds[@]}")
+        tx_cmds=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }" "${tx_cmds[@]}")
     fi
     if [ "$dst_enabled" -eq 1 ]; then
         local dst_expire_sec=$(( (dst_htable_expire + 999) / 1000 ))
@@ -813,13 +813,13 @@ function apply_nft_syn_limit() {
 }
 
 function tcp_syn_limit_set() {
-    local src_rate=${1:-${SYN_SRC_RATE:-"1000/s"}}
-    local src_burst=${2:-${SYN_SRC_BURST:-"2000"}}
-    local dst_rate=${3:-${SYN_DST_RATE:-"20000/s"}}
-    local dst_burst=${4:-${SYN_DST_BURST:-"40000"}}
-    local backend=${LIMITER_BACKEND:-"auto"}
+    local src_rate=${1:-${TCP_SYN_SRC_RATE:-"1000/s"}}
+    local src_burst=${2:-${TCP_SYN_SRC_BURST:-"2000"}}
+    local dst_rate=${3:-${TCP_SYN_DST_RATE:-"20000/s"}}
+    local dst_burst=${4:-${TCP_SYN_DST_BURST:-"40000"}}
+    local backend=${TCP_LIMITER_BACKEND:-"auto"}
     # 底层哈希桶容量与动态老化窗口 (无需外部传参)
-    local htable_max=262144
+    local src_htable_max=262144
     local dst_htable_max=2048
 
     check_inited
@@ -886,29 +886,29 @@ function tcp_syn_limit_set() {
     # Single-backend enforcement: prefer nftables, fall back to iptables when nft is unavailable or fails
     case "$backend" in
         iptables)
-            apply_iptables_syn_limit "$src_enabled" "$src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$dst_rate" "$dst_burst" "$dst_htable_expire" "$htable_max" "$dst_htable_max"
+            apply_iptables_syn_limit "$src_enabled" "$src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"
             return $?
             ;;
         nft)
-            apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$htable_max" "$dst_htable_max"
+            apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"
             return $?
             ;;
         auto)
             if [ -n "$nft_cmd" ]; then
-                if apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$htable_max" "$dst_htable_max"; then
+                if apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"; then
                     return 0
                 fi
                 echo "Warning: nftables syn-limit failed, falling back to iptables" >&2
             fi
             if [ -n "$iptables_cmd" ]; then
-                apply_iptables_syn_limit "$src_enabled" "$src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$dst_rate" "$dst_burst" "$dst_htable_expire" "$htable_max" "$dst_htable_max"
+                apply_iptables_syn_limit "$src_enabled" "$src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"
                 return $?
             fi
             echo "Error: neither nft nor iptables is available for tcp_syn_limit_set" >&2
             return 1
             ;;
         *)
-            echo "Error: invalid LIMITER_BACKEND '$backend' (expected auto|nft|iptables)" >&2
+            echo "Error: invalid TCP_LIMITER_BACKEND '$backend' (expected auto|nft|iptables)" >&2
             return 1
             ;;
     esac

@@ -343,28 +343,28 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 	return util.DefaultNatGwTCPConnLimit
 }
 
-func (c *Controller) getNatGwSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
-	srcRate := util.DefaultNatGwSynSrcRate
-	srcBurst := util.DefaultNatGwSynSrcBurst
-	dstRate := util.DefaultNatGwSynDstRate
-	dstBurst := util.DefaultNatGwSynDstBurst
+func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
+	srcRate := util.DefaultNatGwTCPSynSrcRate
+	srcBurst := util.DefaultNatGwTCPSynSrcBurst
+	dstRate := util.DefaultNatGwTCPSynDstRate
+	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
-	for _, key := range []string{util.VpcNatSynRateLimitAnnotation, util.VpcNatSynSrcRateLimitAnnotation} {
+	for _, key := range []string{util.VpcNatTCPSynRateLimitAnnotation, util.VpcNatTCPSynSrcRateLimitAnnotation} {
 		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
 			srcRate = strings.TrimSpace(val)
 			break
 		}
 	}
-	for _, key := range []string{util.VpcNatSynBurstLimitAnnotation, util.VpcNatSynSrcBurstLimitAnnotation} {
+	for _, key := range []string{util.VpcNatTCPSynBurstLimitAnnotation, util.VpcNatTCPSynSrcBurstLimitAnnotation} {
 		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
 			srcBurst = strings.TrimSpace(val)
 			break
 		}
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
 		dstRate = strings.TrimSpace(val)
 	}
-	if val, ok := gw.Annotations[util.VpcNatSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+	if val, ok := gw.Annotations[util.VpcNatTCPSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
 		dstBurst = strings.TrimSpace(val)
 	}
 
@@ -460,7 +460,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	}
 
 	patch := util.KVPatch{
-		util.VpcNatTCPConnLimitAnnotation:          strconv.Itoa(effectiveLimit),
+		util.VpcNatTCPConnLimitAnnotation:         strconv.Itoa(effectiveLimit),
 		util.VpcNatGatewayDataplaneModeAnnotation: dataplaneMode,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
@@ -471,15 +471,15 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	return c.patchNatGwTCPConnLimitStatus(gw.Name, effectiveLimit)
 }
 
-func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
-	if pod.Annotations != nil && pod.Annotations[util.VpcNatSynRateLimitAnnotation] == tcpSynLimitUnsupported {
+func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
+	if pod.Annotations != nil && pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation] == tcpSynLimitUnsupported {
 		return nil
 	}
 
-	args := c.getNatGwSynRateLimitArgs(gw)
-	desiredKey := strings.Join(args, ",")
+	args := c.getNatGwTCPSynRateLimitArgs(gw)
+	desiredState := strings.Join(args, ",")
 
-	if !force && pod.Annotations != nil && pod.Annotations[util.VpcNatSynRateLimitAnnotation] == desiredKey {
+	if !force && pod.Annotations != nil && pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation] == desiredState {
 		return nil
 	}
 
@@ -487,7 +487,7 @@ func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		if isUnsupportedCommandError(err, natGwTCPSynLimitSet) {
 			klog.Warningf("nat gw %s runs a script without %s: SYN rate limit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTCPSynLimitSet, err)
 			if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-				util.VpcNatSynRateLimitAnnotation: tcpSynLimitUnsupported,
+				util.VpcNatTCPSynLimitStateAnnotation: tcpSynLimitUnsupported,
 			}); patchErr != nil {
 				klog.Errorf("failed to patch pod %s/%s unsupported syn limit annotation: %v", pod.Namespace, pod.Name, patchErr)
 			}
@@ -498,7 +498,7 @@ func (c *Controller) syncNatGwSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	}
 
 	patch := util.KVPatch{
-		util.VpcNatSynRateLimitAnnotation: desiredKey,
+		util.VpcNatTCPSynLimitStateAnnotation: desiredState,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
 		klog.Errorf("failed to patch pod %s/%s annotations for tcp syn limit: %v", pod.Namespace, pod.Name, err)
@@ -707,7 +707,7 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 			if err = c.syncNatGwTCPConnLimit(gw, pod, false); err != nil {
 				return err
 			}
-			if err = c.syncNatGwSynRateLimit(gw, pod, false); err != nil {
+			if err = c.syncNatGwTCPSynRateLimit(gw, pod, false); err != nil {
 				return err
 			}
 		}
@@ -859,7 +859,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
-	if err = c.syncNatGwSynRateLimit(gw, pod, true); err != nil {
+	if err = c.syncNatGwTCPSynRateLimit(gw, pod, true); err != nil {
 		err = fmt.Errorf("failed to set tcp syn limit during init for nat gw %s: %w", key, err)
 		klog.Error(err)
 		return err

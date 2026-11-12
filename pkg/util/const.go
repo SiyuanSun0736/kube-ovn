@@ -53,18 +53,20 @@ const (
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
-	NatGatewayDataplaneModeAnnotation       = VpcNatGatewayDataplaneModeAnnotation
 	VpcNatTCPConnLimitAnnotation            = "ovn.kubernetes.io/tcp-connlimit"
-	VpcNatSynRateLimitAnnotation            = "ovn.kubernetes.io/tcp-syn-ratelimit"
-	VpcNatSynBurstLimitAnnotation           = "ovn.kubernetes.io/tcp-syn-burstlimit"
-	VpcNatSynSrcRateLimitAnnotation         = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
-	VpcNatSynSrcBurstLimitAnnotation        = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
-	VpcNatSynDstRateLimitAnnotation         = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
-	VpcNatSynDstBurstLimitAnnotation        = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
-	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
-	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
-	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
-	EipV6IpLabel                            = "ovn.kubernetes.io/eip_v6_ip"
+	// VpcNatTCPSynRateLimitAnnotation and VpcNatTCPSynBurstLimitAnnotation are shorthand aliases for src rate/burst.
+	VpcNatTCPSynRateLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-ratelimit"
+	VpcNatTCPSynBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-burstlimit"
+	VpcNatTCPSynSrcRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
+	VpcNatTCPSynSrcBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
+	VpcNatTCPSynDstRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
+	VpcNatTCPSynDstBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
+	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state (or "unsupported") on the gateway Pod.
+	VpcNatTCPSynLimitStateAnnotation = "ovn.kubernetes.io/tcp-syn-limit-state"
+	OvnEipTypeLabel                  = "ovn.kubernetes.io/ovn_eip_type"
+	EipV4IpLabel                     = "ovn.kubernetes.io/eip_v4_ip"
+	EipUIDLabel                      = "ovn.kubernetes.io/eip_uid"
+	EipV6IpLabel                     = "ovn.kubernetes.io/eip_v6_ip"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
 	SwitchLBRuleVip            = "switch_lb_vip"
@@ -227,15 +229,15 @@ const (
 
 	DefaultMTU = 1500
 
-	DefaultNatGwTCPConnLimit = 50000
-	DefaultNatGwSynSrcRate   = "1000/s"
-	DefaultNatGwSynSrcBurst  = "2000"
-	DefaultNatGwSynDstRate   = "20000/s"
-	DefaultNatGwSynDstBurst  = "40000"
-	GeneveHeaderLength       = 100
-	VxlanHeaderLength        = 50
-	SttHeaderLength          = 72
-	TCPIPHeaderLength        = 40
+	DefaultNatGwTCPConnLimit   = 50000
+	DefaultNatGwTCPSynSrcRate  = "1000/s"
+	DefaultNatGwTCPSynSrcBurst = "2000"
+	DefaultNatGwTCPSynDstRate  = "20000/s"
+	DefaultNatGwTCPSynDstBurst = "40000"
+	GeneveHeaderLength         = 100
+	VxlanHeaderLength          = 50
+	SttHeaderLength            = 72
+	TCPIPHeaderLength          = 40
 
 	OvnProvider                         = "ovn"
 	DefaultNetworkAnnotation            = "v1.multus-cni.io/default-network"
