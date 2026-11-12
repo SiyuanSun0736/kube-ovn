@@ -238,10 +238,10 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 
 	// Announce routes only if not already announced (idempotent)
 	var errs []error
-	var redirectTarget *TCRedirectTarget
+	var eipRedirectTarget *TCRedirectTarget
 	if c.config.EnableTcBpfRedirect {
 		var err error
-		redirectTarget, _, err = c.resolveEipRedirectTarget(eip)
+		eipRedirectTarget, _, err = c.resolveEipRedirectTarget(eip)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -253,11 +253,11 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 			continue
 		}
 		if c.config.EnableTcBpfRedirect {
-			if redirectTarget == nil || !validTCRedirectTarget(*redirectTarget) {
+			if eipRedirectTarget == nil || !validTCRedirectTarget(*eipRedirectTarget) {
 				klog.V(3).Infof("deferring BGP route announcement for EIP %s until TC redirect target is ready", ip)
 				continue
 			}
-			if err := c.tcManager.AddEIP(net.ParseIP(ip), *redirectTarget); err != nil {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), *eipRedirectTarget); err != nil {
 				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
 				errs = append(errs, err)
 				continue
@@ -338,11 +338,11 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	cached, ok := c.gwTargetCache[eip.Spec.NatGwDp]
 	c.gwTargetCacheMu.RUnlock()
 	if ok && cached.podUID == pod.UID {
-		return &cached.target, false, nil
+		return &cached.gwRedirectTarget, false, nil
 	}
 
 	// 2. 缓存未命中或 Pod 重建（UID 变更），实时解析网卡目标
-	target, err := c.getNatGwTCRedirectTarget(pod, eip)
+	gwRedirectTarget, err := c.getNatGwTCRedirectTarget(pod, eip)
 	if err != nil {
 		// Pod 正常活跃，但网卡/子网元数据暂未就绪（如 NetworkStatus 写入延迟），保留存量映射
 		klog.Warningf("failed to resolve redirect target for EIP %s while pod %s is active: %v", eip.Name, podName, err)
@@ -352,12 +352,12 @@ func (c *Controller) resolveEipRedirectTarget(eip *kubeovnv1.IptablesEIP) (*TCRe
 	// 3. 解析成功，存入长效 UID 缓存
 	c.gwTargetCacheMu.Lock()
 	c.gwTargetCache[eip.Spec.NatGwDp] = gwTargetCacheEntry{
-		podUID: pod.UID,
-		target: target,
+		podUID:           pod.UID,
+		gwRedirectTarget: gwRedirectTarget,
 	}
 	c.gwTargetCacheMu.Unlock()
 
-	return &target, false, nil
+	return &gwRedirectTarget, false, nil
 }
 
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
@@ -371,7 +371,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
 	expectedEipTargets := make(map[string]TCRedirectTarget)
 	var retainedEIPs []string
-	var targetErrors []error
+	var redirectErrors []error
 
 	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
@@ -379,12 +379,12 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		return fmt.Errorf("failed to list EIPs: %w", err)
 	}
 
-	type targetResolution struct {
-		target      *TCRedirectTarget
-		retainStale bool
-		err         error
+	type eipTargetResolution struct {
+		eipRedirectTarget *TCRedirectTarget
+		retainStale       bool
+		err               error
 	}
-	targetCache := make(map[string]targetResolution)
+	eipResolutionCache := make(map[string]eipTargetResolution)
 
 	for _, eip := range eips {
 		// Only process ready EIPs with BGP annotation
@@ -397,21 +397,21 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
-		var redirectTarget *TCRedirectTarget
+		var eipRedirectTarget *TCRedirectTarget
 		var retainStale bool
 		if c.config.EnableTcBpfRedirect {
 			cacheKey := eip.Spec.NatGwDp
-			if cached, ok := targetCache[cacheKey]; ok {
-				redirectTarget, retainStale = cached.target, cached.retainStale
-				if cached.err != nil && redirectTarget == nil {
-					targetErrors = append(targetErrors, cached.err)
+			if cached, ok := eipResolutionCache[cacheKey]; ok {
+				eipRedirectTarget, retainStale = cached.eipRedirectTarget, cached.retainStale
+				if cached.err != nil && eipRedirectTarget == nil {
+					redirectErrors = append(redirectErrors, cached.err)
 				}
 			} else {
 				var err error
-				redirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
-				targetCache[cacheKey] = targetResolution{target: redirectTarget, retainStale: retainStale, err: err}
-				if err != nil && redirectTarget == nil {
-					targetErrors = append(targetErrors, err)
+				eipRedirectTarget, retainStale, err = c.resolveEipRedirectTarget(eip)
+				eipResolutionCache[cacheKey] = eipTargetResolution{eipRedirectTarget: eipRedirectTarget, retainStale: retainStale, err: err}
+				if err != nil && eipRedirectTarget == nil {
+					redirectErrors = append(redirectErrors, err)
 				}
 			}
 		}
@@ -419,8 +419,8 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
-				if redirectTarget != nil {
-					expectedEipTargets[ip] = *redirectTarget
+				if eipRedirectTarget != nil {
+					expectedEipTargets[ip] = *eipRedirectTarget
 				} else if retainStale {
 					retainedEIPs = append(retainedEIPs, ip)
 				}
@@ -436,7 +436,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		if err != nil {
 			// TC eBPF 挂载或同步失败时不应撤销 BGP 路由；降级回退到宿主机内核协议栈以优先保障服务连续性
 			klog.Errorf("failed to sync EIP redirection targets, falling back to kernel datapath: %v", err)
-			targetErrors = append(targetErrors, err)
+			redirectErrors = append(redirectErrors, err)
 		}
 	}
 
@@ -459,7 +459,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(targetErrors...))
+	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(redirectErrors...))
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.

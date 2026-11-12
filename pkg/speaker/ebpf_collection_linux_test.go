@@ -14,40 +14,40 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type mockBPFPinOps struct {
-	defaultBPFPinOps
+type mockBPFMapPinOps struct {
+	defaultBPFMapPinOps
 	failMkdirAll  bool
 	failPinPrefix string
 	failRename    bool
 	failRemove    bool
 }
 
-func (m *mockBPFPinOps) MkdirAll(path string, perm os.FileMode) error {
+func (m *mockBPFMapPinOps) MkdirAll(path string, perm os.FileMode) error {
 	if m.failMkdirAll {
 		return errors.New("mock mkdirall error")
 	}
-	return m.defaultBPFPinOps.MkdirAll(path, perm)
+	return m.defaultBPFMapPinOps.MkdirAll(path, perm)
 }
 
-func (m *mockBPFPinOps) Pin(target *ebpf.Map, path string) error {
+func (m *mockBPFMapPinOps) Pin(target *ebpf.Map, path string) error {
 	if m.failPinPrefix != "" && strings.Contains(path, m.failPinPrefix) {
 		return errors.New("mock pin error")
 	}
-	return m.defaultBPFPinOps.Pin(target, path)
+	return m.defaultBPFMapPinOps.Pin(target, path)
 }
 
-func (m *mockBPFPinOps) Rename(oldpath, newpath string) error {
+func (m *mockBPFMapPinOps) Rename(oldpath, newpath string) error {
 	if m.failRename {
 		return errors.New("mock rename error")
 	}
-	return m.defaultBPFPinOps.Rename(oldpath, newpath)
+	return m.defaultBPFMapPinOps.Rename(oldpath, newpath)
 }
 
-func (m *mockBPFPinOps) Remove(path string) error {
+func (m *mockBPFMapPinOps) Remove(path string) error {
 	if m.failRemove {
 		return errors.New("mock remove error")
 	}
-	return m.defaultBPFPinOps.Remove(path)
+	return m.defaultBPFMapPinOps.Remove(path)
 }
 
 func TestTCRemoveBPFPin(t *testing.T) {
@@ -63,9 +63,9 @@ func TestTCRemoveBPFPin(t *testing.T) {
 	require.NoFileExists(t, filePath)
 
 	// 3. 底层 Remove 返回非 ErrNotExist 错误
-	origOps := pinOps
-	pinOps = &mockBPFPinOps{failRemove: true}
-	t.Cleanup(func() { pinOps = origOps })
+	origOps := mapPinOps
+	mapPinOps = &mockBPFMapPinOps{failRemove: true}
+	t.Cleanup(func() { mapPinOps = origOps })
 	require.ErrorContains(t, removeBPFPin("/tmp/any"), "mock remove error")
 }
 
@@ -213,8 +213,8 @@ func TestTCLoadCollectionTwoPhaseCommitFailures(t *testing.T) {
 		require.Equal(t, expected, val)
 	}
 
-	origOps := pinOps
-	t.Cleanup(func() { pinOps = origOps })
+	origOps := mapPinOps
+	t.Cleanup(func() { mapPinOps = origOps })
 
 	t.Run("mkdir_failure_preserves_old_and_cleans_tmp", func(t *testing.T) {
 		p1 := testTCPinPath(t)
@@ -222,7 +222,7 @@ func TestTCLoadCollectionTwoPhaseCommitFailures(t *testing.T) {
 		// 预先写入 dummy 旧 Pin
 		createDummyPinnedMap(p1, 991)
 
-		pinOps = &mockBPFPinOps{failMkdirAll: true}
+		mapPinOps = &mockBPFMapPinOps{failMkdirAll: true}
 		coll, err := loadCollectionWithPinnedMaps(newSpec(), map[string]string{"map1": p1, "map2": p2})
 		require.ErrorContains(t, err, "create map dir")
 		require.Nil(t, coll)
@@ -243,7 +243,7 @@ func TestTCLoadCollectionTwoPhaseCommitFailures(t *testing.T) {
 			"map1": {Name: "map1", Type: ebpf.Hash, KeySize: 4, ValueSize: 8, MaxEntries: 1},
 			"map2": {Name: "map2", Type: ebpf.Hash, KeySize: 4, ValueSize: 8, MaxEntries: 1},
 		}}
-		pinOps = &mockBPFPinOps{failPinPrefix: "map2"}
+		mapPinOps = &mockBPFMapPinOps{failPinPrefix: "map2"}
 		coll, err := loadCollectionWithPinnedMaps(fallbackSpec, map[string]string{"map1": p1, "map2": p2})
 		require.ErrorContains(t, err, "pin BPF map")
 		require.Nil(t, coll)
@@ -259,7 +259,7 @@ func TestTCLoadCollectionTwoPhaseCommitFailures(t *testing.T) {
 
 	t.Run("phase2_rename_failure_cleans_tmp", func(t *testing.T) {
 		p1 := testTCPinPath(t)
-		pinOps = &mockBPFPinOps{failRename: true}
+		mapPinOps = &mockBPFMapPinOps{failRename: true}
 		coll, err := loadCollectionWithPinnedMaps(newSpec(), map[string]string{"map1": p1})
 		require.ErrorContains(t, err, "atomic swap pinned map")
 		require.Nil(t, coll)
