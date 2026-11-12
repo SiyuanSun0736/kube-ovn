@@ -113,4 +113,78 @@ for enabled_val in "100/s" "1000/s" "1/minute" "enable"; do
     fi
 done
 
+# 6. Test single-backend enforcement and independent src/dst SYN limit disablement
+mock_log="$tmp_dir/mock.log"
+check_inited() { return 0; }
+nft() {
+    if [ "${MOCK_NFT_FAIL:-0}" -eq 1 ] && [[ "$*" == *"add rule ip"* ]]; then
+        return 1
+    fi
+    if [ "${1:-}" = "-f" ]; then
+        while IFS= read -r line; do
+            echo "NFT_TX: $line" >> "$mock_log"
+        done
+        return 0
+    fi
+    if [ "${1:-}" = "list" ] && [ "${2:-}" = "chain" ]; then
+        return 1
+    fi
+    echo "NFT: $*" >> "$mock_log"
+    return 0
+}
+mock_iptables() {
+    echo "IPT: $*" >> "$mock_log"
+    return 0
+}
+nft_cmd="nft"
+iptables_cmd="mock_iptables"
+iptables_save_cmd="true"
+EXTERNAL_INTERFACE="net1"
+
+# 6a. Auto mode with both nft and iptables present must only install nft rules (no double enforcement)
+: > "$mock_log"
+tcp_connlimit_set "50000" "stateful" >/dev/null
+if grep -q -- "-A VPC_CONNLIMIT" "$mock_log"; then
+    echo "FAIL: auto mode must not install iptables VPC_CONNLIMIT when nft succeeds" >&2
+    exit 1
+fi
+if ! grep -q -- "NFT: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over 50000 drop" "$mock_log"; then
+    echo "FAIL: auto mode did not install expected nft conn-limit rule" >&2
+    exit 1
+fi
+
+# 6b. Auto mode falls back to iptables when nft rule installation fails
+: > "$mock_log"
+MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1
+if ! grep -q -- "IPT: -t mangle -A VPC_CONNLIMIT -p tcp --syn -m connlimit --connlimit-above 50000" "$mock_log"; then
+    echo "FAIL: auto mode must fall back to iptables when nft fails" >&2
+    exit 1
+fi
+
+# 6c. Independent src_rate=0 keeps dst_rate active, and dst_rate=0 keeps src_rate active
+: > "$mock_log"
+tcp_syn_limit_set "0" "2000" "8000/s" "16000" >/dev/null
+if grep -q "syn_src_meter" "$mock_log" | grep -v "delete set"; then
+    :
+fi
+if grep -q "add set ip kube-ovn syn_src_meter" "$mock_log"; then
+    echo "FAIL: src_rate=0 must not install syn_src_meter" >&2
+    exit 1
+fi
+if ! grep -q "add set ip kube-ovn syn_dst_meter" "$mock_log"; then
+    echo "FAIL: src_rate=0 must keep syn_dst_meter active" >&2
+    exit 1
+fi
+
+: > "$mock_log"
+tcp_syn_limit_set "300/s" "600" "0" "40000" >/dev/null
+if ! grep -q "add set ip kube-ovn syn_src_meter" "$mock_log"; then
+    echo "FAIL: dst_rate=0 must keep syn_src_meter active" >&2
+    exit 1
+fi
+if grep -q "add set ip kube-ovn syn_dst_meter" "$mock_log"; then
+    echo "FAIL: dst_rate=0 must not install syn_dst_meter" >&2
+    exit 1
+fi
+
 echo "PASS: nat-gateway connlimit & stateless detection tests passed"

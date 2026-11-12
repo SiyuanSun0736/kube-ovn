@@ -927,31 +927,31 @@ func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
 	}
 }
 
-func TestVpcNatGwDesiredTCPConnLimit(t *testing.T) {
+func TestNatGwDesiredTCPConnLimit(t *testing.T) {
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{})
 	require.NoError(t, err)
 	ctrl := fc.fakeController
 
 	// 1. Default when unset: 50,000
 	gw := fakeGw("gw")
-	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 2. Custom annotation tcp-connlimit
 	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
-	assert.Equal(t, 15000, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, 15000, ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 3. Spec field overrides annotation
 	gw.Spec.TCPConnLimit = ptr.To(30000)
-	assert.Equal(t, 30000, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, 30000, ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 4. Spec field 0 disables connlimit
 	gw.Spec.TCPConnLimit = ptr.To(0)
-	assert.Equal(t, 0, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, 0, ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 5. Removing spec field restores default (50000)
 	gw.Spec.TCPConnLimit = nil
 	delete(gw.Annotations, util.VpcNatTCPConnLimitAnnotation)
-	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getVpcNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getNatGwDesiredTCPConnLimit(gw))
 }
 
 func TestSyncNatGwTCPConnLimit(t *testing.T) {
@@ -986,7 +986,7 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[util.VpcNatTCPConnLimitAnnotation] = "50000"
-	pod.Annotations[util.NatGatewayDataplaneModeAnnotation] = "stateful"
+	pod.Annotations[util.VpcNatGatewayDataplaneModeAnnotation] = "stateful"
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Empty(t, calls)
 
@@ -1006,7 +1006,7 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	calls = nil
 	gw.Status.TCPConnLimit = ptr.To(0)
 	gw.Spec.TCPConnLimit = ptr.To(15000)
-	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
+	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "stateless"}
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "15000", "stateless"}}, calls)
 	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
@@ -1015,7 +1015,7 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 
 	// 6. Negative spec value safely falls back to default 50000
 	calls = nil
-	delete(gw.Annotations, util.NatGatewayDataplaneModeAnnotation)
+	delete(gw.Annotations, util.VpcNatGatewayDataplaneModeAnnotation)
 	gw.Spec.TCPConnLimit = ptr.To(-100)
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "50000", "stateful"}}, calls)
@@ -1048,7 +1048,7 @@ func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 
 	// Case 2: Dataplane mode change without threshold change triggers convergence
 	calls = nil
-	gw.Annotations = map[string]string{util.NatGatewayDataplaneModeAnnotation: "stateless"}
+	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "stateless"}
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, newPod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "10000", "stateless"}}, calls)
 
@@ -1150,8 +1150,9 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		return nil
 	}
 
-	// 1. Default rate limits
+	// 1. Default rate limits (must not mutate caller's cached pod object in-place)
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
+	require.Empty(t, pod.Annotations[util.VpcNatSynRateLimitAnnotation], "caller pod object must not be mutated in-place")
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
 		util.DefaultNatGwSynSrcRate,
@@ -1160,7 +1161,9 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 		util.DefaultNatGwSynDstBurst,
 	}}, calls)
 
-	// Repeated reconcile without changes must skip reprogramming to preserve buckets
+	// Repeated reconcile without changes (using updated pod from apiserver) must skip reprogramming to preserve buckets
+	pod, err = ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
 	calls = nil
 	require.NoError(t, ctrl.syncNatGwSynRateLimit(gw, pod, false))
 	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
@@ -1189,7 +1192,7 @@ func TestSyncNatGwSynRateLimit(t *testing.T) {
 	gw.Annotations[util.VpcNatSynSrcRateLimitAnnotation] = "unknown command"
 	err = ctrl.syncNatGwSynRateLimit(gw, pod, false)
 	require.Error(t, err)
-	require.NotEqual(t, synLimitUnsupported, pod.Annotations[util.VpcNatSynRateLimitAnnotation])
+	require.NotEqual(t, tcpSynLimitUnsupported, pod.Annotations[util.VpcNatSynRateLimitAnnotation])
 
 	// 4. Disable SYN rate limit via "0"
 	calls = nil
