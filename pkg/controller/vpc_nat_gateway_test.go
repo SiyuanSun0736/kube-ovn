@@ -1078,7 +1078,7 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			failOp:     natGwTCPConnLimitSet,
 			failErr:    errors.New("iptables rule installation failed"),
 			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
-			expectVal:  tcpConnLimitUnsupported,
+			expectVal:  "",
 		},
 		{
 			name: "custom connlimit failure blocks init",
@@ -1094,7 +1094,7 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			failOp:     natGwTCPSynLimitSet,
 			failErr:    errors.New("nftables rule installation failed"),
 			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
-			expectVal:  tcpSynLimitUnsupported,
+			expectVal:  "",
 		},
 		{
 			name: "custom syn limit failure blocks init",
