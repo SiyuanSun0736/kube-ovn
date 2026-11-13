@@ -54,13 +54,8 @@ const (
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
 	VpcNatTCPConnLimitAnnotation            = "ovn.kubernetes.io/tcp-connlimit"
-	// VpcNatTCPSynRateLimitAnnotation and VpcNatTCPSynBurstLimitAnnotation are shorthand aliases for src rate/burst.
-	VpcNatTCPSynRateLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-ratelimit"
-	VpcNatTCPSynBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-burstlimit"
-	VpcNatTCPSynSrcRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
-	VpcNatTCPSynSrcBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
-	VpcNatTCPSynDstRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
-	VpcNatTCPSynDstBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
+	VpcNatTCPSynDstRateLimitAnnotation      = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
+	VpcNatTCPSynDstBurstLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
 	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state (or "unsupported") on the gateway Pod.
 	VpcNatTCPSynLimitStateAnnotation = "ovn.kubernetes.io/tcp-syn-limit-state"
 	OvnEipTypeLabel                  = "ovn.kubernetes.io/ovn_eip_type"

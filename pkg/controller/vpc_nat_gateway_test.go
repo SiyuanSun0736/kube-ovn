@@ -1168,65 +1168,49 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
 
-	// 2. Custom rate limits via annotations
+	// 2. Custom dst rate limits via annotations
 	calls = nil
 	gw.Annotations = map[string]string{
-		util.VpcNatTCPSynSrcRateLimitAnnotation:  "300/s",
-		util.VpcNatTCPSynSrcBurstLimitAnnotation: "600",
 		util.VpcNatTCPSynDstRateLimitAnnotation:  "8000/s",
 		util.VpcNatTCPSynDstBurstLimitAnnotation: "16000",
 	}
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
-		"300/s",
-		"600",
+		util.DefaultNatGwTCPSynSrcRate,
+		util.DefaultNatGwTCPSynSrcBurst,
 		"8000/s",
 		"16000",
 	}}, calls)
 
 	// 3. User input containing 'unknown command' in value must NOT be misclassified as unsupported command
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
-		return errors.New("exit status 1: Error: invalid SYN src_rate 'unknown command'")
+		return errors.New("exit status 1: Error: invalid SYN dst_rate 'unknown command'")
 	}
-	gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation] = "unknown command"
+	gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation] = "unknown command"
 	err = ctrl.syncNatGwTCPSynRateLimit(gw, pod, false)
 	require.Error(t, err)
 	require.NotEqual(t, tcpSynLimitUnsupported, pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation])
 
-	// 4. Disable SYN rate limit via "0"
+	// 4. Disable destination SYN rate limit via "0"
 	calls = nil
 	ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, rules []string) error {
 		calls = append(calls, append([]string{operation}, rules...))
 		return nil
 	}
 	gw.Annotations = map[string]string{
-		util.VpcNatTCPSynRateLimitAnnotation: "0",
+		util.VpcNatTCPSynDstRateLimitAnnotation: "0",
 	}
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
-		"0",
+		util.DefaultNatGwTCPSynSrcRate,
 		util.DefaultNatGwTCPSynSrcBurst,
-		util.DefaultNatGwTCPSynDstRate,
+		"0",
 		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
 
-	// 5. Explicit src-* annotations take precedence over shorthand aliases
-	gw.Annotations = map[string]string{
-		util.VpcNatTCPSynRateLimitAnnotation:     "100/s",
-		util.VpcNatTCPSynBurstLimitAnnotation:    "200",
-		util.VpcNatTCPSynSrcRateLimitAnnotation:  "500/s",
-		util.VpcNatTCPSynSrcBurstLimitAnnotation: "1000",
-	}
-	require.Equal(t, []string{
-		"500/s",
-		"1000",
-		util.DefaultNatGwTCPSynDstRate,
-		util.DefaultNatGwTCPSynDstBurst,
-	}, ctrl.getNatGwTCPSynRateLimitArgs(gw))
-
-	// 6. Dataplane mode trims whitespace and falls back to stateful when empty
+	// 5. Dataplane mode trims whitespace and falls back to stateful when empty
 	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "  "}
 	require.Equal(t, "stateful", ctrl.getNatGwDataplaneMode(gw))
 	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: " stateless "}

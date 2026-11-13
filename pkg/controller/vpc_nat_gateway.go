@@ -349,18 +349,6 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	dstRate := util.DefaultNatGwTCPSynDstRate
 	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
-	for _, key := range []string{util.VpcNatTCPSynSrcRateLimitAnnotation, util.VpcNatTCPSynRateLimitAnnotation} {
-		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
-			srcRate = strings.TrimSpace(val)
-			break
-		}
-	}
-	for _, key := range []string{util.VpcNatTCPSynSrcBurstLimitAnnotation, util.VpcNatTCPSynBurstLimitAnnotation} {
-		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
-			srcBurst = strings.TrimSpace(val)
-			break
-		}
-	}
 	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
 		dstRate = strings.TrimSpace(val)
 	}
