@@ -349,6 +349,12 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	dstRate := util.DefaultNatGwTCPSynDstRate
 	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
+	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcRate = strings.TrimSpace(val)
+	}
+	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
+		srcBurst = strings.TrimSpace(val)
+	}
 	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
 		dstRate = strings.TrimSpace(val)
 	}
@@ -367,11 +373,11 @@ func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 			}
 		}
 	}
-	return "stateful"
+	return util.NatDataplaneModeStateful
 }
 
 func isStatelessMode(mode string) bool {
-	return mode == "stateless" || mode == "stateless-nft"
+	return mode == util.NatDataplaneModeStateless || mode == util.NatDataplaneModeStatelessNft
 }
 
 func isUnsupportedCommandError(err error, operation string) bool {
@@ -380,20 +386,12 @@ func isUnsupportedCommandError(err error, operation string) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	target := strings.ToLower(operation)
-	return strings.Contains(msg, "unknown command: "+target) ||
-		strings.Contains(msg, "unknown subcommand: "+target) ||
-		strings.Contains(msg, "unrecognized option: "+target) ||
-		strings.Contains(msg, "invalid command: "+target)
+	return strings.Contains(msg, "unknown command: "+target)
 }
 
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
-	// Note: util.VpcNatTCPConnLimitAnnotation serves dual purposes:
-	// 1. On VpcNatGateway CR (gw.Annotations): user configuration fallback if spec.tcpConnLimit is unset.
-	// 2. On NAT Gateway Pod (pod.Annotations): records the effective limit currently applied inside this Pod,
-	//    allowing the controller to track convergence and avoid executing redundant iptables/nft commands.
-
 	// If the Pod was already marked as running an image without tcp-connlimit-set, check whether to skip
-	if pod.Annotations != nil && pod.Annotations[util.VpcNatTCPConnLimitAnnotation] == tcpConnLimitUnsupported {
+	if pod.Annotations != nil && pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation] == tcpConnLimitUnsupported {
 		if gw.Status.TCPConnLimit != nil {
 			if err := c.clearNatGwTCPConnLimitStatus(gw.Name); err != nil {
 				klog.Errorf("failed to clear status.tcpConnLimit for unsupported nat gw %s, %v", gw.Name, err)
@@ -425,7 +423,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	appliedLimit := ""
 	if pod.Annotations != nil {
 		appliedMode = pod.Annotations[util.VpcNatGatewayDataplaneModeAnnotation]
-		appliedLimit = pod.Annotations[util.VpcNatTCPConnLimitAnnotation]
+		appliedLimit = pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation]
 	}
 
 	effectiveLimitStr := strconv.FormatInt(int64(effectiveLimit), 10)
@@ -439,7 +437,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		if isUnsupportedCommandError(err, natGwTCPConnLimitSet) {
 			klog.Warningf("nat gw %s runs a script without %s: connlimit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTCPConnLimitSet, err)
 			if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-				util.VpcNatTCPConnLimitAnnotation: tcpConnLimitUnsupported,
+				util.VpcNatTCPConnLimitStateAnnotation: tcpConnLimitUnsupported,
 			}); patchErr != nil {
 				klog.Errorf("failed to patch pod %s/%s unsupported connlimit annotation: %v", pod.Namespace, pod.Name, patchErr)
 			}
@@ -456,7 +454,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	}
 
 	patch := util.KVPatch{
-		util.VpcNatTCPConnLimitAnnotation:         effectiveLimitStr,
+		util.VpcNatTCPConnLimitStateAnnotation:    effectiveLimitStr,
 		util.VpcNatGatewayDataplaneModeAnnotation: dataplaneMode,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
@@ -857,14 +855,25 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	}
 
 	if err = c.syncNatGwTCPConnLimit(gw, pod, true); err != nil {
-		err = fmt.Errorf("failed to set tcp connlimit during init for nat gw %s: %w", key, err)
-		klog.Error(err)
-		return err
+		klog.Errorf("failed to set tcp connlimit during init for nat gw %s: %v", key, err)
+		if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
+			util.VpcNatTCPConnLimitStateAnnotation: tcpConnLimitUnsupported,
+		}); patchErr != nil {
+			klog.Errorf("failed to patch pod %s/%s unsupported connlimit annotation: %v", pod.Namespace, pod.Name, patchErr)
+		}
+		if gw.Status.TCPConnLimit != nil {
+			if clearErr := c.clearNatGwTCPConnLimitStatus(gw.Name); clearErr != nil {
+				klog.Errorf("failed to clear status.tcpConnLimit for nat gw %s: %v", gw.Name, clearErr)
+			}
+		}
 	}
 	if err = c.syncNatGwTCPSynRateLimit(gw, pod, true); err != nil {
-		err = fmt.Errorf("failed to set tcp syn limit during init for nat gw %s: %w", key, err)
-		klog.Error(err)
-		return err
+		klog.Errorf("failed to set tcp syn limit during init for nat gw %s: %v", key, err)
+		if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
+			util.VpcNatTCPSynLimitStateAnnotation: tcpSynLimitUnsupported,
+		}); patchErr != nil {
+			klog.Errorf("failed to patch pod %s/%s unsupported syn limit annotation: %v", pod.Namespace, pod.Name, patchErr)
+		}
 	}
 
 	if gw.Spec.QoSPolicy != "" {
@@ -1282,6 +1291,8 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 		if len(stdOutput) > 0 {
 			klog.Infof("NAT gateway command failed - stdout: %v", stdOutput)
 		}
+		// Note: stdOutput is wrapped into the error so callers can inspect dispatcher
+		// responses (e.g. "Unknown command: <op>") when detecting controller/image skew.
 		klog.Errorf("NAT gateway command execution error: %v", err)
 		return fmt.Errorf("%w: %s (stdout: %s)", err, strings.TrimSpace(errOutput), strings.TrimSpace(stdOutput))
 	}
