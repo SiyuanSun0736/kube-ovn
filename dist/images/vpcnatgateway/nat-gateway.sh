@@ -2851,9 +2851,9 @@ case $opt in
         qos_del "$@"
         ;;
     *)
-        echo "Unknown command: $opt"
-        echo ""
-        show_help
+        echo "Unknown command: $opt" >&2
+        echo "" >&2
+        show_help >&2
         exit 1
         ;;
 esac

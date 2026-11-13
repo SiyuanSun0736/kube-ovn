@@ -62,14 +62,13 @@ const (
 	// in VpcNatGatewayStatus.HairpinSNAT.
 	hairpinSNATEnable  = "enable"
 	hairpinSNATDisable = "disable"
-	// Recorded instead when the Pod runs a gateway script that has no hairpin-snat-set: the
-	// field cannot be honoured until that Pod is replaced by the gateway image that has it.
-	hairpinSNATUnsupported = "unsupported"
-	// Distinct unsupported state markers recorded in Pod annotations. Do not reuse across features:
-	// tcpConnLimitUnsupported -> VpcNatTCPConnLimitStateAnnotation
-	// tcpSynLimitUnsupported  -> VpcNatTCPSynLimitStateAnnotation
-	tcpConnLimitUnsupported = "unsupported"
-	tcpSynLimitUnsupported  = "unsupported"
+	// Value recorded in Pod state annotations (VpcNatTCPConnLimitStateAnnotation, VpcNatTCPSynLimitStateAnnotation,
+	// and VpcNatGatewayStatus.HairpinSNAT) when the running gateway image lacks support for the command.
+	// This string value is immutable for backward compatibility across controller and image versions.
+	natGwFeatureUnsupported = "unsupported"
+	hairpinSNATUnsupported  = natGwFeatureUnsupported
+	tcpConnLimitUnsupported = natGwFeatureUnsupported
+	tcpSynLimitUnsupported  = natGwFeatureUnsupported
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
@@ -333,6 +332,7 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 			return *gw.Spec.TCPConnLimit
 		}
 		klog.Warningf("nat gw %s has invalid negative spec.tcpConnLimit %d, ignoring", gw.Name, *gw.Spec.TCPConnLimit)
+		// falls through to annotation fallback
 	}
 	// 2. Annotation fallback
 	if val, ok := gw.Annotations[util.VpcNatTCPConnLimitAnnotation]; ok {
@@ -1607,6 +1607,10 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 							Lifecycle: &corev1.Lifecycle{
 								PostStart: &corev1.LifecycleHandler{
 									Exec: &corev1.ExecAction{
+										// Shorten net.netfilter.nf_conntrack_tcp_timeout_syn_recv from Linux default 60s to 5s.
+										// During large-scale SYN flood or port scans, half-open SYN_RECV conntrack entries
+										// expire 12x faster, drastically mitigating conntrack table exhaustion while remaining
+										// generous enough for standard TCP 3-way handshake completion under normal WAN RTT.
 										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1 && (sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true)"},
 									},
 								},
