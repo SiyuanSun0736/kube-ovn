@@ -1066,8 +1066,10 @@ func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
+		setupGw    func(*kubeovnv1.VpcNatGateway)
 		failOp     string
 		failErr    error
+		expectErr  bool
 		expectAnno string
 		expectVal  string
 	}{
@@ -1079,6 +1081,15 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			expectVal:  tcpConnLimitUnsupported,
 		},
 		{
+			name: "custom connlimit failure blocks init",
+			setupGw: func(g *kubeovnv1.VpcNatGateway) {
+				g.Spec.TCPConnLimit = ptr.To(int32(20000))
+			},
+			failOp:    natGwTCPConnLimitSet,
+			failErr:   errors.New("iptables rule installation failed"),
+			expectErr: true,
+		},
+		{
 			name:       "syn limit failure tolerated during init (fail-open)",
 			failOp:     natGwTCPSynLimitSet,
 			failErr:    errors.New("nftables rule installation failed"),
@@ -1086,16 +1097,25 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			expectVal:  tcpSynLimitUnsupported,
 		},
 		{
+			name: "custom syn limit failure blocks init",
+			setupGw: func(g *kubeovnv1.VpcNatGateway) {
+				g.Annotations = map[string]string{util.VpcNatTCPSynDstRateLimitAnnotation: "5000/s"}
+			},
+			failOp:    natGwTCPSynLimitSet,
+			failErr:   errors.New("nftables rule installation failed"),
+			expectErr: true,
+		},
+		{
 			name:       "unsupported connlimit command tolerated during init",
 			failOp:     natGwTCPConnLimitSet,
-			failErr:    errors.New("exit status 1: Unknown command: tcp-connlimit-set"),
+			failErr:    errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="),
 			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
 			expectVal:  tcpConnLimitUnsupported,
 		},
 		{
 			name:       "unsupported syn limit command tolerated during init",
 			failOp:     natGwTCPSynLimitSet,
-			failErr:    errors.New("exit status 1: Unknown command: tcp-syn-limit-set"),
+			failErr:    errors.New("exit status 1: stderr=Unknown command: tcp-syn-limit-set stdout="),
 			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
 			expectVal:  tcpSynLimitUnsupported,
 		},
@@ -1106,6 +1126,9 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			t.Cleanup(func() { vpcNatEnabled = old })
 
 			gw := fakeGw("gw-sec")
+			if tc.setupGw != nil {
+				tc.setupGw(gw)
+			}
 			pod := fakeNatGwPod("gw-sec", false)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
@@ -1128,6 +1151,10 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			}
 
 			err = ctrl.handleInitVpcNatGw("gw-sec")
+			if tc.expectErr {
+				require.Error(t, err, "custom limiter failure must fail init to alert operator")
+				return
+			}
 			require.NoError(t, err, "limiter failure must not gate data plane initialization")
 			initializedPod, getErr := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
 			require.NoError(t, getErr)
@@ -1224,6 +1251,7 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 
 func TestIsUnsupportedCommandError(t *testing.T) {
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTCPConnLimitSet))
