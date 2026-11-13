@@ -83,7 +83,7 @@ function show_help() {
     echo "  floating-ip-del          - Delete floating IP mapping"
     echo "  hairpin-snat-set         - Turn the lanIP fallback hairpin SNAT on/off: enable | disable"
     echo "  tcp-connlimit-set        - Set or clear TCP connlimit: <limit> [mode]"
-    echo "  tcp-syn-limit-set        - Set TCP SYN raw rate limit: [src_rate] [src_burst] [dst_rate] [dst_burst]"
+    echo "  tcp-syn-limit-set        - Set or clear TCP SYN raw rate limit: [src_rate] [src_burst] [dst_rate] [dst_burst]"
     echo "  dnat-add                 - Add DNAT rule"
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
@@ -577,8 +577,8 @@ function apply_nft_connlimit() {
 }
 
 function tcp_connlimit_set() {
-    local limit=$1
-    local mode=$2
+    local limit=${1:-}
+    local mode=${2:-stateful}
     local backend=${TCP_LIMITER_BACKEND:-"auto"}
 
     check_inited
