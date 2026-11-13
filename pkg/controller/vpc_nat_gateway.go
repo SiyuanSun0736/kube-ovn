@@ -65,10 +65,11 @@ const (
 	// Value recorded in Pod state annotations (VpcNatTCPConnLimitStateAnnotation, VpcNatTCPSynLimitStateAnnotation,
 	// and VpcNatGatewayStatus.HairpinSNAT) when the running gateway image lacks support for the command.
 	// This string value is immutable for backward compatibility across controller and image versions.
-	natGwFeatureUnsupported = "unsupported"
-	hairpinSNATUnsupported  = natGwFeatureUnsupported
-	tcpConnLimitUnsupported = natGwFeatureUnsupported
-	tcpSynLimitUnsupported  = natGwFeatureUnsupported
+	natGwFeatureUnsupported         = "unsupported"
+	natGwUnsupportedCommandSentinel = "UNSUPPORTED_COMMAND"
+	hairpinSNATUnsupported          = natGwFeatureUnsupported
+	tcpConnLimitUnsupported         = natGwFeatureUnsupported
+	tcpSynLimitUnsupported          = natGwFeatureUnsupported
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
@@ -387,9 +388,30 @@ func isUnsupportedCommandError(err error, operation string) bool {
 	if err == nil || operation == "" {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
 	target := strings.ToLower(operation)
-	return strings.Contains(msg, "unknown command: "+target)
+	sentinel := strings.ToLower(natGwUnsupportedCommandSentinel + ": " + target)
+	legacyTarget := "unknown command: " + target
+
+	errStr := strings.ToLower(err.Error())
+
+	// 1. Structured sentinel check (highest precision, unambiguous)
+	if strings.Contains(errStr, sentinel) {
+		return true
+	}
+
+	// 2. When wrapped by execNatGwRules (stderr=... stdout=...), match within stderr
+	// to avoid false positives if stdout happens to contain command names or error strings.
+	targetSegment := errStr
+	if idxStderr := strings.Index(errStr, "stderr="); idxStderr != -1 {
+		idxStdout := strings.Index(errStr[idxStderr:], "stdout=")
+		if idxStdout != -1 {
+			targetSegment = errStr[idxStderr+len("stderr=") : idxStderr+idxStdout]
+		} else {
+			targetSegment = errStr[idxStderr+len("stderr="):]
+		}
+	}
+
+	return strings.Contains(targetSegment, legacyTarget)
 }
 
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
