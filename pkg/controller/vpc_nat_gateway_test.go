@@ -1211,6 +1211,26 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 		util.DefaultNatGwTCPSynDstRate,
 		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
+
+	// 5. Explicit src-* annotations take precedence over shorthand aliases
+	gw.Annotations = map[string]string{
+		util.VpcNatTCPSynRateLimitAnnotation:     "100/s",
+		util.VpcNatTCPSynBurstLimitAnnotation:    "200",
+		util.VpcNatTCPSynSrcRateLimitAnnotation:  "500/s",
+		util.VpcNatTCPSynSrcBurstLimitAnnotation: "1000",
+	}
+	require.Equal(t, []string{
+		"500/s",
+		"1000",
+		util.DefaultNatGwTCPSynDstRate,
+		util.DefaultNatGwTCPSynDstBurst,
+	}, ctrl.getNatGwTCPSynRateLimitArgs(gw))
+
+	// 6. Dataplane mode trims whitespace and falls back to stateful when empty
+	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "  "}
+	require.Equal(t, "stateful", ctrl.getNatGwDataplaneMode(gw))
+	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: " stateless "}
+	require.Equal(t, "stateless", ctrl.getNatGwDataplaneMode(gw))
 }
 
 func TestIsUnsupportedCommandError(t *testing.T) {

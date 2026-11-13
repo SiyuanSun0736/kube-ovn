@@ -349,13 +349,13 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	dstRate := util.DefaultNatGwTCPSynDstRate
 	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
-	for _, key := range []string{util.VpcNatTCPSynRateLimitAnnotation, util.VpcNatTCPSynSrcRateLimitAnnotation} {
+	for _, key := range []string{util.VpcNatTCPSynSrcRateLimitAnnotation, util.VpcNatTCPSynRateLimitAnnotation} {
 		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
 			srcRate = strings.TrimSpace(val)
 			break
 		}
 	}
-	for _, key := range []string{util.VpcNatTCPSynBurstLimitAnnotation, util.VpcNatTCPSynSrcBurstLimitAnnotation} {
+	for _, key := range []string{util.VpcNatTCPSynSrcBurstLimitAnnotation, util.VpcNatTCPSynBurstLimitAnnotation} {
 		if val, ok := gw.Annotations[key]; ok && strings.TrimSpace(val) != "" {
 			srcBurst = strings.TrimSpace(val)
 			break
@@ -374,7 +374,9 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	if gw.Annotations != nil {
 		if mode, ok := gw.Annotations[util.VpcNatGatewayDataplaneModeAnnotation]; ok {
-			return mode
+			if trimmed := strings.TrimSpace(mode); trimmed != "" {
+				return trimmed
+			}
 		}
 	}
 	return "stateful"
@@ -525,6 +527,9 @@ func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int) error {
 	}
 	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
 		patch, metav1.PatchOptions{}, "status")
+	if err != nil {
+		klog.Errorf("failed to patch status.tcpConnLimit=%d for vpc nat gw %s: %v", limit, oriGw.Name, err)
+	}
 	return err
 }
 
@@ -546,6 +551,9 @@ func (c *Controller) clearNatGwTCPConnLimitStatus(key string) error {
 	}
 	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
 		patch, metav1.PatchOptions{}, "status")
+	if err != nil {
+		klog.Errorf("failed to clear status.tcpConnLimit for vpc nat gw %s: %v", oriGw.Name, err)
+	}
 	return err
 }
 

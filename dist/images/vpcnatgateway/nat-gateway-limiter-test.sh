@@ -164,9 +164,6 @@ fi
 # 6c. Independent src_rate=0 keeps dst_rate active, and dst_rate=0 keeps src_rate active
 : > "$mock_log"
 tcp_syn_limit_set "0" "2000" "8000/s" "16000" >/dev/null
-if grep -q "syn_src_meter" "$mock_log" | grep -v "delete set"; then
-    :
-fi
 if grep -q "add set ip kube-ovn syn_src_meter" "$mock_log"; then
     echo "FAIL: src_rate=0 must not install syn_src_meter" >&2
     exit 1
