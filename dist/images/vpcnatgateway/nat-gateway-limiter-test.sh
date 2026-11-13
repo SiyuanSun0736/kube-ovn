@@ -88,6 +88,10 @@ assert_expire "1/day" "10" "86400000"
 # Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
 assert_expire "0/s" "10" "10000"
 assert_expire "invalid" "10" "10000"
+# Zero or invalid burst should safely fall back to baseline 10000ms
+assert_expire "1000/s" "0" "10000"
+assert_expire "1000/s" "invalid" "10000"
+assert_expire "1000/s" "" "10000"
 
 # 4. Test rate pattern validation
 rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
