@@ -180,9 +180,6 @@ function init() {
     ensure_hairpin_snat "$(current_hairpin_fallback_state)"
     ensure_exclusive_snat_oif
 
-    # Pod-level half-open timeout tuning to prevent SYN flood conntrack exhaustion
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true
-
     # run once is enough
     $iptables_save_cmd | grep DNAT_FILTER && exit 0
     # add static chain
@@ -555,12 +552,18 @@ function apply_nft_connlimit() {
     if $nft_cmd list chain ip "$NFT_TABLE" conn-limit 2>/dev/null | grep -E -q -- "ct count over $limit([[:space:]]|$)"; then
         echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
     else
-        if ! nft_transaction \
-            "add table ip $NFT_TABLE" \
-            "add chain ip $NFT_TABLE conn-limit { type filter hook prerouting priority -150; policy accept; }" \
-            "flush chain ip $NFT_TABLE conn-limit" \
-            "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return" \
-            "add rule ip $NFT_TABLE conn-limit tcp dport 179 return"; then
+        local -a cmds=(
+            "add table ip $NFT_TABLE"
+        )
+        if ! $nft_cmd list chain ip "$NFT_TABLE" conn-limit >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE conn-limit { type filter hook prerouting priority -150; policy accept; }")
+        fi
+        cmds+=(
+            "flush chain ip $NFT_TABLE conn-limit"
+            "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return"
+            "add rule ip $NFT_TABLE conn-limit tcp dport 179 return"
+        )
+        if ! nft_transaction "${cmds[@]}"; then
             echo "Failed to create nftables conn-limit chain" >&2
             return 1
         fi
@@ -599,7 +602,7 @@ function tcp_connlimit_set() {
     fi
 
     # 2. Disabled (0 or empty): clean connlimit rules
-    if [ -z "$limit" ] || [ "$limit" -eq 0 ] 2>/dev/null; then
+    if [ -z "$limit" ] || [ "$limit" -eq 0 ]; then
         echo "TCP connlimit is disabled (limit=$limit), clearing connlimit rules"
         flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
         flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
@@ -688,7 +691,7 @@ function calc_bucket_expire_ms() {
 function is_syn_limit_disabled() {
     local val=$1
     case "$val" in
-        0|0/*|disable|disabled|none|off) return 0 ;;
+        0|0/s|0/sec|0/second|0/m|0/min|0/minute|0/h|0/hour|0/d|0/day|disable|disabled|none|off) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -764,11 +767,20 @@ function apply_nft_syn_limit() {
 
     [ -z "$nft_cmd" ] && return 1
 
-    # Flush chain to release references to existing meters, then delete old sets so new timeout takes effect
-    nft_transaction_ignore_errors \
-        "add table ip $NFT_TABLE" \
-        "add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }" \
-        "flush chain ip $NFT_TABLE syn-limit"
+    # Flush chain to release references to existing meters, then delete old sets so new timeout takes effect.
+    # Base chain is created only when missing because 'add chain' on an existing base chain returns EEXIST
+    # on stricter nftables versions and rolls back the transaction.
+    local -a init_cmds=(
+        "add table ip $NFT_TABLE"
+    )
+    if ! $nft_cmd list chain ip "$NFT_TABLE" syn-limit >/dev/null 2>&1; then
+        init_cmds+=("add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }")
+    fi
+    init_cmds+=("flush chain ip $NFT_TABLE syn-limit")
+    if ! nft_transaction "${init_cmds[@]}"; then
+        echo "Failed to initialize nftables syn-limit chain" >&2
+        return 1
+    fi
 
     nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
     nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
@@ -818,9 +830,13 @@ function tcp_syn_limit_set() {
     local dst_rate=${3:-${TCP_SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${TCP_SYN_DST_BURST:-"40000"}}
     local backend=${TCP_LIMITER_BACKEND:-"auto"}
-    # 底层哈希桶容量与动态老化窗口 (无需外部传参)
-    local src_htable_max=262144
-    local dst_htable_max=2048
+    # Sizing for hashlimit / nftables dynamic meter capacity:
+    # - src_htable_max: capacity for unique concurrent source IP tracking. Default 262144 (~256k sources)
+    #   is sized to withstand broad distributed scanners while keeping kernel hash memory within ~16-32MB.
+    # - dst_htable_max: capacity for destination VIP/EIP tracking. Default 2048 covers typical VPC EIP
+    #   allocation limits. Both can be tuned via environment variables if deployed in ultra-large clusters.
+    local src_htable_max=${TCP_SYN_SRC_HTABLE_MAX:-262144}
+    local dst_htable_max=${TCP_SYN_DST_HTABLE_MAX:-2048}
 
     check_inited
 

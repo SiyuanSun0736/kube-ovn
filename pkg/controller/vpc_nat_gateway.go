@@ -323,7 +323,7 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 	return c.patchNatGwHairpinSNATStatus(gw.Name, mode)
 }
 
-func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) int {
+func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) int32 {
 	// 1. Explicit spec field
 	if gw.Spec.TCPConnLimit != nil {
 		if *gw.Spec.TCPConnLimit >= 0 {
@@ -331,16 +331,16 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 		}
 		klog.Warningf("nat gw %s has invalid negative spec.tcpConnLimit %d, ignoring", gw.Name, *gw.Spec.TCPConnLimit)
 	}
-	// 2. Annotation
+	// 2. Annotation fallback
 	if val, ok := gw.Annotations[util.VpcNatTCPConnLimitAnnotation]; ok {
-		limit, err := strconv.Atoi(strings.TrimSpace(val))
+		limit, err := strconv.ParseInt(strings.TrimSpace(val), 10, 32)
 		if err == nil && limit >= 0 {
-			return limit
+			return int32(limit)
 		}
 		klog.Warningf("nat gw %s has invalid annotation %s=%q, falling back to default %d", gw.Name, util.VpcNatTCPConnLimitAnnotation, val, util.DefaultNatGwTCPConnLimit)
 	}
 	// 3. Standalone default connlimit fallback (50,000 / 5w)
-	return util.DefaultNatGwTCPConnLimit
+	return int32(util.DefaultNatGwTCPConnLimit)
 }
 
 func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
@@ -387,6 +387,11 @@ func isUnsupportedCommandError(err error, operation string) bool {
 }
 
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
+	// Note: util.VpcNatTCPConnLimitAnnotation serves dual purposes:
+	// 1. On VpcNatGateway CR (gw.Annotations): user configuration fallback if spec.tcpConnLimit is unset.
+	// 2. On NAT Gateway Pod (pod.Annotations): records the effective limit currently applied inside this Pod,
+	//    allowing the controller to track convergence and avoid executing redundant iptables/nft commands.
+
 	// If the Pod was already marked as running an image without tcp-connlimit-set, check whether to skip
 	if pod.Annotations != nil && pod.Annotations[util.VpcNatTCPConnLimitAnnotation] == tcpConnLimitUnsupported {
 		if gw.Status.TCPConnLimit != nil {
@@ -423,12 +428,13 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		appliedLimit = pod.Annotations[util.VpcNatTCPConnLimitAnnotation]
 	}
 
+	effectiveLimitStr := strconv.FormatInt(int64(effectiveLimit), 10)
 	if !force && gw.Status.TCPConnLimit != nil && *gw.Status.TCPConnLimit == effectiveLimit &&
-		appliedMode == dataplaneMode && appliedLimit == strconv.Itoa(effectiveLimit) {
+		appliedMode == dataplaneMode && appliedLimit == effectiveLimitStr {
 		return nil
 	}
 
-	args := []string{strconv.Itoa(desiredLimit), dataplaneMode}
+	args := []string{strconv.FormatInt(int64(desiredLimit), 10), dataplaneMode}
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTCPConnLimitSet, args); err != nil {
 		if isUnsupportedCommandError(err, natGwTCPConnLimitSet) {
 			klog.Warningf("nat gw %s runs a script without %s: connlimit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTCPConnLimitSet, err)
@@ -450,7 +456,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	}
 
 	patch := util.KVPatch{
-		util.VpcNatTCPConnLimitAnnotation:         strconv.Itoa(effectiveLimit),
+		util.VpcNatTCPConnLimitAnnotation:         effectiveLimitStr,
 		util.VpcNatGatewayDataplaneModeAnnotation: dataplaneMode,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
@@ -497,7 +503,7 @@ func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *
 	return nil
 }
 
-func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int) error {
+func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error {
 	oriGw, err := c.vpcNatGatewayLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -509,7 +515,7 @@ func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int) error {
 	if oriGw.Status.TCPConnLimit != nil && *oriGw.Status.TCPConnLimit == limit {
 		return nil
 	}
-	patch, err := json.Marshal(map[string]any{"status": map[string]int{"tcpConnLimit": limit}})
+	patch, err := json.Marshal(map[string]any{"status": map[string]int32{"tcpConnLimit": limit}})
 	if err != nil {
 		return err
 	}

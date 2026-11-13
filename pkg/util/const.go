@@ -53,9 +53,12 @@ const (
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
-	VpcNatTCPConnLimitAnnotation            = "ovn.kubernetes.io/tcp-connlimit"
-	VpcNatTCPSynDstRateLimitAnnotation      = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
-	VpcNatTCPSynDstBurstLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
+	// VpcNatTCPConnLimitAnnotation serves a dual purpose:
+	// 1. On VpcNatGateway CR (gw.Annotations): optional user configuration fallback if spec.tcpConnLimit is unset.
+	// 2. On NAT Gateway Pod (pod.Annotations): records the applied limit value (or "unsupported") to track convergence.
+	VpcNatTCPConnLimitAnnotation        = "ovn.kubernetes.io/tcp-connlimit"
+	VpcNatTCPSynDstRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
+	VpcNatTCPSynDstBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
 	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state (or "unsupported") on the gateway Pod.
 	VpcNatTCPSynLimitStateAnnotation = "ovn.kubernetes.io/tcp-syn-limit-state"
 	OvnEipTypeLabel                  = "ovn.kubernetes.io/ovn_eip_type"
