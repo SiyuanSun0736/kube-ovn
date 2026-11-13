@@ -948,8 +948,14 @@ func TestNatGwDesiredTCPConnLimit(t *testing.T) {
 	gw.Spec.TCPConnLimit = ptr.To(int32(0))
 	assert.Equal(t, int32(0), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
-	// 5. Removing spec field restores default (50000)
+	// 5. Negative spec field falls back to default directly (authoritative, does not fall through to annotation)
+	gw.Spec.TCPConnLimit = ptr.To(int32(-1))
+	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
+	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
+
+	// 6. Removing spec field restores annotation or default
 	gw.Spec.TCPConnLimit = nil
+	assert.Equal(t, int32(15000), ctrl.getNatGwDesiredTCPConnLimit(gw))
 	delete(gw.Annotations, util.VpcNatTCPConnLimitAnnotation)
 	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 }
