@@ -2859,6 +2859,6 @@ case $opt in
         echo "Unknown command: $opt" >&2
         echo "" >&2
         show_help >&2
-        exit 1
+        exit 127
         ;;
 esac

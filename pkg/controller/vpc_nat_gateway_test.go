@@ -1259,9 +1259,16 @@ func TestIsUnsupportedCommandError(t *testing.T) {
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=UNSUPPORTED_COMMAND: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("exit status 127: stderr=UNSUPPORTED_COMMAND: tcp-connlimit-set\nUnknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTCPConnLimitSet))
+
+	// False positive prevention: user input reflecting sentinel or unknown command inside validation error MUST NOT match
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid SYN src_rate 'UNSUPPORTED_COMMAND: tcp-syn-limit-set' stdout="), natGwTCPSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid SYN src_rate 'Unknown command: tcp-syn-limit-set' stdout="), natGwTCPSynLimitSet))
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid tcp connlimit value 'UNSUPPORTED_COMMAND: tcp-connlimit-set': must be an integer stdout="), natGwTCPConnLimitSet))
+
 	// False positive prevention: "unknown command: tcp-connlimit-set" inside stdout must NOT match when stderr is present
 	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=iptables error stdout=unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
 	require.False(t, isUnsupportedCommandError(nil, natGwTCPConnLimitSet))
