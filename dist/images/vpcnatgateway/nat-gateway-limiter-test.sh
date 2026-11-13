@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Note: This test script is strictly for local and CI automated verification.
+# It is excluded from the production gateway container image (never packaged).
 set -Eeuo pipefail
 
 script="$(cd "$(dirname "$0")" && pwd)/nat-gateway.sh"
@@ -106,7 +108,7 @@ for disabled_val in "0" "0/s" "disable" "disabled" "none" "off"; do
     fi
 done
 
-for enabled_val in "100/s" "1000/s" "1/minute" "enable"; do
+for enabled_val in "100/s" "1000/s" "1/minute" "enable" "0/invalid" "0/foo"; do
     if is_syn_limit_disabled "$enabled_val"; then
         echo "FAIL: is_syn_limit_disabled must return 1 for '$enabled_val'" >&2
         exit 1

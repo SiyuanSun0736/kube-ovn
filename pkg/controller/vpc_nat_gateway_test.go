@@ -934,24 +934,24 @@ func TestNatGwDesiredTCPConnLimit(t *testing.T) {
 
 	// 1. Default when unset: 50,000
 	gw := fakeGw("gw")
-	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 2. Custom annotation tcp-connlimit
 	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
-	assert.Equal(t, 15000, ctrl.getNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, int32(15000), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 3. Spec field overrides annotation
-	gw.Spec.TCPConnLimit = ptr.To(30000)
-	assert.Equal(t, 30000, ctrl.getNatGwDesiredTCPConnLimit(gw))
+	gw.Spec.TCPConnLimit = ptr.To(int32(30000))
+	assert.Equal(t, int32(30000), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 4. Spec field 0 disables connlimit
-	gw.Spec.TCPConnLimit = ptr.To(0)
-	assert.Equal(t, 0, ctrl.getNatGwDesiredTCPConnLimit(gw))
+	gw.Spec.TCPConnLimit = ptr.To(int32(0))
+	assert.Equal(t, int32(0), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
 	// 5. Removing spec field restores default (50000)
 	gw.Spec.TCPConnLimit = nil
 	delete(gw.Annotations, util.VpcNatTCPConnLimitAnnotation)
-	assert.Equal(t, util.DefaultNatGwTCPConnLimit, ctrl.getNatGwDesiredTCPConnLimit(gw))
+	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 }
 
 func TestSyncNatGwTCPConnLimit(t *testing.T) {
@@ -977,11 +977,11 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, patched.Status.TCPConnLimit)
-	require.Equal(t, 50000, *patched.Status.TCPConnLimit)
+	require.Equal(t, int32(50000), *patched.Status.TCPConnLimit)
 
 	// 2. Converged: status matches desired, no re-exec
 	calls = nil
-	gw.Status.TCPConnLimit = ptr.To(50000)
+	gw.Status.TCPConnLimit = ptr.To(int32(50000))
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
@@ -991,40 +991,40 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	require.Empty(t, calls)
 
 	// 3. Dynamic modification: spec changed to 20000
-	gw.Spec.TCPConnLimit = ptr.To(20000)
+	gw.Spec.TCPConnLimit = ptr.To(int32(20000))
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "20000", "stateful"}}, calls)
 
 	// 4. Disable: spec set to 0
 	calls = nil
-	gw.Status.TCPConnLimit = ptr.To(20000)
-	gw.Spec.TCPConnLimit = ptr.To(0)
+	gw.Status.TCPConnLimit = ptr.To(int32(20000))
+	gw.Spec.TCPConnLimit = ptr.To(int32(0))
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "0", "stateful"}}, calls)
 
 	// 5. Stateless mode: pass dataplane mode to script and publish effective limit 0
 	calls = nil
-	gw.Status.TCPConnLimit = ptr.To(0)
-	gw.Spec.TCPConnLimit = ptr.To(15000)
+	gw.Status.TCPConnLimit = ptr.To(int32(0))
+	gw.Spec.TCPConnLimit = ptr.To(int32(15000))
 	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "stateless"}
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "15000", "stateless"}}, calls)
 	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
 	require.NoError(t, getErr)
-	require.Equal(t, ptr.To(0), patchedGw.Status.TCPConnLimit)
+	require.Equal(t, ptr.To(int32(0)), patchedGw.Status.TCPConnLimit)
 
 	// 6. Negative spec value safely falls back to default 50000
 	calls = nil
 	delete(gw.Annotations, util.VpcNatGatewayDataplaneModeAnnotation)
-	gw.Spec.TCPConnLimit = ptr.To(-100)
+	gw.Spec.TCPConnLimit = ptr.To(int32(-100))
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "50000", "stateful"}}, calls)
 }
 
 func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	gw := fakeGw("gw")
-	gw.Status.TCPConnLimit = ptr.To(10000)
-	gw.Spec.TCPConnLimit = ptr.To(10000)
+	gw.Status.TCPConnLimit = ptr.To(int32(10000))
+	gw.Spec.TCPConnLimit = ptr.To(int32(10000))
 
 	newPod := fakeNatGwPod("gw", true)
 	skewPod := fakeNatGwPod("gw-skew", true)
