@@ -486,7 +486,7 @@ function ensure_iptables_syn_limit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t raw -N VPC_SYN_LIMIT 2>/dev/null || true
         $iptables_cmd -t raw -C PREROUTING -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_SYN_LIMIT 2>/dev/null || \
-            $iptables_cmd -t raw -A PREROUTING -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_SYN_LIMIT
+            $iptables_cmd -t raw -I PREROUTING 1 -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_SYN_LIMIT
     fi
 }
 
@@ -546,7 +546,7 @@ function apply_nft_connlimit() {
     [ -z "$nft_cmd" ] && return 1
 
     # If already configured with identical limit, avoid flushing to preserve connection accounting
-    if $nft_cmd list chain ip "$NFT_TABLE" conn-limit 2>/dev/null | grep -E -q -- "ct count over $limit([[:space:]]|$)"; then
+    if $nft_cmd list chain ip "$NFT_TABLE" conn-limit 2>/dev/null | grep -F -q -- "ct count over $limit drop"; then
         echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
     else
         local -a cmds=(
@@ -560,15 +560,10 @@ function apply_nft_connlimit() {
             "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return"
             "add rule ip $NFT_TABLE conn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
             "add rule ip $NFT_TABLE conn-limit tcp dport 179 return"
+            "add rule ip $NFT_TABLE conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over $limit drop"
         )
         if ! nft_transaction "${cmds[@]}"; then
-            echo "Failed to create nftables conn-limit chain" >&2
-            return 1
-        fi
-
-        # Propagate error if adding the ct count rule fails
-        if ! $nft_cmd add rule ip "$NFT_TABLE" conn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn ct count over "$limit" drop; then
-            echo "Failed to install nftables conn-limit rule" >&2
+            echo "Failed to install nftables conn-limit rules" >&2
             flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" 2>/dev/null || true
             return 1
         fi
@@ -681,7 +676,17 @@ function calc_bucket_expire_ms() {
     # Ensure idle expiry is at least the token refill period ceil(burst * unit_ms / num),
     # with a minimum baseline of 10000ms (10s) and an upper bound of 86400000ms (24h)
     # to prevent premature entry eviction or kernel u32 parameter overflow.
-    local refill_ms=$(( (burst * unit_ms + num - 1) / num ))
+    # Prevent 32-bit arithmetic overflow: if burst / num >= 86400000 / unit_ms,
+    # the refill period already meets or exceeds the 86400000ms cap.
+    local max_ratio=$(( 86400000 / unit_ms ))
+    local q=$(( burst / num ))
+    if [ "$q" -ge "$max_ratio" ]; then
+        echo "86400000"
+        return 0
+    fi
+
+    local r=$(( burst % num ))
+    local refill_ms=$(( q * unit_ms + (r * unit_ms + num - 1) / num ))
     if [ "$refill_ms" -lt 10000 ]; then
         refill_ms=10000
     elif [ "$refill_ms" -gt 86400000 ]; then
@@ -750,8 +755,10 @@ function apply_iptables_syn_limit() {
     fi
 
     flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
-    nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
-    nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+    if [ -n "$nft_cmd" ] && $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+    fi
     return 0
 }
 
@@ -796,32 +803,19 @@ function apply_nft_syn_limit() {
         local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
         [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
         tx_cmds=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }" "${tx_cmds[@]}")
+        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_src_meter { ip saddr limit rate over $nft_src_rate burst $src_burst packets } drop")
     fi
     if [ "$dst_enabled" -eq 1 ]; then
         local dst_expire_sec=$(( (dst_htable_expire + 999) / 1000 ))
         [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
         tx_cmds=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }" "${tx_cmds[@]}")
+        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_dst_meter { ip daddr limit rate over $nft_dst_rate burst $dst_burst packets } drop")
     fi
 
     if ! nft_transaction "${tx_cmds[@]}"; then
-        echo "Failed to create nftables syn-limit sets or base rules" >&2
+        echo "Failed to install nftables syn-limit sets and rules" >&2
+        flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
         return 1
-    fi
-
-    # Propagate error if adding nft rules fails
-    if [ "$src_enabled" -eq 1 ]; then
-        if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn update @syn_src_meter \{ ip saddr limit rate over "$nft_src_rate" burst "$src_burst" packets \} drop; then
-            echo "Failed to install nftables syn_src_meter rule" >&2
-            flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
-            return 1
-        fi
-    fi
-    if [ "$dst_enabled" -eq 1 ]; then
-        if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn update @syn_dst_meter \{ ip daddr limit rate over "$nft_dst_rate" burst "$dst_burst" packets \} drop; then
-            echo "Failed to install nftables syn_dst_meter rule" >&2
-            flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
-            return 1
-        fi
     fi
 
     flush_iptables_chain_if_exists "raw" "VPC_SYN_LIMIT" 2>/dev/null || true
@@ -854,8 +848,10 @@ function tcp_syn_limit_set() {
         echo "TCP SYN rate limit is disabled (src_rate=$src_rate, dst_rate=$dst_rate), clearing raw syn limit rules"
         flush_iptables_chain_if_exists "raw" "VPC_SYN_LIMIT" || return 1
         flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" || return 1
-        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
-        nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+        if [ -n "$nft_cmd" ] && $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+            nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+        fi
         return 0
     fi
 

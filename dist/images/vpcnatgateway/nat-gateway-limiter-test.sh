@@ -85,6 +85,7 @@ assert_expire "1/m" "5" "300000"
 assert_expire "2/hour" "1" "1800000"
 # Excessively large duration should be capped at 86400000ms (24h)
 assert_expire "1/day" "10" "86400000"
+assert_expire "1/hour" "40000" "86400000"
 # Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
 assert_expire "0/s" "10" "10000"
 assert_expire "invalid" "10" "10000"
@@ -123,7 +124,7 @@ done
 mock_log="$tmp_dir/mock.log"
 check_inited() { return 0; }
 nft() {
-    if [ "${MOCK_NFT_FAIL:-0}" -eq 1 ] && [[ "$*" == *"add rule ip"* ]]; then
+    if [ "${MOCK_NFT_FAIL:-0}" -eq 1 ]; then
         return 1
     fi
     if [ "${1:-}" = "-f" ]; then
@@ -157,7 +158,7 @@ if grep -q -- "-A VPC_CONNLIMIT" "$mock_log"; then
     echo "FAIL: auto mode must not install iptables VPC_CONNLIMIT when nft succeeds" >&2
     exit 1
 fi
-if ! grep -q -- "NFT: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over 50000 drop" "$mock_log"; then
+if ! grep -q -- "NFT_TX: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over 50000 drop" "$mock_log"; then
     echo "FAIL: auto mode did not install expected nft conn-limit rule" >&2
     exit 1
 fi
