@@ -91,6 +91,7 @@ type VpcNatGatewaySpec struct {
 	// Set to positive integer for custom threshold; set to 0 to disable connlimit without affecting pre-routing SYN rate limiting.
 	// Applied dynamically without Pod recreation.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
 	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.

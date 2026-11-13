@@ -571,6 +571,7 @@ function apply_nft_connlimit() {
         # Propagate error if adding the ct count rule fails
         if ! $nft_cmd add rule ip "$NFT_TABLE" conn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn ct count over "$limit" drop; then
             echo "Failed to install nftables conn-limit rule" >&2
+            flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" 2>/dev/null || true
             return 1
         fi
     fi
@@ -664,6 +665,11 @@ function calc_bucket_expire_ms() {
     local unit_ms=1000
 
     if [ -z "$num" ] || ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ]; then
+        echo "10000"
+        return 0
+    fi
+
+    if [ -z "$burst" ] || ! [[ "$burst" =~ ^[0-9]+$ ]] || [ "$burst" -le 0 ]; then
         echo "10000"
         return 0
     fi
@@ -810,12 +816,14 @@ function apply_nft_syn_limit() {
     if [ "$src_enabled" -eq 1 ]; then
         if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn update @syn_src_meter \{ ip saddr limit rate over "$nft_src_rate" burst "$src_burst" packets \} drop; then
             echo "Failed to install nftables syn_src_meter rule" >&2
+            flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
             return 1
         fi
     fi
     if [ "$dst_enabled" -eq 1 ]; then
         if ! $nft_cmd add rule ip "$NFT_TABLE" syn-limit tcp flags \& \(fin\|syn\|rst\|ack\) == syn update @syn_dst_meter \{ ip daddr limit rate over "$nft_dst_rate" burst "$dst_burst" packets \} drop; then
             echo "Failed to install nftables syn_dst_meter rule" >&2
+            flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
             return 1
         fi
     fi
