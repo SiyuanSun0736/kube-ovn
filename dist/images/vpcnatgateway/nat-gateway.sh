@@ -549,9 +549,10 @@ function apply_nft_connlimit() {
     if $nft_cmd list chain ip "$NFT_TABLE" conn-limit 2>/dev/null | grep -F -q -- "ct count over $limit drop"; then
         echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
     else
-        local -a cmds=(
-            "add table ip $NFT_TABLE"
-        )
+        local -a cmds=()
+        if ! $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            cmds+=("add table ip $NFT_TABLE")
+        fi
         if ! $nft_cmd list chain ip "$NFT_TABLE" conn-limit >/dev/null 2>&1; then
             cmds+=("add chain ip $NFT_TABLE conn-limit { type filter hook prerouting priority -150; policy accept; }")
         fi
@@ -779,9 +780,10 @@ function apply_nft_syn_limit() {
     # Flush chain to release references to existing meters, then delete old sets so new timeout takes effect.
     # Base chain is created only when missing because 'add chain' on an existing base chain returns EEXIST
     # on stricter nftables versions and rolls back the transaction.
-    local -a init_cmds=(
-        "add table ip $NFT_TABLE"
-    )
+    local -a init_cmds=()
+    if ! $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        init_cmds+=("add table ip $NFT_TABLE")
+    fi
     if ! $nft_cmd list chain ip "$NFT_TABLE" syn-limit >/dev/null 2>&1; then
         init_cmds+=("add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }")
     fi

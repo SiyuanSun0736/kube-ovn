@@ -520,6 +520,7 @@ func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error
 	}
 	patch, err := json.Marshal(map[string]any{"status": map[string]int32{"tcpConnLimit": limit}})
 	if err != nil {
+		klog.Errorf("failed to marshal status.tcpConnLimit=%d patch for vpc nat gw %s: %v", limit, key, err)
 		return err
 	}
 	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
@@ -544,6 +545,7 @@ func (c *Controller) clearNatGwTCPConnLimitStatus(key string) error {
 	}
 	patch, err := json.Marshal(map[string]any{"status": map[string]any{"tcpConnLimit": nil}})
 	if err != nil {
+		klog.Errorf("failed to marshal clear status.tcpConnLimit patch for vpc nat gw %s: %v", key, err)
 		return err
 	}
 	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
@@ -865,11 +867,9 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		if isCustomConnLimit {
 			return connLimitErr
 		}
-		if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-			util.VpcNatTCPConnLimitStateAnnotation: tcpConnLimitUnsupported,
-		}); patchErr != nil {
-			klog.Errorf("failed to patch pod %s/%s unsupported connlimit annotation: %v", pod.Namespace, pod.Name, patchErr)
-		}
+		// Note: For default unconfigured connlimit, do not mark the Pod as permanently unsupported
+		// on transient execution errors so subsequent reconciles can retry. Unsupported older images
+		// are already marked inside syncNatGwTCPConnLimit.
 		if gw.Status.TCPConnLimit != nil {
 			if clearErr := c.clearNatGwTCPConnLimitStatus(gw.Name); clearErr != nil {
 				klog.Errorf("failed to clear status.tcpConnLimit for nat gw %s: %v", gw.Name, clearErr)
@@ -892,11 +892,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		if isCustomSynLimit {
 			return synLimitErr
 		}
-		if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-			util.VpcNatTCPSynLimitStateAnnotation: tcpSynLimitUnsupported,
-		}); patchErr != nil {
-			klog.Errorf("failed to patch pod %s/%s unsupported syn limit annotation: %v", pod.Namespace, pod.Name, patchErr)
-		}
+		// Note: For default baseline SYN limits, transient execution errors do not mark unsupported
+		// so subsequent reconciles can retry. Unsupported older images are marked inside syncNatGwTCPSynRateLimit.
 	}
 
 	if gw.Spec.QoSPolicy != "" {

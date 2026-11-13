@@ -23,6 +23,8 @@ assert_rate() {
     fi
 }
 
+assert_rate "1/s" "1/second"
+assert_rate "9/s" "9/second"
 assert_rate "500/s" "500/second"
 assert_rate "500/sec" "500/second"
 assert_rate "500/second" "500/second"
@@ -98,6 +100,14 @@ assert_expire "1000/s" "" "10000"
 rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
 if [[ "0/s" =~ $rate_pattern ]]; then
     echo "FAIL: rate_pattern must reject 0/s" >&2
+    exit 1
+fi
+if ! [[ "1/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 1/s" >&2
+    exit 1
+fi
+if ! [[ "9/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 9/s" >&2
     exit 1
 fi
 if ! [[ "100/s" =~ $rate_pattern ]]; then
