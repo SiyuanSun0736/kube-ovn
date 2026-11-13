@@ -347,23 +347,31 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 	return int32(util.DefaultNatGwTCPConnLimit)
 }
 
+func cleanRateLimitAnnotation(val, fallback string) string {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
+		return fallback
+	}
+	return trimmed
+}
+
 func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
 	srcRate := util.DefaultNatGwTCPSynSrcRate
 	srcBurst := util.DefaultNatGwTCPSynSrcBurst
 	dstRate := util.DefaultNatGwTCPSynDstRate
 	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
-	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcRate = strings.TrimSpace(val)
+	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation]; ok {
+		srcRate = cleanRateLimitAnnotation(val, srcRate)
 	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		srcBurst = strings.TrimSpace(val)
+	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcBurstLimitAnnotation]; ok {
+		srcBurst = cleanRateLimitAnnotation(val, srcBurst)
 	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		dstRate = strings.TrimSpace(val)
+	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok {
+		dstRate = cleanRateLimitAnnotation(val, dstRate)
 	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynDstBurstLimitAnnotation]; ok && strings.TrimSpace(val) != "" {
-		dstBurst = strings.TrimSpace(val)
+	if val, ok := gw.Annotations[util.VpcNatTCPSynDstBurstLimitAnnotation]; ok {
+		dstBurst = cleanRateLimitAnnotation(val, dstBurst)
 	}
 
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
@@ -394,13 +402,18 @@ func isUnsupportedCommandError(err error, operation string) bool {
 
 	errStr := strings.ToLower(err.Error())
 
-	// 1. Structured sentinel check (highest precision, unambiguous)
-	if strings.Contains(errStr, sentinel) {
+	// 1. If command exited with status 127 (POSIX standard "command not found" emitted by gateway script),
+	// check if the sentinel or target is present.
+	isExit127 := strings.Contains(errStr, "exit status 127") ||
+		strings.Contains(errStr, "exit code 127") ||
+		strings.Contains(errStr, "command terminated with exit code 127")
+	if isExit127 && (strings.Contains(errStr, sentinel) || strings.Contains(errStr, legacyTarget)) {
 		return true
 	}
 
-	// 2. When wrapped by execNatGwRules (stderr=... stdout=...), match within stderr
-	// to avoid false positives if stdout happens to contain command names or error strings.
+	// 2. Extract the stderr segment if wrapped by execNatGwRules (stderr=... stdout=...).
+	// Never match against full error string or stdout to prevent forged command strings
+	// reflected in validation errors or unrelated stdout messages.
 	targetSegment := errStr
 	if idxStderr := strings.Index(errStr, "stderr="); idxStderr != -1 {
 		idxStdout := strings.Index(errStr[idxStderr:], "stdout=")
@@ -409,9 +422,26 @@ func isUnsupportedCommandError(err error, operation string) bool {
 		} else {
 			targetSegment = errStr[idxStderr+len("stderr="):]
 		}
+	} else if strings.HasPrefix(targetSegment, "exit status ") || strings.HasPrefix(targetSegment, "command terminated with ") {
+		if idx := strings.Index(targetSegment, ": "); idx != -1 {
+			targetSegment = targetSegment[idx+2:]
+		}
 	}
 
-	return strings.Contains(targetSegment, legacyTarget)
+	// 3. Line-by-line inspection: must match exact standalone sentinel or unknown command line.
+	// Reject lines that are parameter validation errors (e.g. starting with "error:" or containing
+	// quoted parameter reflections like 'UNSUPPORTED_COMMAND: ...').
+	for _, rawLine := range strings.Split(targetSegment, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "error:") {
+			continue
+		}
+		if line == sentinel || line == legacyTarget {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
