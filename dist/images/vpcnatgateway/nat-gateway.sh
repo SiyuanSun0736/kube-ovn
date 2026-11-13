@@ -523,7 +523,7 @@ function apply_iptables_connlimit() {
     ensure_iptables_connlimit_chain
 
     # If already configured with identical limit, avoid flushing to preserve connection accounting
-    if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -E -q -- "--connlimit-above $limit([[:space:]]|$)"; then
+    if $iptables_cmd -t mangle -S VPC_CONNLIMIT 2>/dev/null | grep -F -q -- "--connlimit-above $limit --connlimit-mask 0"; then
         echo "TCP connlimit $limit is already installed in iptables, keeping existing accounting match"
     else
         $iptables_cmd -t mangle -F VPC_CONNLIMIT
@@ -596,7 +596,7 @@ function tcp_connlimit_set() {
     fi
 
     # 2. Disabled (0 or empty): clean connlimit rules
-    if [ -z "$limit" ] || [ "$limit" -eq 0 ]; then
+    if [ -z "$limit" ] || [ "$limit" = "0" ]; then
         echo "TCP connlimit is disabled (limit=$limit), clearing connlimit rules"
         flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
         flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
@@ -1313,12 +1313,14 @@ function nft_identity_chain_name() {
 # Submitted as a single netlink batch via `nft -f`.
 # Returns 0 on success, non-zero on failure.
 function nft_transaction() {
-    printf '%s\n' "$@" | nft -f -
+    [ -z "$nft_cmd" ] && return 1
+    printf '%s\n' "$@" | $nft_cmd -f -
 }
 
 # Same as nft_transaction but ignores errors (for idempotent cleanup).
 function nft_transaction_ignore_errors() {
-    printf '%s\n' "$@" | nft -f - 2>/dev/null || true
+    [ -z "$nft_cmd" ] && return 0
+    printf '%s\n' "$@" | $nft_cmd -f - 2>/dev/null || true
 }
 
 # Compute the identity hash (md5 prefix of eip:dport:protocol). This is the suffix used by
@@ -1351,7 +1353,7 @@ function cleanup_nft_affinity_objects() {
     # nft 1.0.x does not support `list chains ip <table>` or `list sets ip <table>`.
     # Enumerate the table once and select only objects owned by this identity.
     local table_dump
-    table_dump=$(nft list table ip "$NFT_TABLE" 2>/dev/null || true)
+    [ -n "$nft_cmd" ] && table_dump=$($nft_cmd list table ip "$NFT_TABLE" 2>/dev/null || true)
 
     for obj in $(printf '%s\n' "$table_dump" | grep -oE "chain ep-${idhash}-[0-9a-f]+" | awk '{print $2}'); do
         bk=${obj#ep-${idhash}-}
@@ -1476,20 +1478,20 @@ function add_nft_dnat_map() {
         # on stricter nftables builds and roll back the whole batch. The base chain is
         # share-dnat-exclusive; flushing it wipes any other rule in it (see NFT_PREROUTING_CHAIN).
         local -a cmds=()
-        if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        if ! $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
             cmds+=("add table ip $NFT_TABLE")
         fi
-        if ! nft list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" >/dev/null 2>&1; then
+        if ! $nft_cmd list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" >/dev/null 2>&1; then
             cmds+=("add map ip $NFT_TABLE $NFT_SERVICES_MAP { type ipv4_addr . inet_proto . inet_service : verdict ; }")
         fi
-        if ! nft list chain ip "$NFT_TABLE" "$NFT_PREROUTING_CHAIN" >/dev/null 2>&1; then
+        if ! $nft_cmd list chain ip "$NFT_TABLE" "$NFT_PREROUTING_CHAIN" >/dev/null 2>&1; then
             cmds+=("add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }")
         fi
         cmds+=(
             "flush chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN"
             "add rule ip $NFT_TABLE $NFT_PREROUTING_CHAIN ip daddr . meta l4proto . th dport vmap @$NFT_SERVICES_MAP"
         )
-        if ! nft list chain ip "$NFT_TABLE" "$identity_chain" >/dev/null 2>&1; then
+        if ! $nft_cmd list chain ip "$NFT_TABLE" "$identity_chain" >/dev/null 2>&1; then
             cmds+=("add chain ip $NFT_TABLE $identity_chain")
         fi
 
@@ -1520,10 +1522,10 @@ function add_nft_dnat_map() {
 
                 # create-only-when-missing (same EEXIST reasoning as above); an existing set
                 # keeps its affinity state for surviving clients when the chain is flushed
-                if ! nft list set ip "$NFT_TABLE" "$aff_set" >/dev/null 2>&1; then
+                if ! $nft_cmd list set ip "$NFT_TABLE" "$aff_set" >/dev/null 2>&1; then
                     cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
                 fi
-                if ! nft list chain ip "$NFT_TABLE" "$ep_chain" >/dev/null 2>&1; then
+                if ! $nft_cmd list chain ip "$NFT_TABLE" "$ep_chain" >/dev/null 2>&1; then
                     cmds+=("add chain ip $NFT_TABLE $ep_chain")
                 fi
                 cmds+=("flush chain ip $NFT_TABLE $ep_chain")
@@ -1578,10 +1580,11 @@ function del_nft_dnat_map() {
     # Format: eip,dport,protocol
     check_inited
 
+    [ -z "$nft_cmd" ] && return 0
     # Check if table exists (global precondition): if absent there is nothing to delete
     # for any rule, so return early. Kept outside the loop so a missing table does not
     # silently skip the remaining rules in a batch call.
-    if ! nft list table ip $NFT_TABLE >/dev/null 2>&1; then
+    if ! $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
         echo "NFT table $NFT_TABLE does not exist, nothing to delete"
         return 0
     fi
@@ -1624,7 +1627,7 @@ function del_nft_dnat_map() {
         # These are separate operations because nft -f is transactional (all-or-nothing):
         # if the element doesn't exist, a single transaction would roll back and
         # leave the chain behind. By splitting, each step is independently idempotent.
-        nft delete element ip $NFT_TABLE $NFT_SERVICES_MAP "{ $eip . $nft_proto . $dport }" 2>/dev/null || true
+        $nft_cmd delete element ip "$NFT_TABLE" "$NFT_SERVICES_MAP" "{ $eip . $nft_proto . $dport }" 2>/dev/null || true
         nft_transaction_ignore_errors \
             "flush chain ip $NFT_TABLE $identity_chain" \
             "delete chain ip $NFT_TABLE $identity_chain"
@@ -1722,7 +1725,7 @@ function sync_nft_lanvip() {
     done
     local want_count=${#r_vip[@]}
 
-    if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+    if [ -z "$nft_cmd" ] || ! $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
         if [ "$want_count" -eq 0 ]; then
             echo "NFT table $NFT_TABLE does not exist, nothing to sync"
             return 0
@@ -1731,9 +1734,9 @@ function sync_nft_lanvip() {
 
     # Drop stale partition identities: vmap elements whose address is the gateway's own VPC
     # address (or any vip the desired set names) and whose (vip, proto, port) is not wanted.
-    if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+    if [ -n "$nft_cmd" ] && $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
         local map_dump el e_vip e_proto e_port wanted vip_scoped
-        map_dump=$(nft list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" 2>/dev/null || true)
+        map_dump=$($nft_cmd list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" 2>/dev/null || true)
         while IFS= read -r el; do
             [ -z "$el" ] && continue
             e_vip=$(awk '{print $1}' <<< "$el")
@@ -1769,9 +1772,9 @@ function sync_nft_lanvip() {
 
     # Drop dnat-* chains no map element references any more (stale or crash-orphaned ones).
     # Affinity chains/sets of the removed identities go with them.
-    if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+    if [ -n "$nft_cmd" ] && $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
         local table_dump referenced cname
-        table_dump=$(nft list table ip "$NFT_TABLE" 2>/dev/null || true)
+        table_dump=$($nft_cmd list table ip "$NFT_TABLE" 2>/dev/null || true)
         referenced=$(printf '%s\n' "$table_dump" | grep -oE 'goto dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u || true)
         for cname in $(printf '%s\n' "$table_dump" | grep -oE 'chain dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u); do
             if ! printf '%s\n' "$referenced" | grep -qxF "$cname"; then
