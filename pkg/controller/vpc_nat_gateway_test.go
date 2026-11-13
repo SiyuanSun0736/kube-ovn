@@ -822,7 +822,7 @@ func TestNatGwStatusWritersKeepHairpinSNAT(t *testing.T) {
 			got, err := gwClient.Get(t.Context(), "gw", metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, hairpinSNATEnable, got.Status.HairpinSNAT)
-			require.Equal(t, ptr.To(50000), got.Status.TCPConnLimit)
+			require.Equal(t, ptr.To(int32(50000)), got.Status.TCPConnLimit)
 		})
 	}
 }
@@ -985,7 +985,7 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
-	pod.Annotations[util.VpcNatTCPConnLimitAnnotation] = "50000"
+	pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation] = "50000"
 	pod.Annotations[util.VpcNatGatewayDataplaneModeAnnotation] = "stateful"
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Empty(t, calls)
@@ -1065,34 +1065,39 @@ func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 
 func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		failOp    string
-		failErr   error
-		expectErr bool
+		name       string
+		failOp     string
+		failErr    error
+		expectAnno string
+		expectVal  string
 	}{
 		{
-			name:      "connlimit failure aborts initialization",
-			failOp:    natGwTCPConnLimitSet,
-			failErr:   errors.New("iptables rule installation failed"),
-			expectErr: true,
+			name:       "connlimit failure tolerated during init (fail-open)",
+			failOp:     natGwTCPConnLimitSet,
+			failErr:    errors.New("iptables rule installation failed"),
+			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
+			expectVal:  tcpConnLimitUnsupported,
 		},
 		{
-			name:      "syn limit failure aborts initialization",
-			failOp:    natGwTCPSynLimitSet,
-			failErr:   errors.New("nftables rule installation failed"),
-			expectErr: true,
+			name:       "syn limit failure tolerated during init (fail-open)",
+			failOp:     natGwTCPSynLimitSet,
+			failErr:    errors.New("nftables rule installation failed"),
+			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
+			expectVal:  tcpSynLimitUnsupported,
 		},
 		{
-			name:      "unsupported connlimit command tolerated during init",
-			failOp:    natGwTCPConnLimitSet,
-			failErr:   errors.New("exit status 1: Unknown command: tcp-connlimit-set"),
-			expectErr: false,
+			name:       "unsupported connlimit command tolerated during init",
+			failOp:     natGwTCPConnLimitSet,
+			failErr:    errors.New("exit status 1: Unknown command: tcp-connlimit-set"),
+			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
+			expectVal:  tcpConnLimitUnsupported,
 		},
 		{
-			name:      "unsupported syn limit command tolerated during init",
-			failOp:    natGwTCPSynLimitSet,
-			failErr:   errors.New("exit status 1: Unknown command: tcp-syn-limit-set"),
-			expectErr: false,
+			name:       "unsupported syn limit command tolerated during init",
+			failOp:     natGwTCPSynLimitSet,
+			failErr:    errors.New("exit status 1: Unknown command: tcp-syn-limit-set"),
+			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
+			expectVal:  tcpSynLimitUnsupported,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1123,13 +1128,11 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			}
 
 			err = ctrl.handleInitVpcNatGw("gw-sec")
-			if tc.expectErr {
-				require.Error(t, err)
-				initializedPod, _ := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
-				require.NotEqual(t, "true", initializedPod.Annotations[util.VpcNatGatewayInitAnnotation], "failed security rule must not allow pod to be marked initialized")
-			} else {
-				require.NoError(t, err)
-			}
+			require.NoError(t, err, "limiter failure must not gate data plane initialization")
+			initializedPod, getErr := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
+			require.NoError(t, getErr)
+			require.Equal(t, "true", initializedPod.Annotations[util.VpcNatGatewayInitAnnotation], "gateway must be marked initialized")
+			require.Equal(t, tc.expectVal, initializedPod.Annotations[tc.expectAnno], "failed limiter must be marked unsupported on pod")
 		})
 	}
 }
@@ -1168,17 +1171,19 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
 
-	// 2. Custom dst rate limits via annotations
+	// 2. Custom dst and src rate limits via annotations
 	calls = nil
 	gw.Annotations = map[string]string{
+		util.VpcNatTCPSynSrcRateLimitAnnotation:  "5000/s",
+		util.VpcNatTCPSynSrcBurstLimitAnnotation: "10000",
 		util.VpcNatTCPSynDstRateLimitAnnotation:  "8000/s",
 		util.VpcNatTCPSynDstBurstLimitAnnotation: "16000",
 	}
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
 		natGwTCPSynLimitSet,
-		util.DefaultNatGwTCPSynSrcRate,
-		util.DefaultNatGwTCPSynSrcBurst,
+		"5000/s",
+		"10000",
 		"8000/s",
 		"16000",
 	}}, calls)

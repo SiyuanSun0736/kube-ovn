@@ -140,6 +140,9 @@ nft() {
 }
 mock_iptables() {
     echo "IPT: $*" >> "$mock_log"
+    if [[ "$*" == *"-C "* ]]; then
+        return 1
+    fi
     return 0
 }
 nft_cmd="nft"
@@ -158,10 +161,18 @@ if ! grep -q -- "NFT: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|a
     echo "FAIL: auto mode did not install expected nft conn-limit rule" >&2
     exit 1
 fi
+if ! grep -q -- 'NFT_TX: add rule ip kube-ovn conn-limit iifname != "net1" return' "$mock_log"; then
+    echo "FAIL: nft conn-limit must filter out non-external interface traffic" >&2
+    exit 1
+fi
 
 # 6b. Auto mode falls back to iptables when nft rule installation fails
 : > "$mock_log"
 MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1
+if ! grep -q -- 'IPT: -t mangle -I PREROUTING 1 -i net1 -p tcp --syn -j VPC_CONNLIMIT' "$mock_log"; then
+    echo "FAIL: iptables connlimit PREROUTING jump must scope to external interface" >&2
+    exit 1
+fi
 if ! grep -q -- "IPT: -t mangle -A VPC_CONNLIMIT -p tcp --syn -m connlimit --connlimit-above 50000" "$mock_log"; then
     echo "FAIL: auto mode must fall back to iptables when nft fails" >&2
     exit 1

@@ -206,10 +206,6 @@ function init() {
     $iptables_cmd -t mangle -A PREROUTING -j VPC_MARK
     $iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK --set-xmark 0x1/0x1
 
-    # Apply TCP SYN pre-routing rate limit and TCP connlimit
-    tcp_syn_limit_set
-    tcp_connlimit_set "${TCP_CONNLIMIT:-${CONNLIMIT:-50000}}"
-
     # Load IFB kernel module for ingress QoS traffic shaping
     # IFB (Intermediate Functional Block) is required for ingress rate limiting using HTB
     # Load it early in init to detect any issues before QoS rules are applied
@@ -474,12 +470,14 @@ function is_stateless_active() {
     return 1
 }
 
-# 幂等初始化 iptables mangle 表 VPC_CONNLIMIT 链及 PREROUTING 首位跳转（nftables 原生 Hook 无需此步）
+# 幂等初始化 iptables mangle 表 VPC_CONNLIMIT 链及外网流量 PREROUTING 首位跳转（nftables 原生 Hook 无需此步）
 function ensure_iptables_connlimit_chain() {
     if [ -n "$iptables_cmd" ]; then
         $iptables_cmd -t mangle -N VPC_CONNLIMIT 2>/dev/null || true
-        $iptables_cmd -t mangle -C PREROUTING -j VPC_CONNLIMIT 2>/dev/null || \
-            $iptables_cmd -t mangle -I PREROUTING 1 -j VPC_CONNLIMIT
+        # Clean up legacy unscoped PREROUTING jump if present
+        $iptables_cmd -t mangle -D PREROUTING -j VPC_CONNLIMIT 2>/dev/null || true
+        $iptables_cmd -t mangle -C PREROUTING -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_CONNLIMIT 2>/dev/null || \
+            $iptables_cmd -t mangle -I PREROUTING 1 -i "$EXTERNAL_INTERFACE" -p tcp --syn -j VPC_CONNLIMIT
     fi
 }
 
@@ -540,7 +538,6 @@ function apply_iptables_connlimit() {
     fi
 
     flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" 2>/dev/null || true
-    flush_nft_chain_if_exists "$NFT_TABLE" "connlimit" 2>/dev/null || true
     return 0
 }
 
@@ -561,6 +558,7 @@ function apply_nft_connlimit() {
         cmds+=(
             "flush chain ip $NFT_TABLE conn-limit"
             "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return"
+            "add rule ip $NFT_TABLE conn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
             "add rule ip $NFT_TABLE conn-limit tcp dport 179 return"
         )
         if ! nft_transaction "${cmds[@]}"; then
@@ -598,7 +596,6 @@ function tcp_connlimit_set() {
         echo "Stateless NAT is active (full-link NOTRACK), skipping stateful connlimit and cleaning up any existing connlimit rules"
         flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
         flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
-        flush_nft_chain_if_exists "$NFT_TABLE" "connlimit" 2>/dev/null || true
         return 0
     fi
 
@@ -607,7 +604,6 @@ function tcp_connlimit_set() {
         echo "TCP connlimit is disabled (limit=$limit), clearing connlimit rules"
         flush_iptables_chain_if_exists "mangle" "VPC_CONNLIMIT" || return 1
         flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
-        flush_nft_chain_if_exists "$NFT_TABLE" "connlimit" 2>/dev/null || true
         return 0
     fi
 

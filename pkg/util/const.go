@@ -53,18 +53,27 @@ const (
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
-	// VpcNatTCPConnLimitAnnotation serves a dual purpose:
-	// 1. On VpcNatGateway CR (gw.Annotations): optional user configuration fallback if spec.tcpConnLimit is unset.
-	// 2. On NAT Gateway Pod (pod.Annotations): records the applied limit value (or "unsupported") to track convergence.
-	VpcNatTCPConnLimitAnnotation        = "ovn.kubernetes.io/tcp-connlimit"
+	// VpcNatTCPConnLimitAnnotation is an optional user configuration fallback on the VpcNatGateway CR (gw.Annotations)
+	// when spec.tcpConnLimit is unset.
+	VpcNatTCPConnLimitAnnotation = "ovn.kubernetes.io/tcp-connlimit"
+	// VpcNatTCPConnLimitStateAnnotation records the applied limit value (or "unsupported") on the gateway Pod.
+	// Separating this from VpcNatTCPConnLimitAnnotation prevents collisions when user annotations in spec.annotations
+	// are propagated to the Pod template by StatefulSet.
+	VpcNatTCPConnLimitStateAnnotation   = "ovn.kubernetes.io/tcp-connlimit-state"
+	VpcNatTCPSynSrcRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
+	VpcNatTCPSynSrcBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
 	VpcNatTCPSynDstRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
 	VpcNatTCPSynDstBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
 	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state (or "unsupported") on the gateway Pod.
 	VpcNatTCPSynLimitStateAnnotation = "ovn.kubernetes.io/tcp-syn-limit-state"
-	OvnEipTypeLabel                  = "ovn.kubernetes.io/ovn_eip_type"
-	EipV4IpLabel                     = "ovn.kubernetes.io/eip_v4_ip"
-	EipUIDLabel                      = "ovn.kubernetes.io/eip_uid"
-	EipV6IpLabel                     = "ovn.kubernetes.io/eip_v6_ip"
+
+	NatDataplaneModeStateful     = "stateful"
+	NatDataplaneModeStateless    = "stateless"
+	NatDataplaneModeStatelessNft = "stateless-nft"
+	OvnEipTypeLabel              = "ovn.kubernetes.io/ovn_eip_type"
+	EipV4IpLabel                 = "ovn.kubernetes.io/eip_v4_ip"
+	EipUIDLabel                  = "ovn.kubernetes.io/eip_uid"
+	EipV6IpLabel                 = "ovn.kubernetes.io/eip_v6_ip"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
 	SwitchLBRuleVip            = "switch_lb_vip"
