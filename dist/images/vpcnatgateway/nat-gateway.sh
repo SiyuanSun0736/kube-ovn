@@ -1352,7 +1352,7 @@ function cleanup_nft_affinity_objects() {
 
     # nft 1.0.x does not support `list chains ip <table>` or `list sets ip <table>`.
     # Enumerate the table once and select only objects owned by this identity.
-    local table_dump
+    local table_dump=""
     [ -n "$nft_cmd" ] && table_dump=$($nft_cmd list table ip "$NFT_TABLE" 2>/dev/null || true)
 
     for obj in $(printf '%s\n' "$table_dump" | grep -oE "chain ep-${idhash}-[0-9a-f]+" | awk '{print $2}'); do
@@ -1773,7 +1773,7 @@ function sync_nft_lanvip() {
     # Drop dnat-* chains no map element references any more (stale or crash-orphaned ones).
     # Affinity chains/sets of the removed identities go with them.
     if [ -n "$nft_cmd" ] && $nft_cmd list table ip "$NFT_TABLE" >/dev/null 2>&1; then
-        local table_dump referenced cname
+        local table_dump="" referenced="" cname=""
         table_dump=$($nft_cmd list table ip "$NFT_TABLE" 2>/dev/null || true)
         referenced=$(printf '%s\n' "$table_dump" | grep -oE 'goto dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u || true)
         for cname in $(printf '%s\n' "$table_dump" | grep -oE 'chain dnat-[0-9a-f]{12}' | awk '{print $2}' | sort -u); do
@@ -2855,6 +2855,7 @@ case $opt in
         qos_del "$@"
         ;;
     *)
+        echo "UNSUPPORTED_COMMAND: $opt" >&2
         echo "Unknown command: $opt" >&2
         echo "" >&2
         show_help >&2

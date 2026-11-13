@@ -1258,8 +1258,11 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 func TestIsUnsupportedCommandError(t *testing.T) {
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
+	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=UNSUPPORTED_COMMAND: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
 	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTCPSynLimitSet))
 	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTCPConnLimitSet))
+	// False positive prevention: "unknown command: tcp-connlimit-set" inside stdout must NOT match when stderr is present
+	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=iptables error stdout=unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
 	require.False(t, isUnsupportedCommandError(nil, natGwTCPConnLimitSet))
 }
