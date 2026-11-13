@@ -1471,16 +1471,17 @@ function add_nft_dnat_map() {
             fi
         done
 
-        # Common infrastructure commands: table + service vmap keep a constant spec and stay
-        # idempotent repeats; chains/sets are only created when missing because `add chain` on
-        # an existing chain fails with EEXIST on stricter nftables builds and rolls back the
-        # whole batch (an existing chain still gets flushed/rebuilt below, so set rebuilds
-        # stay complete). The base chain is share-dnat-exclusive; flushing it wipes any other
-        # rule in it (see NFT_PREROUTING_CHAIN).
-        local -a cmds=(
-            "add table ip $NFT_TABLE"
-            "add map ip $NFT_TABLE $NFT_SERVICES_MAP { type ipv4_addr . inet_proto . inet_service : verdict ; }"
-        )
+        # Common infrastructure commands: table, map, and chains are only created when missing
+        # because `add table`/`add map`/`add chain` on existing objects can fail with EEXIST
+        # on stricter nftables builds and roll back the whole batch. The base chain is
+        # share-dnat-exclusive; flushing it wipes any other rule in it (see NFT_PREROUTING_CHAIN).
+        local -a cmds=()
+        if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            cmds+=("add table ip $NFT_TABLE")
+        fi
+        if ! nft list map ip "$NFT_TABLE" "$NFT_SERVICES_MAP" >/dev/null 2>&1; then
+            cmds+=("add map ip $NFT_TABLE $NFT_SERVICES_MAP { type ipv4_addr . inet_proto . inet_service : verdict ; }")
+        fi
         if ! nft list chain ip "$NFT_TABLE" "$NFT_PREROUTING_CHAIN" >/dev/null 2>&1; then
             cmds+=("add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }")
         fi
