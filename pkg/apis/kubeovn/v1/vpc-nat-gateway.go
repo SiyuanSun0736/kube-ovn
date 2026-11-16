@@ -86,9 +86,44 @@ type VpcNatGatewaySpec struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default=true
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
+	// DataplaneMode specifies whether the NAT gateway operates in stateless data plane mode.
+	// Valid value is "stateless-nft". Unset or empty indicates default stateful mode.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum="";stateless-nft
+	DataplaneMode string `json:"dataplaneMode,omitempty"`
+	// TCPConnLimit configures the maximum concurrent TCP connections for the NAT gateway.
+	// When unset or set to 0, TCP connlimit is disabled. Set to a positive integer to enable.
+	// Applied dynamically without Pod recreation.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
+	// TCPSynRateLimit configures the pre-routing TCP SYN packet rate and burst limits for the NAT gateway.
+	// When unset or set to 0, rate limiting is disabled.
+	// Applied dynamically without Pod recreation.
+	// +kubebuilder:validation:Optional
+	TCPSynRateLimit *TCPSynRateLimit `json:"tcpSynRateLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+type TCPSynRateLimit struct {
+	// TCP SYN packet rate limit on source IP (e.g. "1000/s", "0" to disable).
+	// If unset or "0", rate limiting on source IP is disabled.
+	// +kubebuilder:validation:Optional
+	SrcRate string `json:"srcRate,omitempty"`
+	// TCP SYN packet burst limit on source IP (packet count, e.g. "2000").
+	// If unset when SrcRate is enabled, defaults to 2000 (DefaultNatGwTCPSynSrcBurst).
+	// +kubebuilder:validation:Optional
+	SrcBurst string `json:"srcBurst,omitempty"`
+	// TCP SYN packet rate limit on destination IP (e.g. "20000/s", "0" to disable).
+	// If unset or "0", rate limiting on destination IP is disabled.
+	// +kubebuilder:validation:Optional
+	DstRate string `json:"dstRate,omitempty"`
+	// TCP SYN packet burst limit on destination IP (packet count, e.g. "40000").
+	// If unset when DstRate is enabled, defaults to 40000 (DefaultNatGwTCPSynDstBurst).
+	// +kubebuilder:validation:Optional
+	DstBurst string `json:"dstBurst,omitempty"`
 }
 
 type VpcBgpSpeaker struct {
@@ -117,6 +152,12 @@ type VpcNatGatewayStatus struct {
 	Selector        []string            `json:"selector" patchStrategy:"merge"`
 	Tolerations     []corev1.Toleration `json:"tolerations" patchStrategy:"merge"`
 	Affinity        corev1.Affinity     `json:"affinity" patchStrategy:"merge"`
+	// DataplaneMode is the active data plane mode configured on the NAT gateway ("stateless-nft" or empty for default).
+	DataplaneMode string `json:"dataplaneMode,omitempty"`
+	// TCPConnLimit is the current active TCP connlimit value applied to the NAT gateway.
+	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
+	// TCPSynRateLimit is the current active TCP SYN rate limit applied to the NAT gateway.
+	TCPSynRateLimit *TCPSynRateLimit `json:"tcpSynRateLimit,omitempty" patchStrategy:"merge"`
 }
 
 type Route struct {

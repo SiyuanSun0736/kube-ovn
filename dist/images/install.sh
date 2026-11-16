@@ -506,6 +506,24 @@ spec:
                 hairpinSnat:
                   type: string
                   description: State of the lanIP fallback hairpin SNAT programmed on the NAT gateway (enable, disable, or unsupported when the running gateway image cannot switch it)
+                dataplaneMode:
+                  type: string
+                  description: Active data plane mode configured on the NAT gateway ("stateless-nft" or empty for default)
+                tcpConnLimit:
+                  type: integer
+                  description: Active TCP connlimit threshold configured on the NAT gateway
+                tcpSynRateLimit:
+                  type: object
+                  description: Active TCP SYN rate limit applied on the NAT gateway
+                  properties:
+                    srcRate:
+                      type: string
+                    srcBurst:
+                      type: string
+                    dstRate:
+                      type: string
+                    dstBurst:
+                      type: string
                 tolerations:
                   type: array
                   items:
@@ -861,6 +879,32 @@ spec:
                     traffic dialed at a FIP from inside the VPC is always SNAT'd to that FIP, and an
                     external client dialing it stays visible to its owner. Applied without Pod
                     recreation.
+                dataplaneMode:
+                  type: string
+                  enum:
+                    - ""
+                    - stateless-nft
+                  description: Data plane mode of the NAT gateway. Set to "stateless-nft" for stateless mode, or empty/unset for default mode.
+                tcpConnLimit:
+                  type: integer
+                  minimum: 0
+                  description: Maximum concurrent TCP connections allowed on the NAT gateway. When unset or set to 0, connlimit is disabled. Set to a positive integer to enable.
+                tcpSynRateLimit:
+                  type: object
+                  description: Pre-routing TCP SYN packet rate and burst limits on the NAT gateway. Disabled when unset or rate is 0. Applied dynamically without Pod recreation.
+                  properties:
+                    srcRate:
+                      type: string
+                      description: TCP SYN rate limit per source IP (e.g. "1000/s", "0" to disable).
+                    srcBurst:
+                      type: string
+                      description: TCP SYN burst limit per source IP (packet count, e.g. "2000").
+                    dstRate:
+                      type: string
+                      description: TCP SYN rate limit per destination IP (e.g. "20000/s", "0" to disable).
+                    dstBurst:
+                      type: string
+                      description: TCP SYN burst limit per destination IP (packet count, e.g. "40000").
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

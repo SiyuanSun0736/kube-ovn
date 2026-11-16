@@ -52,10 +52,16 @@ const (
 	VpcEipAnnotation                        = "ovn.kubernetes.io/vpc_eip"
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
-	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
-	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
-	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
-	EipV6IpLabel                            = "ovn.kubernetes.io/eip_v6_ip"
+
+	NatDataplaneModeStatelessNft = "stateless-nft"
+
+	DefaultNatGwTCPSynSrcBurst = "2000"
+	DefaultNatGwTCPSynDstBurst = "40000"
+
+	OvnEipTypeLabel = "ovn.kubernetes.io/ovn_eip_type"
+	EipV4IpLabel    = "ovn.kubernetes.io/eip_v4_ip"
+	EipUIDLabel     = "ovn.kubernetes.io/eip_uid"
+	EipV6IpLabel    = "ovn.kubernetes.io/eip_v6_ip"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
 	SwitchLBRuleVip            = "switch_lb_vip"
@@ -216,7 +222,8 @@ const (
 	NetpolACLTier      = 2
 	BanpACLTier        = 3
 
-	DefaultMTU         = 1500
+	DefaultMTU = 1500
+
 	GeneveHeaderLength = 100
 	VxlanHeaderLength  = 50
 	SttHeaderLength    = 72

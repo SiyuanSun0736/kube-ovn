@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Note: This test script is strictly for local and CI automated verification.
+# It is excluded from the production gateway container image (never packaged).
+set -Eeuo pipefail
+
+script="$(cd "$(dirname "$0")" && pwd)/nat-gateway.sh"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+export NAT_GW_ENV_FILE="$tmp_dir/nat-gateway.env"
+# Load script functions without command dispatcher
+eval "$(sed '/^opt=\$1$/,$d' "$script")"
+
+# 1. Test to_nft_rate conversion
+assert_rate() {
+    local input=$1
+    local want=$2
+    local got
+    got=$(to_nft_rate "$input")
+    if [ "$got" != "$want" ]; then
+        echo "FAIL to_nft_rate '$input': got '$got', want '$want'" >&2
+        exit 1
+    fi
+}
+
+assert_rate "1/s" "1/second"
+assert_rate "9/s" "9/second"
+assert_rate "500/s" "500/second"
+assert_rate "500/sec" "500/second"
+assert_rate "500/second" "500/second"
+
+for invalid_unit in "100/m" "100/min" "100/minute" "200/h" "200/hour" "50/d" "50/day" "500/invalid"; do
+    if to_nft_rate "$invalid_unit" 2>/dev/null; then
+        echo "FAIL to_nft_rate accepted non-second unit '$invalid_unit'" >&2
+        exit 1
+    fi
+done
+
+# 2. Test is_stateless_active mode handling
+if is_stateless_active "stateless"; then
+    echo "FAIL: mode 'stateless' must not be treated as active stateless" >&2
+    exit 1
+fi
+
+if ! is_stateless_active "stateless-nft"; then
+    echo "FAIL: mode 'stateless-nft' must be treated as active stateless" >&2
+    exit 1
+fi
+
+if is_stateless_active "stateful"; then
+    echo "FAIL: mode 'stateful' must not be treated as active stateless" >&2
+    exit 1
+fi
+
+if is_stateless_active ""; then
+    echo "FAIL: empty mode must not be treated as active stateless" >&2
+    exit 1
+fi
+
+if is_stateless_active "unknown"; then
+    echo "FAIL: unknown mode must not be treated as active stateless" >&2
+    exit 1
+fi
+
+# 3. Test calc_bucket_expire_sec
+assert_expire() {
+    local rate=$1
+    local burst=$2
+    local want=$3
+    local got
+    got=$(calc_bucket_expire_sec "$rate" "$burst")
+    if [ "$got" != "$want" ]; then
+        echo "FAIL calc_bucket_expire_sec '$rate' '$burst': got '$got', want '$want'" >&2
+        exit 1
+    fi
+}
+
+assert_expire "1000/s" "2000" "10"
+assert_expire "20000/s" "40000" "10"
+assert_expire "10/s" "500" "50"
+assert_expire "1/s" "100" "100"
+# Excessively large duration should be capped at 86400s (24h)
+assert_expire "1/s" "90000" "86400"
+# Zero or invalid rate should safely fall back to baseline 10s without division by zero
+assert_expire "0/s" "10" "10"
+assert_expire "invalid" "10" "10"
+# Zero or invalid burst should safely fall back to baseline 10s
+assert_expire "1000/s" "0" "10"
+assert_expire "1000/s" "invalid" "10"
+assert_expire "1000/s" "" "10"
+
+# 4. Test rate pattern validation
+rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
+if [[ "0/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must reject 0/s" >&2
+    exit 1
+fi
+if [[ "100/m" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must reject non-second 100/m" >&2
+    exit 1
+fi
+if ! [[ "1/s" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 1/s" >&2
+    exit 1
+fi
+if ! [[ "9/sec" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 9/sec" >&2
+    exit 1
+fi
+if ! [[ "100/second" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 100/second" >&2
+    exit 1
+fi
+
+# 5. Test is_syn_limit_disabled
+for disabled_val in "0" "0/s" "0/sec" "0/second" "disable" "disabled" "none" "off"; do
+    if ! is_syn_limit_disabled "$disabled_val"; then
+        echo "FAIL: is_syn_limit_disabled must return 0 for '$disabled_val'" >&2
+        exit 1
+    fi
+done
+
+for enabled_val in "100/s" "1000/s" "500/sec" "100/second" "enable" "0/invalid" "0/foo"; do
+    if is_syn_limit_disabled "$enabled_val"; then
+        echo "FAIL: is_syn_limit_disabled must return 1 for '$enabled_val'" >&2
+        exit 1
+    fi
+done
+
+# 6. Test single-backend enforcement and independent src/dst SYN limit disablement
+mock_log="$tmp_dir/mock.log"
+check_inited() { return 0; }
+nft() {
+    if [ "${MOCK_NFT_FAIL:-0}" -eq 1 ]; then
+        return 1
+    fi
+    if [ "${1:-}" = "-f" ]; then
+        while IFS= read -r line; do
+            echo "NFT_TX: $line" >> "$mock_log"
+        done
+        return 0
+    fi
+    if [ "${1:-}" = "list" ] && [ "${2:-}" = "chain" ]; then
+        return 1
+    fi
+    echo "NFT: $*" >> "$mock_log"
+    return 0
+}
+mock_iptables() {
+    echo "IPT: $*" >> "$mock_log"
+    if [[ "$*" == *"-C "* ]]; then
+        return 1
+    fi
+    return 0
+}
+iptables_cmd="mock_iptables"
+iptables_save_cmd="true"
+EXTERNAL_INTERFACE="net1"
+
+# 6a. Single-backend nftables installs nft rules and never touches iptables
+: > "$mock_log"
+tcp_connlimit_set "50000" "stateful" >/dev/null
+if grep -q -- "IPT:" "$mock_log"; then
+    echo "FAIL: tcp_connlimit_set must not invoke iptables" >&2
+    exit 1
+fi
+if ! grep -q -- "NFT_TX: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over 50000 drop" "$mock_log"; then
+    echo "FAIL: did not install expected nft conn-limit rule" >&2
+    exit 1
+fi
+if ! grep -q -- 'NFT_TX: add rule ip kube-ovn conn-limit iifname != "net1" return' "$mock_log"; then
+    echo "FAIL: nft conn-limit must filter out non-external interface traffic" >&2
+    exit 1
+fi
+
+# 6b. When nft rule installation fails, tcp_connlimit_set returns error
+: > "$mock_log"
+if MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
+    echo "FAIL: tcp_connlimit_set must return error when nft rule installation fails" >&2
+    exit 1
+fi
+if grep -q -- "IPT:" "$mock_log"; then
+    echo "FAIL: tcp_connlimit_set must never touch iptables even on nft failure" >&2
+    exit 1
+fi
+
+# 6c. Independent src_rate=0 keeps dst_rate active, and dst_rate=0 keeps src_rate active
+: > "$mock_log"
+tcp_syn_limit_set "0" "2000" "8000/s" "16000" >/dev/null
+if grep -q "add set ip kube-ovn syn_src_meter" "$mock_log"; then
+    echo "FAIL: src_rate=0 must not install syn_src_meter" >&2
+    exit 1
+fi
+if ! grep -q "add set ip kube-ovn syn_dst_meter" "$mock_log"; then
+    echo "FAIL: src_rate=0 must keep syn_dst_meter active" >&2
+    exit 1
+fi
+
+: > "$mock_log"
+tcp_syn_limit_set "300/s" "600" "0" "40000" >/dev/null
+if ! grep -q "add set ip kube-ovn syn_src_meter" "$mock_log"; then
+    echo "FAIL: dst_rate=0 must keep syn_src_meter active" >&2
+    exit 1
+fi
+if grep -q "add set ip kube-ovn syn_dst_meter" "$mock_log"; then
+    echo "FAIL: dst_rate=0 must not install syn_dst_meter" >&2
+    exit 1
+fi
+
+# 7. Test NFT_TABLE environment variable override preservation
+custom_table_output=$(NFT_TABLE="custom-table" bash -c '
+    script="'"$script"'"
+    eval "$(sed "/^opt=\$1$/,\$d" "$script")"
+    echo "$NFT_TABLE"
+')
+if [ "$custom_table_output" != "custom-table" ]; then
+    echo "FAIL: custom NFT_TABLE environment variable was overwritten: got '$custom_table_output', want 'custom-table'" >&2
+    exit 1
+fi
+
+echo "PASS: nat-gateway connlimit & stateless detection tests passed"

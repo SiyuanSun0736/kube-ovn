@@ -57,8 +57,9 @@ QOS_DEBUG=${QOS_DEBUG:-"false"}
 # installed, the default must stay, because the nft share-DNAT maps and the hairpin/SNAT rules
 # below live in the same nftables backend -- pointing the iptables rules at the legacy backend
 # would run the gateway as a split data plane.
-iptables_cmd=$(which iptables)
-iptables_save_cmd=$(which iptables-save)
+iptables_cmd=$(which iptables 2>/dev/null || true)
+iptables_save_cmd=$(which iptables-save 2>/dev/null || true)
+NFT_TABLE=${NFT_TABLE:-"kube-ovn"}
 
 function show_help() {
     echo "NAT Gateway Configuration Script"
@@ -80,6 +81,8 @@ function show_help() {
     echo "  floating-ip-add          - Add floating IP mapping"
     echo "  floating-ip-del          - Delete floating IP mapping"
     echo "  hairpin-snat-set         - Turn the lanIP fallback hairpin SNAT on/off: enable | disable"
+    echo "  tcp-connlimit-set        - Set or clear TCP connlimit: <limit> [mode]"
+    echo "  tcp-syn-limit-set        - Set or clear TCP SYN raw rate limit: [src_rate] [src_burst] [dst_rate] [dst_burst]"
     echo "  dnat-add                 - Add DNAT rule"
     echo "  dnat-del                 - Delete DNAT rule"
     echo "  nft-dnat-map-add         - Add nft map-based DNAT rule (Share type)"
@@ -458,6 +461,287 @@ function hairpin_snat_mode() {
     echo "lanIP fallback hairpin SNAT: $state"
 }
 
+function is_stateless_active() {
+    local mode=$1
+    if [ "$mode" = "stateless-nft" ]; then
+        return 0
+    fi
+    return 1
+}
+
+function flush_nft_chain_if_exists() {
+    local table=$1
+    local chain=$2
+    if nft list chain ip "$table" "$chain" >/dev/null 2>&1; then
+        if ! nft flush chain ip "$table" "$chain"; then
+            echo "Failed to flush nftables chain $chain in table $table" >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
+function apply_nft_connlimit() {
+    local limit=$1
+
+    # If already configured with identical limit, avoid flushing to preserve connection accounting
+    if nft list chain ip "$NFT_TABLE" conn-limit 2>/dev/null | grep -F -q -- "ct count over $limit drop"; then
+        echo "TCP connlimit $limit is already installed in nftables, keeping existing accounting match"
+    else
+        local -a cmds=()
+        if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            cmds+=("add table ip $NFT_TABLE")
+        fi
+        if ! nft list chain ip "$NFT_TABLE" conn-limit >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE conn-limit { type filter hook prerouting priority -150; policy accept; }")
+        fi
+        cmds+=(
+            "flush chain ip $NFT_TABLE conn-limit"
+            "add rule ip $NFT_TABLE conn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
+            "add rule ip $NFT_TABLE conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over $limit drop"
+        )
+        if ! nft_transaction "${cmds[@]}"; then
+            echo "Failed to install nftables conn-limit rules" >&2
+            flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+function tcp_connlimit_set() {
+    local limit=${1:-}
+    local mode=${2:-stateful}
+
+    check_inited
+
+    # Validate limit: must be a non-negative decimal integer
+    if [ -n "$limit" ] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid tcp connlimit value '$limit': must be an integer" >&2
+        return 1
+    fi
+
+    # 1. Stateless NAT (full-link notrack): bypass conntrack entirely, skip & clean connlimit
+    if is_stateless_active "$mode"; then
+        echo "Stateless NAT is active (full-link NOTRACK), skipping stateful connlimit and cleaning up any existing connlimit rules"
+        flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
+        return 0
+    fi
+
+    # 2. Disabled (0 or empty): clean connlimit rules
+    if [ -z "$limit" ] || [ "$limit" = "0" ]; then
+        echo "TCP connlimit is disabled (limit=$limit), clearing connlimit rules"
+        flush_nft_chain_if_exists "$NFT_TABLE" "conn-limit" || return 1
+        return 0
+    fi
+
+    echo "Applying TCP connlimit=$limit (mode=$mode)"
+    apply_nft_connlimit "$limit"
+}
+
+function to_nft_rate() {
+    local val=$1
+    local num="${val%/*}"
+    local unit="${val#*/}"
+    case "$unit" in
+        s|sec|second) echo "${num}/second" ;;
+        *) return 1 ;;
+    esac
+}
+
+function calc_bucket_expire_sec() {
+    local rate=$1
+    local burst=$2
+    local num="${rate%/*}"
+
+    if [ -z "$num" ] || ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ]; then
+        echo "10"
+        return 0
+    fi
+
+    if [ -z "$burst" ] || ! [[ "$burst" =~ ^[0-9]+$ ]] || [ "$burst" -le 0 ]; then
+        echo "10"
+        return 0
+    fi
+
+    # Ensure idle expiry is at least the token refill period ceil(burst / num),
+    # with a minimum baseline of 10s and an upper bound of 86400s (24h)
+    # to prevent premature entry eviction or kernel parameter overflow.
+    local refill_sec=$(( (burst + num - 1) / num ))
+    if [ "$refill_sec" -lt 10 ]; then
+        refill_sec=10
+    elif [ "$refill_sec" -gt 86400 ]; then
+        refill_sec=86400
+    fi
+    echo "$refill_sec"
+}
+
+function parse_syn_rate_burst() {
+    local target=$1
+    local rate=$2
+    local burst=$3
+    local rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
+    local num_pattern="^[0-9]+$"
+
+    [[ "$rate" =~ ^[0-9]+$ ]] && rate="${rate}/s"
+    if ! [[ "$rate" =~ $rate_pattern ]]; then
+        echo "Error: invalid SYN ${target}_rate '$rate'" >&2
+        return 1
+    fi
+    local nft_rate
+    if ! nft_rate=$(to_nft_rate "$rate") || [ -z "$nft_rate" ]; then
+        echo "Error: invalid SYN ${target}_rate unit in '$rate'" >&2
+        return 1
+    fi
+    if ! [[ "$burst" =~ $num_pattern ]] || [ "$burst" -le 0 ]; then
+        echo "Error: invalid SYN ${target}_burst '$burst'" >&2
+        return 1
+    fi
+    local expire_sec
+    expire_sec=$(calc_bucket_expire_sec "$rate" "$burst")
+    echo "$nft_rate $expire_sec"
+}
+
+function is_syn_limit_disabled() {
+    local val=$1
+    case "$val" in
+        0|0/s|0/sec|0/second|disable|disabled|none|off) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# apply_nft_syn_limit 真正创建并下发 nftables TCP SYN 前置限频规则。
+# 参数说明：
+#   $1 src_enabled:        是否启用源 IP 限流 (0/1)
+#   $2 nft_src_rate:       nft 格式源 IP 限速 (如 1000/second)
+#   $3 src_burst:          源 IP 突发容忍包数
+#   $4 src_expire_sec:     源 IP 哈希表项空闲老化时间 (单位秒 s，写入 set timeout)
+#                          当特定源 IP 静默超过此时间无新报文时，内核自动回收其哈希表项以释放内存
+#   $5 dst_enabled:        是否启用目的 EIP 限流 (0/1)
+#   $6 nft_dst_rate:       nft 格式目的 EIP 限速 (如 20000/second)
+#   $7 dst_burst:          目的 EIP 突发容忍包数
+#   $8 dst_expire_sec:     目的 EIP 哈希表项空闲老化时间 (单位秒 s)
+#   $9 src_htable_max:     源 IP 哈希表容量上限 (写入 set size，限制最大同时跟踪的源 IP 数量，防内存爆表)
+#  ${10} dst_htable_max:   目的 EIP 哈希表容量上限 (写入 set size)
+function apply_nft_syn_limit() {
+    local src_enabled=$1
+    local nft_src_rate=$2
+    local src_burst=$3
+    local src_expire_sec=$4
+    local dst_enabled=$5
+    local nft_dst_rate=$6
+    local dst_burst=$7
+    local dst_expire_sec=$8
+    local src_htable_max=$9
+    local dst_htable_max=${10}
+
+    # Flush chain to release references to existing meters, then delete old sets so new timeout takes effect.
+    # Base chain is created only when missing because 'add chain' on an existing base chain returns EEXIST
+    # on stricter nftables versions and rolls back the transaction.
+    local -a init_cmds=()
+    if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        init_cmds+=("add table ip $NFT_TABLE")
+    fi
+    if ! nft list chain ip "$NFT_TABLE" syn-limit >/dev/null 2>&1; then
+        init_cmds+=("add chain ip $NFT_TABLE syn-limit { type filter hook prerouting priority -300; policy accept; }")
+    fi
+    init_cmds+=("flush chain ip $NFT_TABLE syn-limit")
+    if ! nft_transaction "${init_cmds[@]}"; then
+        echo "Failed to initialize nftables syn-limit chain" >&2
+        return 1
+    fi
+
+    nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+    nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+
+    local tx_cmds=()
+    if [ "$src_enabled" -eq 1 ]; then
+        [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
+        tx_cmds+=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }")
+    fi
+    if [ "$dst_enabled" -eq 1 ]; then
+        [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
+        tx_cmds+=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }")
+    fi
+    tx_cmds+=(
+        "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
+    )
+    if [ "$src_enabled" -eq 1 ]; then
+        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_src_meter { ip saddr limit rate over $nft_src_rate burst $src_burst packets } drop")
+    fi
+    if [ "$dst_enabled" -eq 1 ]; then
+        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_dst_meter { ip daddr limit rate over $nft_dst_rate burst $dst_burst packets } drop")
+    fi
+
+    if ! nft_transaction "${tx_cmds[@]}"; then
+        echo "Failed to install nftables syn-limit sets and rules" >&2
+        flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
+function tcp_syn_limit_set() {
+    local src_rate=${1:-${TCP_SYN_SRC_RATE:-"1000/s"}}
+    local src_burst=${2:-${TCP_SYN_SRC_BURST:-"2000"}}
+    local dst_rate=${3:-${TCP_SYN_DST_RATE:-"20000/s"}}
+    local dst_burst=${4:-${TCP_SYN_DST_BURST:-"40000"}}
+    local src_htable_max=${TCP_SYN_SRC_HTABLE_MAX:-262144}
+    local dst_htable_max=${TCP_SYN_DST_HTABLE_MAX:-2048}
+
+    check_inited
+
+    # Shorten nf_conntrack_tcp_timeout_syn_recv from Linux default 60s to 5s to mitigate conntrack table exhaustion
+    if ! sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 >/dev/null 2>&1; then
+        echo "Warning: failed to tune net.netfilter.nf_conntrack_tcp_timeout_syn_recv to 5s" >&2
+    fi
+
+    local src_enabled=1
+    local dst_enabled=1
+    is_syn_limit_disabled "$src_rate" && src_enabled=0
+    is_syn_limit_disabled "$dst_rate" && dst_enabled=0
+
+    # 0. Check if both layers are disabled
+    if [ "$src_enabled" -eq 0 ] && [ "$dst_enabled" -eq 0 ]; then
+        echo "TCP SYN rate limit is disabled (src_rate=$src_rate, dst_rate=$dst_rate), clearing raw syn limit rules"
+        flush_nft_chain_if_exists "$NFT_TABLE" "syn-limit" || return 1
+        if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
+            nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
+        fi
+        return 0
+    fi
+
+    local nft_src_rate=""
+    local src_expire_sec=10
+    local nft_dst_rate=""
+    local dst_expire_sec=10
+
+    if [ "$src_enabled" -eq 1 ]; then
+        local src_parsed
+        if ! src_parsed=$(parse_syn_rate_burst "src" "$src_rate" "$src_burst"); then
+            return 1
+        fi
+        read -r nft_src_rate src_expire_sec <<< "$src_parsed"
+    fi
+
+    if [ "$dst_enabled" -eq 1 ]; then
+        local dst_parsed
+        if ! dst_parsed=$(parse_syn_rate_burst "dst" "$dst_rate" "$dst_burst"); then
+            return 1
+        fi
+        read -r nft_dst_rate dst_expire_sec <<< "$dst_parsed"
+    fi
+
+    echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate (enabled=$src_enabled), src_burst=$src_burst, dst_rate=$dst_rate (enabled=$dst_enabled), dst_burst=$dst_burst"
+    apply_nft_syn_limit \
+        "$src_enabled" "$nft_src_rate" "$src_burst" "$src_expire_sec" \
+        "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_expire_sec" \
+        "$src_htable_max" "$dst_htable_max"
+}
+
 function ensure_hairpin_fip() {
     # HAIRPIN_FIP is derived state: EXCLUSIVE_DNAT holds the authoritative FIP map
     # (-d <eip>/32 -j DNAT --to-destination <internalIp>), so the chain can be rebuilt from it.
@@ -809,7 +1093,6 @@ function del_dnat() {
 #   Shell variables: UPPER_CASE
 #   nft object names: lower_case (Linux/nftables convention, case-sensitive)
 
-NFT_TABLE="kube-ovn"
 NFT_SERVICES_MAP="service-ips"
 # WARNING: this base chain is owned exclusively by the share-dnat feature. add_nft_dnat_map
 # flushes it on every add/update and re-adds its single vmap dispatch rule, so any other rule
@@ -2332,6 +2615,14 @@ case $opt in
     hairpin-snat-set)
         echo "hairpin-snat-set $*"
         hairpin_snat_mode "$@"
+        ;;
+    tcp-connlimit-set)
+        echo "tcp-connlimit-set $*"
+        tcp_connlimit_set "$@"
+        ;;
+    tcp-syn-limit-set)
+        echo "tcp-syn-limit-set $*"
+        tcp_syn_limit_set "$@"
         ;;
     get-iptables-version)
         echo "get-iptables-version $*"
