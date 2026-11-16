@@ -93,9 +93,32 @@ type VpcNatGatewaySpec struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
+	// TCPSynRateLimit configures the pre-routing TCP SYN packet rate and burst limits for the NAT gateway.
+	// Applied dynamically without Pod recreation.
+	// +kubebuilder:validation:Optional
+	TCPSynRateLimit *TCPSynRateLimit `json:"tcpSynRateLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+type TCPSynRateLimit struct {
+	// TCP SYN packet rate limit on source IP (e.g. "2000/s", "0" to disable).
+	// If unset, defaults to 2000/s (DefaultNatGwTCPSynSrcRate).
+	// +kubebuilder:validation:Optional
+	SrcRate string `json:"srcRate,omitempty"`
+	// TCP SYN packet burst limit on source IP (packet count, e.g. "4000").
+	// If unset, defaults to 4000 (DefaultNatGwTCPSynSrcBurst).
+	// +kubebuilder:validation:Optional
+	SrcBurst string `json:"srcBurst,omitempty"`
+	// TCP SYN packet rate limit on destination IP (e.g. "5000/s", "0" to disable).
+	// If unset, defaults to 5000/s (DefaultNatGwTCPSynDstRate).
+	// +kubebuilder:validation:Optional
+	DstRate string `json:"dstRate,omitempty"`
+	// TCP SYN packet burst limit on destination IP (packet count, e.g. "10000").
+	// If unset, defaults to 10000 (DefaultNatGwTCPSynDstBurst).
+	// +kubebuilder:validation:Optional
+	DstBurst string `json:"dstBurst,omitempty"`
 }
 
 type VpcBgpSpeaker struct {
@@ -126,6 +149,8 @@ type VpcNatGatewayStatus struct {
 	Affinity        corev1.Affinity     `json:"affinity" patchStrategy:"merge"`
 	// TCPConnLimit is the current active TCP connlimit value applied to the NAT gateway.
 	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty" patchStrategy:"merge"`
+	// TCPSynRateLimit is the current active TCP SYN rate limit applied to the NAT gateway.
+	TCPSynRateLimit *TCPSynRateLimit `json:"tcpSynRateLimit,omitempty" patchStrategy:"merge"`
 }
 
 type Route struct {

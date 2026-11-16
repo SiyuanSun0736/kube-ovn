@@ -318,7 +318,7 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 	return int32(util.DefaultNatGwTCPConnLimit)
 }
 
-func cleanRateLimitAnnotation(val, fallback string) string {
+func cleanRateLimit(val, fallback string) string {
 	trimmed := strings.TrimSpace(val)
 	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
 		return fallback
@@ -332,17 +332,19 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	dstRate := util.DefaultNatGwTCPSynDstRate
 	dstBurst := util.DefaultNatGwTCPSynDstBurst
 
-	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation]; ok {
-		srcRate = cleanRateLimitAnnotation(val, srcRate)
-	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynSrcBurstLimitAnnotation]; ok {
-		srcBurst = cleanRateLimitAnnotation(val, srcBurst)
-	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation]; ok {
-		dstRate = cleanRateLimitAnnotation(val, dstRate)
-	}
-	if val, ok := gw.Annotations[util.VpcNatTCPSynDstBurstLimitAnnotation]; ok {
-		dstBurst = cleanRateLimitAnnotation(val, dstBurst)
+	if gw.Spec.TCPSynRateLimit != nil {
+		if gw.Spec.TCPSynRateLimit.SrcRate != "" {
+			srcRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcRate, srcRate)
+		}
+		if gw.Spec.TCPSynRateLimit.SrcBurst != "" {
+			srcBurst = cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcBurst, srcBurst)
+		}
+		if gw.Spec.TCPSynRateLimit.DstRate != "" {
+			dstRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.DstRate, dstRate)
+		}
+		if gw.Spec.TCPSynRateLimit.DstBurst != "" {
+			dstBurst = cleanRateLimit(gw.Spec.TCPSynRateLimit.DstBurst, dstBurst)
+		}
 	}
 
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
@@ -413,7 +415,20 @@ func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *
 	args := c.getNatGwTCPSynRateLimitArgs(gw)
 	desiredState := strings.Join(args, ",")
 
-	if !force && pod.Annotations != nil && strings.TrimSpace(pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation]) == desiredState {
+	appliedState := ""
+	if pod.Annotations != nil {
+		appliedState = strings.TrimSpace(pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation])
+	}
+
+	statusMatches := false
+	if gw.Status.TCPSynRateLimit != nil {
+		statusMatches = gw.Status.TCPSynRateLimit.SrcRate == args[0] &&
+			gw.Status.TCPSynRateLimit.SrcBurst == args[1] &&
+			gw.Status.TCPSynRateLimit.DstRate == args[2] &&
+			gw.Status.TCPSynRateLimit.DstBurst == args[3]
+	}
+
+	if !force && statusMatches && appliedState == desiredState {
 		return nil
 	}
 
@@ -429,7 +444,42 @@ func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *
 		klog.Errorf("failed to patch pod %s/%s annotations for tcp syn limit: %v", pod.Namespace, pod.Name, err)
 		return err
 	}
-	return nil
+
+	return c.patchNatGwTCPSynRateLimitStatus(gw.Name, &kubeovnv1.TCPSynRateLimit{
+		SrcRate:  args[0],
+		SrcBurst: args[1],
+		DstRate:  args[2],
+		DstBurst: args[3],
+	})
+}
+
+func (c *Controller) patchNatGwTCPSynRateLimitStatus(key string, limit *kubeovnv1.TCPSynRateLimit) error {
+	oriGw, err := c.vpcNatGatewayLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
+		return err
+	}
+	if oriGw.Status.TCPSynRateLimit != nil &&
+		oriGw.Status.TCPSynRateLimit.SrcRate == limit.SrcRate &&
+		oriGw.Status.TCPSynRateLimit.SrcBurst == limit.SrcBurst &&
+		oriGw.Status.TCPSynRateLimit.DstRate == limit.DstRate &&
+		oriGw.Status.TCPSynRateLimit.DstBurst == limit.DstBurst {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"status": map[string]any{"tcpSynRateLimit": limit}})
+	if err != nil {
+		klog.Errorf("failed to marshal status.tcpSynRateLimit patch for vpc nat gw %s: %v", key, err)
+		return err
+	}
+	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
+		patch, metav1.PatchOptions{}, "status")
+	if err != nil {
+		klog.Errorf("failed to patch status.tcpSynRateLimit for vpc nat gw %s: %v", oriGw.Name, err)
+	}
+	return err
 }
 
 func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error {

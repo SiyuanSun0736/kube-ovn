@@ -54,11 +54,7 @@ const (
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
 	// VpcNatTCPConnLimitStateAnnotation records the applied limit value on the gateway Pod.
-	VpcNatTCPConnLimitStateAnnotation   = "ovn.kubernetes.io/tcp-connlimit-state"
-	VpcNatTCPSynSrcRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
-	VpcNatTCPSynSrcBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
-	VpcNatTCPSynDstRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
-	VpcNatTCPSynDstBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
+	VpcNatTCPConnLimitStateAnnotation = "ovn.kubernetes.io/tcp-connlimit-state"
 	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state on the gateway Pod.
 	VpcNatTCPSynLimitStateAnnotation = "ovn.kubernetes.io/tcp-syn-limit-state"
 

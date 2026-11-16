@@ -221,6 +221,18 @@ spec:
                 tcpConnLimit:
                   type: integer
                   description: Active TCP connlimit threshold configured on the NAT gateway
+                tcpSynRateLimit:
+                  type: object
+                  description: Active TCP SYN rate limit applied on the NAT gateway
+                  properties:
+                    srcRate:
+                      type: string
+                    srcBurst:
+                      type: string
+                    dstRate:
+                      type: string
+                    dstBurst:
+                      type: string
                 tolerations:
                   type: array
                   items:
@@ -580,6 +592,22 @@ spec:
                   type: integer
                   minimum: 0
                   description: Maximum concurrent TCP connections allowed on the NAT gateway. Set to 0 to disable.
+                tcpSynRateLimit:
+                  type: object
+                  description: Pre-routing TCP SYN packet rate and burst limits on the NAT gateway. Applied dynamically without Pod recreation.
+                  properties:
+                    srcRate:
+                      type: string
+                      description: TCP SYN rate limit per source IP (e.g. "2000/s", "0" to disable).
+                    srcBurst:
+                      type: string
+                      description: TCP SYN burst limit per source IP (packet count, e.g. "4000").
+                    dstRate:
+                      type: string
+                      description: TCP SYN rate limit per destination IP (e.g. "5000/s", "0" to disable).
+                    dstBurst:
+                      type: string
+                      description: TCP SYN burst limit per destination IP (packet count, e.g. "10000").
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

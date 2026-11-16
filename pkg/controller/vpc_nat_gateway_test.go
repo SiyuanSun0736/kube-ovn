@@ -816,13 +816,15 @@ func TestNatGwStatusWritersKeepHairpinSNAT(t *testing.T) {
 
 			require.NoError(t, ctrl.patchNatGwHairpinSNATStatus("gw", hairpinSNATEnable))
 			require.NoError(t, ctrl.patchNatGwTCPConnLimitStatus("gw", 50000))
-			// the lister snapshot these writers use has neither hairpinSnat nor tcpConnLimit
+			require.NoError(t, ctrl.patchNatGwTCPSynRateLimitStatus("gw", &kubeovnv1.TCPSynRateLimit{SrcRate: "3000/s"}))
+			// the lister snapshot these writers use has neither hairpinSnat nor tcpConnLimit nor tcpSynRateLimit
 			require.NoError(t, tt.write(ctrl))
 
 			got, err := gwClient.Get(t.Context(), "gw", metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, hairpinSNATEnable, got.Status.HairpinSNAT)
 			require.Equal(t, ptr.To(int32(50000)), got.Status.TCPConnLimit)
+			require.Equal(t, &kubeovnv1.TCPSynRateLimit{SrcRate: "3000/s"}, got.Status.TCPSynRateLimit)
 		})
 	}
 }
@@ -1086,6 +1088,12 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
 
+	patched, err := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, patched.Status.TCPSynRateLimit)
+	require.Equal(t, util.DefaultNatGwTCPSynSrcRate, patched.Status.TCPSynRateLimit.SrcRate)
+	gw.Status.TCPSynRateLimit = patched.Status.TCPSynRateLimit
+
 	// Repeated reconcile without changes (using updated pod from apiserver) must skip reprogramming to preserve buckets
 	pod, err = ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
 	require.NoError(t, err)
@@ -1093,13 +1101,13 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Empty(t, calls, "unchanged syn rate limit must not reprogram pod")
 
-	// 2. Custom dst and src rate limits via annotations
+	// 2. Custom dst and src rate limits via spec
 	calls = nil
-	gw.Annotations = map[string]string{
-		util.VpcNatTCPSynSrcRateLimitAnnotation:  "5000/s",
-		util.VpcNatTCPSynSrcBurstLimitAnnotation: "10000",
-		util.VpcNatTCPSynDstRateLimitAnnotation:  "8000/s",
-		util.VpcNatTCPSynDstBurstLimitAnnotation: "16000",
+	gw.Spec.TCPSynRateLimit = &kubeovnv1.TCPSynRateLimit{
+		SrcRate:  "5000/s",
+		SrcBurst: "10000",
+		DstRate:  "8000/s",
+		DstBurst: "16000",
 	}
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
@@ -1114,7 +1122,7 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Error: invalid SYN dst_rate 'unknown command'")
 	}
-	gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation] = "unknown command"
+	gw.Spec.TCPSynRateLimit.DstRate = "unknown command"
 	err = ctrl.syncNatGwTCPSynRateLimit(gw, pod, false)
 	require.Error(t, err)
 
@@ -1124,8 +1132,8 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 		calls = append(calls, append([]string{operation}, rules...))
 		return nil
 	}
-	gw.Annotations = map[string]string{
-		util.VpcNatTCPSynDstRateLimitAnnotation: "0",
+	gw.Spec.TCPSynRateLimit = &kubeovnv1.TCPSynRateLimit{
+		DstRate: "0",
 	}
 	require.NoError(t, ctrl.syncNatGwTCPSynRateLimit(gw, pod, false))
 	require.Equal(t, [][]string{{
