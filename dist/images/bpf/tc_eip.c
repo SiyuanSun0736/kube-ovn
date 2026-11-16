@@ -93,6 +93,36 @@ static __always_inline int is_local_delivery(struct __sk_buff *skb, void *data,
 // - TC_ACT_UNSPEC (-1)：未命中 EIP 的常规网络流量（如节点管理、BGP 协商）原样放行，交付宿主机 Linux 内核协议栈正常处理；
 // - TC_ACT_OK (0)：专用于“已命中 EIP 且正处于 macvlan 本地交付链路”的报文，直接终止 TC 处理交由内核驱动 RX 处理，规避重定向死循环；
 // - TC_ACT_SHOT (2)：仅在底层严重异常（如 bpf_skb_store_bytes 越界失败）时安全丢包。
+// 统一的目标直通与交付逻辑：
+// 包含本地防回环交付校验、跨设备 L3 邻居直通、同桥 L2 目的 MAC 改写与 bpf_redirect
+static __always_inline int redirect_to_target(struct __sk_buff *skb, void *data, struct eip_target *target) {
+    if (is_local_delivery(skb, data, target)) {
+        return TC_ACT_OK;
+    }
+
+    // 跨桥/跨设备场景（入站接口与目标 parent_ifindex 不一致）：
+    // 若流量从其它物理子网/VLAN（如多运营商不同平面）打入，无法直接在 macvlan 二层桥内直塞。
+    // 采用内核三层邻居转发 helper bpf_redirect_neigh，由内核自动执行 FIB/邻居(ARP)查找并重新封装二层头，
+    // 实现跨设备直通交付并彻底 bypass 宿主机 Netfilter/conntrack。
+    if (target->parent_ifindex && skb->ifindex &&
+        skb->ifindex != target->ifindex &&
+        skb->ifindex != target->parent_ifindex) {
+        return bpf_redirect_neigh(target->ifindex, NULL, 0, 0);
+    }
+
+    // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC（外层 MAC 偏移为 0）
+    if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
+        target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {
+        if (bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest), target->target_mac, 6, 0) < 0) {
+            return TC_ACT_SHOT;
+        }
+    }
+
+    // 内核短路直通转发：从宿主机 macvlan 的 Egress 发出（flags=0），由目标 Pod MAC 选择接收端
+    // 彻底避开宿主机根空间 Netfilter 与 conntrack 表
+    return bpf_redirect(target->ifindex, 0);
+}
+
 // 处理 IPv4 报文逻辑
 static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void *data_end, __u32 l3_offset) {
     struct iphdr *iph = data + l3_offset;
@@ -109,21 +139,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, void *data, void 
         return TC_ACT_UNSPEC;
     }
 
-    if (is_local_delivery(skb, data, target)) {
-        return TC_ACT_OK;
-    }
-
-    // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC（外层 MAC 偏移为 0）
-    if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
-        target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {
-        if (bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest), target->target_mac, 6, 0) < 0) {
-            return TC_ACT_SHOT;
-        }
-    }
-
-    // 内核短路直通转发：从宿主机 macvlan 的 Egress 发出（flags=0），由目标 Pod MAC 选择接收端
-    // 彻底避开宿主机根空间 Netfilter 与 conntrack 表
-    return bpf_redirect(target->ifindex, 0);
+    return redirect_to_target(skb, data, target);
 }
 
 // 处理 IPv6 报文逻辑
@@ -139,18 +155,7 @@ static __always_inline int process_ipv6(struct __sk_buff *skb, void *data, void 
         return TC_ACT_UNSPEC;
     }
 
-    if (is_local_delivery(skb, data, target)) {
-        return TC_ACT_OK;
-    }
-
-    if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
-        target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {
-        if (bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest), target->target_mac, 6, 0) < 0) {
-            return TC_ACT_SHOT;
-        }
-    }
-
-    return bpf_redirect(target->ifindex, 0);
+    return redirect_to_target(skb, data, target);
 }
 
 // TC 分类器入口钩子函数
