@@ -744,9 +744,6 @@ function tcp_syn_limit_set() {
         "$src_htable_max" "$dst_htable_max"
 }
 
-    apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"
-}
-
 function ensure_hairpin_fip() {
     # HAIRPIN_FIP is derived state: EXCLUSIVE_DNAT holds the authoritative FIP map
     # (-d <eip>/32 -j DNAT --to-destination <internalIp>), so the chain can be rebuilt from it.
