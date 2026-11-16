@@ -613,6 +613,19 @@ function is_syn_limit_disabled() {
     esac
 }
 
+# apply_nft_syn_limit 真正创建并下发 nftables TCP SYN 前置限频规则。
+# 参数说明：
+#   $1 src_enabled:        是否启用源 IP 限流 (0/1)
+#   $2 nft_src_rate:       nft 格式源 IP 限速 (如 1000/second)
+#   $3 src_burst:          源 IP 突发容忍包数
+#   $4 src_htable_expire:  源 IP 哈希表项空闲老化时间 (单位毫秒 ms，换算为秒写入 set timeout)
+#                          当特定源 IP 静默超过此时间无新报文时，内核自动回收其哈希表项以释放内存
+#   $5 dst_enabled:        是否启用目的 EIP 限流 (0/1)
+#   $6 nft_dst_rate:       nft 格式目的 EIP 限速 (如 20000/second)
+#   $7 dst_burst:          目的 EIP 突发容忍包数
+#   $8 dst_htable_expire:  目的 EIP 哈希表项空闲老化时间 (单位毫秒 ms)
+#   $9 src_htable_max:     源 IP 哈希表容量上限 (写入 set size，限制最大同时跟踪的源 IP 数量，防内存爆表)
+#  ${10} dst_htable_max:   目的 EIP 哈希表容量上限 (写入 set size)
 function apply_nft_syn_limit() {
     local src_enabled=$1
     local nft_src_rate=$2
@@ -678,11 +691,14 @@ function tcp_syn_limit_set() {
     local dst_rate=${3:-${TCP_SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${TCP_SYN_DST_BURST:-"40000"}}
     local backend=${TCP_LIMITER_BACKEND:-"auto"}
-    # Sizing for nftables dynamic meter capacity:
-    # - src_htable_max: capacity for unique concurrent source IP tracking. Default 262144 (~256k sources)
-    #   is sized to withstand broad distributed scanners while keeping kernel hash memory within ~16-32MB.
-    # - dst_htable_max: capacity for destination VIP/EIP tracking. Default 2048 covers typical VPC EIP
-    #   allocation limits. Both can be tuned via environment variables if deployed in ultra-large clusters.
+    # nftables 动态集合（dynamic set / meter）在内核底层以哈希表（hash table，简称 htable）承载单 IP 计数桶：
+    # - src_htable_max: 源 IP 哈希表最大容量（写入 set size）。默认 262,144（~256k 活跃源 IP），
+    #   确保遭遇海量伪造源 IP 的 SYN Flood 攻击或分布式扫描时，内核哈希表内存被严格封顶在 ~16-32MB，
+    #   防止物理机内核 slab 内存耗尽。超大规模集群可通过 TCP_SYN_SRC_HTABLE_MAX 环境变量调整。
+    # - dst_htable_max: 目的 EIP 聚合限流哈希表容量（写入 set size）。默认 2048，覆盖常规 VPC 绑定的 EIP 上限。
+    # - src/dst_htable_expire: 单 IP 限流桶在哈希表中的空闲老化时间（写入 set timeout，毫秒 ms）。
+    #   当 IP 静默无流量达到该时长后，内核垃圾回收定时器自动释放其哈希表项，避免内存泄漏，
+    #   并在下次再次发包时重新赋予完整 burst 突发额度。该时长根据令牌充满所需周期自适应计算（10s ~ 24h）。
     local src_htable_max=${TCP_SYN_SRC_HTABLE_MAX:-262144}
     local dst_htable_max=${TCP_SYN_DST_HTABLE_MAX:-2048}
 
