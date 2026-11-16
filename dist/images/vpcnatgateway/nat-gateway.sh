@@ -463,7 +463,7 @@ function hairpin_snat_mode() {
 
 function is_stateless_active() {
     local mode=$1
-    if [ "$mode" = "stateless" ] || [ "$mode" = "stateless-nft" ]; then
+    if [ "$mode" = "stateless-nft" ]; then
         return 0
     fi
     return 1
@@ -497,7 +497,6 @@ function apply_nft_connlimit() {
         fi
         cmds+=(
             "flush chain ip $NFT_TABLE conn-limit"
-            "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return"
             "add rule ip $NFT_TABLE conn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
             "add rule ip $NFT_TABLE conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over $limit drop"
         )
@@ -666,7 +665,6 @@ function apply_nft_syn_limit() {
         tx_cmds+=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }")
     fi
     tx_cmds+=(
-        "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return"
         "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
     )
     if [ "$src_enabled" -eq 1 ]; then

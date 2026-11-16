@@ -37,8 +37,8 @@ for invalid_unit in "100/m" "100/min" "100/minute" "200/h" "200/hour" "50/d" "50
 done
 
 # 2. Test is_stateless_active mode handling
-if ! is_stateless_active "stateless"; then
-    echo "FAIL: mode 'stateless' must be treated as active stateless" >&2
+if is_stateless_active "stateless"; then
+    echo "FAIL: mode 'stateless' must not be treated as active stateless" >&2
     exit 1
 fi
 

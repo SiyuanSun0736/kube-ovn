@@ -506,6 +506,9 @@ spec:
                 hairpinSnat:
                   type: string
                   description: State of the lanIP fallback hairpin SNAT programmed on the NAT gateway (enable, disable, or unsupported when the running gateway image cannot switch it)
+                dataplaneMode:
+                  type: string
+                  description: Active data plane mode configured on the NAT gateway ("stateless-nft" or empty for default)
                 tcpConnLimit:
                   type: integer
                   description: Active TCP connlimit threshold configured on the NAT gateway
@@ -876,13 +879,19 @@ spec:
                     traffic dialed at a FIP from inside the VPC is always SNAT'd to that FIP, and an
                     external client dialing it stays visible to its owner. Applied without Pod
                     recreation.
+                dataplaneMode:
+                  type: string
+                  enum:
+                    - ""
+                    - stateless-nft
+                  description: Data plane mode of the NAT gateway. Set to "stateless-nft" for stateless mode, or empty/unset for default mode.
                 tcpConnLimit:
                   type: integer
                   minimum: 0
-                  description: Maximum concurrent TCP connections allowed on the NAT gateway. Set to 0 to disable.
+                  description: Maximum concurrent TCP connections allowed on the NAT gateway. When unset or set to 0, connlimit is disabled. Set to a positive integer to enable.
                 tcpSynRateLimit:
                   type: object
-                  description: Pre-routing TCP SYN packet rate and burst limits on the NAT gateway. Applied dynamically without Pod recreation.
+                  description: Pre-routing TCP SYN packet rate and burst limits on the NAT gateway. Disabled when unset or rate is 0. Applied dynamically without Pod recreation.
                   properties:
                     srcRate:
                       type: string

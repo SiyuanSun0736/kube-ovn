@@ -308,14 +308,10 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 }
 
 func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) int32 {
-	// Explicit spec field is the single authoritative configuration source
-	if gw.Spec.TCPConnLimit != nil {
-		if *gw.Spec.TCPConnLimit >= 0 {
-			return *gw.Spec.TCPConnLimit
-		}
-		klog.Warningf("nat gw %s has invalid negative spec.tcpConnLimit %d, falling back to default %d", gw.Name, *gw.Spec.TCPConnLimit, util.DefaultNatGwTCPConnLimit)
+	if gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
+		return *gw.Spec.TCPConnLimit
 	}
-	return int32(util.DefaultNatGwTCPConnLimit)
+	return 0
 }
 
 var (
@@ -323,21 +319,21 @@ var (
 	synBurstRegex = regexp.MustCompile(`^[1-9][0-9]*$`)
 )
 
-func cleanRateLimit(val, fallback string) string {
+func cleanRateLimit(val string) string {
 	trimmed := strings.TrimSpace(val)
-	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
-		return fallback
+	if trimmed == "" || trimmed == "0" || trimmed == "disable" || trimmed == "none" || strings.ContainsAny(trimmed, "\r\n") {
+		return "0"
 	}
-	if trimmed == "0" || trimmed == "disable" || trimmed == "none" || synRateRegex.MatchString(trimmed) {
+	if synRateRegex.MatchString(trimmed) {
 		return trimmed
 	}
-	klog.Warningf("invalid tcp syn rate %q, falling back to %s", trimmed, fallback)
-	return fallback
+	klog.Warningf("invalid tcp syn rate %q, disabling rate limit", trimmed)
+	return "0"
 }
 
 func cleanBurstLimit(val, fallback string) string {
 	trimmed := strings.TrimSpace(val)
-	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
+	if trimmed == "" || trimmed == "0" || strings.ContainsAny(trimmed, "\r\n") {
 		return fallback
 	}
 	if synBurstRegex.MatchString(trimmed) {
@@ -348,34 +344,31 @@ func cleanBurstLimit(val, fallback string) string {
 }
 
 func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
-	srcRate := util.DefaultNatGwTCPSynSrcRate
-	srcBurst := util.DefaultNatGwTCPSynSrcBurst
-	dstRate := util.DefaultNatGwTCPSynDstRate
-	dstBurst := util.DefaultNatGwTCPSynDstBurst
+	if gw.Spec.TCPSynRateLimit == nil {
+		return []string{"0", "0", "0", "0"}
+	}
 
-	if gw.Spec.TCPSynRateLimit != nil {
-		srcRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcRate, srcRate)
-		srcBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.SrcBurst, srcBurst)
-		dstRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.DstRate, dstRate)
-		dstBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.DstBurst, dstBurst)
+	srcRate := cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcRate)
+	srcBurst := "0"
+	if srcRate != "0" {
+		srcBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.SrcBurst, util.DefaultNatGwTCPSynSrcBurst)
+	}
+
+	dstRate := cleanRateLimit(gw.Spec.TCPSynRateLimit.DstRate)
+	dstBurst := "0"
+	if dstRate != "0" {
+		dstBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.DstBurst, util.DefaultNatGwTCPSynDstBurst)
 	}
 
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
 }
 
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
-	if gw.Annotations != nil {
-		if mode, ok := gw.Annotations[util.VpcNatGatewayDataplaneModeAnnotation]; ok {
-			if trimmed := strings.TrimSpace(mode); trimmed != "" {
-				return trimmed
-			}
-		}
-	}
-	return util.NatDataplaneModeStateful
+	return strings.TrimSpace(gw.Spec.DataplaneMode)
 }
 
 func isStatelessMode(mode string) bool {
-	return mode == util.NatDataplaneModeStateless || mode == util.NatDataplaneModeStatelessNft
+	return mode == util.NatDataplaneModeStatelessNft
 }
 
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
@@ -387,37 +380,17 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 		effectiveLimit = 0
 	}
 
-	// Check convergence decision:
-	// A new/restarted Pod (or force=true during init) must be programmed.
-	// Normal convergence checks that:
-	// 1. Status tcpConnLimit matches effectiveLimit
-	// 2. Applied dataplaneMode on this Pod matches current dataplaneMode
-	// 3. Applied connlimit on this Pod matches effectiveLimit
-	appliedMode := ""
-	appliedLimit := ""
-	if pod.Annotations != nil {
-		appliedMode = strings.TrimSpace(pod.Annotations[util.VpcNatGatewayDataplaneModeStateAnnotation])
-		appliedLimit = strings.TrimSpace(pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation])
-	}
+	statusLimitMatches := (gw.Status.TCPConnLimit == nil && effectiveLimit == 0) ||
+		(gw.Status.TCPConnLimit != nil && *gw.Status.TCPConnLimit == effectiveLimit)
 
-	effectiveLimitStr := strconv.FormatInt(int64(effectiveLimit), 10)
-	if !force && gw.Status.TCPConnLimit != nil && *gw.Status.TCPConnLimit == effectiveLimit &&
-		appliedMode == dataplaneMode && appliedLimit == effectiveLimitStr {
+	if !force && statusLimitMatches && gw.Status.DataplaneMode == dataplaneMode {
 		return nil
 	}
 
-	args := []string{strconv.FormatInt(int64(desiredLimit), 10), dataplaneMode}
+	effectiveLimitStr := strconv.FormatInt(int64(effectiveLimit), 10)
+	args := []string{effectiveLimitStr, dataplaneMode}
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTCPConnLimitSet, args); err != nil {
-		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", desiredLimit, gw.Name, err)
-		return err
-	}
-
-	patch := util.KVPatch{
-		util.VpcNatTCPConnLimitStateAnnotation:         effectiveLimitStr,
-		util.VpcNatGatewayDataplaneModeStateAnnotation: dataplaneMode,
-	}
-	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
-		klog.Errorf("failed to patch pod %s/%s annotations for tcp connlimit: %v", pod.Namespace, pod.Name, err)
+		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", effectiveLimit, gw.Name, err)
 		return err
 	}
 
@@ -426,22 +399,21 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 
 func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
 	args := c.getNatGwTCPSynRateLimitArgs(gw)
-	desiredState := strings.Join(args, ",")
-	desiredLimit := kubeovnv1.TCPSynRateLimit{
-		SrcRate:  args[0],
-		SrcBurst: args[1],
-		DstRate:  args[2],
-		DstBurst: args[3],
+	isDesiredDisabled := args[0] == "0" && args[2] == "0"
+	var desiredLimit *kubeovnv1.TCPSynRateLimit
+	if !isDesiredDisabled {
+		desiredLimit = &kubeovnv1.TCPSynRateLimit{
+			SrcRate:  args[0],
+			SrcBurst: args[1],
+			DstRate:  args[2],
+			DstBurst: args[3],
+		}
 	}
 
-	appliedState := ""
-	if pod.Annotations != nil {
-		appliedState = strings.TrimSpace(pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation])
-	}
+	statusMatches := (gw.Status.TCPSynRateLimit == nil && isDesiredDisabled) ||
+		(gw.Status.TCPSynRateLimit != nil && desiredLimit != nil && *gw.Status.TCPSynRateLimit == *desiredLimit)
 
-	statusMatches := gw.Status.TCPSynRateLimit != nil && *gw.Status.TCPSynRateLimit == desiredLimit
-
-	if !force && statusMatches && appliedState == desiredState {
+	if !force && statusMatches {
 		return nil
 	}
 
@@ -450,15 +422,7 @@ func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *
 		return err
 	}
 
-	patch := util.KVPatch{
-		util.VpcNatTCPSynLimitStateAnnotation: desiredState,
-	}
-	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
-		klog.Errorf("failed to patch pod %s/%s annotations for tcp syn limit: %v", pod.Namespace, pod.Name, err)
-		return err
-	}
-
-	return c.patchNatGwTCPSynRateLimitStatus(gw.Name, &desiredLimit)
+	return c.patchNatGwTCPSynRateLimitStatus(gw.Name, desiredLimit)
 }
 
 func (c *Controller) patchNatGwTCPSynRateLimitStatus(key string, limit *kubeovnv1.TCPSynRateLimit) error {
@@ -470,7 +434,8 @@ func (c *Controller) patchNatGwTCPSynRateLimitStatus(key string, limit *kubeovnv
 		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
 		return err
 	}
-	if oriGw.Status.TCPSynRateLimit != nil && limit != nil && *oriGw.Status.TCPSynRateLimit == *limit {
+	if (oriGw.Status.TCPSynRateLimit == nil && limit == nil) ||
+		(oriGw.Status.TCPSynRateLimit != nil && limit != nil && *oriGw.Status.TCPSynRateLimit == *limit) {
 		return nil
 	}
 	patch, err := json.Marshal(map[string]any{"status": map[string]any{"tcpSynRateLimit": limit}})
@@ -482,8 +447,9 @@ func (c *Controller) patchNatGwTCPSynRateLimitStatus(key string, limit *kubeovnv
 		patch, metav1.PatchOptions{}, "status")
 	if err != nil {
 		klog.Errorf("failed to patch status.tcpSynRateLimit for vpc nat gw %s: %v", oriGw.Name, err)
+		return err
 	}
-	return err
+	return nil
 }
 
 func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error {
@@ -495,10 +461,14 @@ func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error
 		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
 		return err
 	}
-	if oriGw.Status.TCPConnLimit != nil && *oriGw.Status.TCPConnLimit == limit {
+	dataplaneMode := c.getNatGwDataplaneMode(oriGw)
+	if oriGw.Status.TCPConnLimit != nil && *oriGw.Status.TCPConnLimit == limit && oriGw.Status.DataplaneMode == dataplaneMode {
 		return nil
 	}
-	patch, err := json.Marshal(map[string]any{"status": map[string]int32{"tcpConnLimit": limit}})
+	patch, err := json.Marshal(map[string]any{"status": map[string]any{
+		"tcpConnLimit":  limit,
+		"dataplaneMode": dataplaneMode,
+	}})
 	if err != nil {
 		klog.Errorf("failed to marshal status.tcpConnLimit=%d patch for vpc nat gw %s: %v", limit, key, err)
 		return err
