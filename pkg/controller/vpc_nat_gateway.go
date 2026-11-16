@@ -327,23 +327,13 @@ func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *core
 }
 
 func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) int32 {
-	// 1. Explicit spec field (authoritative)
+	// Explicit spec field is the single authoritative configuration source
 	if gw.Spec.TCPConnLimit != nil {
 		if *gw.Spec.TCPConnLimit >= 0 {
 			return *gw.Spec.TCPConnLimit
 		}
 		klog.Warningf("nat gw %s has invalid negative spec.tcpConnLimit %d, falling back to default %d", gw.Name, *gw.Spec.TCPConnLimit, util.DefaultNatGwTCPConnLimit)
-		return int32(util.DefaultNatGwTCPConnLimit)
 	}
-	// 2. Annotation fallback (only when spec is unset)
-	if val, ok := gw.Annotations[util.VpcNatTCPConnLimitAnnotation]; ok {
-		limit, err := strconv.ParseInt(strings.TrimSpace(val), 10, 32)
-		if err == nil && limit >= 0 {
-			return int32(limit)
-		}
-		klog.Warningf("nat gw %s has invalid annotation %s=%q, falling back to default %d", gw.Name, util.VpcNatTCPConnLimitAnnotation, val, util.DefaultNatGwTCPConnLimit)
-	}
-	// 3. Standalone default connlimit fallback (50,000 / 5w)
 	return int32(util.DefaultNatGwTCPConnLimit)
 }
 
@@ -453,7 +443,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 				return err
 			}
 		}
-		if gw.Spec.TCPConnLimit == nil && (gw.Annotations == nil || gw.Annotations[util.VpcNatTCPConnLimitAnnotation] == "") {
+		if gw.Spec.TCPConnLimit == nil {
 			return nil
 		}
 		klog.Warningf("nat gw %s pod runs an image without %s: custom limit cannot take effect until pod is replaced", gw.Name, natGwTCPConnLimitSet)
@@ -911,7 +901,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return err
 	}
 
-	isCustomConnLimit := gw.Spec.TCPConnLimit != nil || (gw.Annotations != nil && gw.Annotations[util.VpcNatTCPConnLimitAnnotation] != "")
+	isCustomConnLimit := gw.Spec.TCPConnLimit != nil
 	if connLimitErr := c.syncNatGwTCPConnLimit(gw, pod, true); connLimitErr != nil {
 		klog.Errorf("failed to set tcp connlimit during init for nat gw %s: %v", key, connLimitErr)
 		if isCustomConnLimit {

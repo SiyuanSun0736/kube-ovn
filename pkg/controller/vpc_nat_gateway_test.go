@@ -936,27 +936,20 @@ func TestNatGwDesiredTCPConnLimit(t *testing.T) {
 	gw := fakeGw("gw")
 	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
-	// 2. Custom annotation tcp-connlimit
-	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
-	assert.Equal(t, int32(15000), ctrl.getNatGwDesiredTCPConnLimit(gw))
-
-	// 3. Spec field overrides annotation
+	// 2. Custom spec field
 	gw.Spec.TCPConnLimit = ptr.To(int32(30000))
 	assert.Equal(t, int32(30000), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
-	// 4. Spec field 0 disables connlimit
+	// 3. Spec field 0 disables connlimit
 	gw.Spec.TCPConnLimit = ptr.To(int32(0))
 	assert.Equal(t, int32(0), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
-	// 5. Negative spec field falls back to default directly (authoritative, does not fall through to annotation)
+	// 4. Negative spec field falls back to default directly
 	gw.Spec.TCPConnLimit = ptr.To(int32(-1))
-	gw.Annotations = map[string]string{util.VpcNatTCPConnLimitAnnotation: "15000"}
 	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 
-	// 6. Removing spec field restores annotation or default
+	// 5. Removing spec field restores default
 	gw.Spec.TCPConnLimit = nil
-	assert.Equal(t, int32(15000), ctrl.getNatGwDesiredTCPConnLimit(gw))
-	delete(gw.Annotations, util.VpcNatTCPConnLimitAnnotation)
 	assert.Equal(t, int32(util.DefaultNatGwTCPConnLimit), ctrl.getNatGwDesiredTCPConnLimit(gw))
 }
 

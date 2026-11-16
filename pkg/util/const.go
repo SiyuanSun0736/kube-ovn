@@ -53,12 +53,7 @@ const (
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
-	// VpcNatTCPConnLimitAnnotation is an optional user configuration fallback on the VpcNatGateway CR (gw.Annotations)
-	// when spec.tcpConnLimit is unset.
-	VpcNatTCPConnLimitAnnotation = "ovn.kubernetes.io/tcp-connlimit"
 	// VpcNatTCPConnLimitStateAnnotation records the applied limit value (or "unsupported") on the gateway Pod.
-	// Separating this from VpcNatTCPConnLimitAnnotation prevents collisions when user annotations in spec.annotations
-	// are propagated to the Pod template by StatefulSet.
 	VpcNatTCPConnLimitStateAnnotation   = "ovn.kubernetes.io/tcp-connlimit-state"
 	VpcNatTCPSynSrcRateLimitAnnotation  = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
 	VpcNatTCPSynSrcBurstLimitAnnotation = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
