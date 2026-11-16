@@ -502,7 +502,6 @@ function apply_nft_connlimit() {
             "flush chain ip $NFT_TABLE conn-limit"
             "add rule ip $NFT_TABLE conn-limit iifname \"lo\" return"
             "add rule ip $NFT_TABLE conn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
-            "add rule ip $NFT_TABLE conn-limit tcp dport 179 return"
             "add rule ip $NFT_TABLE conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over $limit drop"
         )
         if ! nft_transaction "${cmds[@]}"; then
@@ -666,7 +665,6 @@ function apply_nft_syn_limit() {
     local tx_cmds=(
         "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return"
         "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
-        "add rule ip $NFT_TABLE syn-limit tcp dport 179 return"
     )
     if [ "$src_enabled" -eq 1 ]; then
         local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
