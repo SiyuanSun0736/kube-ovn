@@ -318,12 +318,33 @@ func (c *Controller) getNatGwDesiredTCPConnLimit(gw *kubeovnv1.VpcNatGateway) in
 	return int32(util.DefaultNatGwTCPConnLimit)
 }
 
+var (
+	synRateRegex  = regexp.MustCompile(`^[1-9][0-9]*/(s|sec|second)$`)
+	synBurstRegex = regexp.MustCompile(`^[1-9][0-9]*$`)
+)
+
 func cleanRateLimit(val, fallback string) string {
 	trimmed := strings.TrimSpace(val)
 	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
 		return fallback
 	}
-	return trimmed
+	if trimmed == "0" || trimmed == "disable" || trimmed == "none" || synRateRegex.MatchString(trimmed) {
+		return trimmed
+	}
+	klog.Warningf("invalid tcp syn rate %q, falling back to %s", trimmed, fallback)
+	return fallback
+}
+
+func cleanBurstLimit(val, fallback string) string {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n") {
+		return fallback
+	}
+	if synBurstRegex.MatchString(trimmed) {
+		return trimmed
+	}
+	klog.Warningf("invalid tcp syn burst %q, falling back to %s", trimmed, fallback)
+	return fallback
 }
 
 func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []string {
@@ -337,13 +358,13 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 			srcRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcRate, srcRate)
 		}
 		if gw.Spec.TCPSynRateLimit.SrcBurst != "" {
-			srcBurst = cleanRateLimit(gw.Spec.TCPSynRateLimit.SrcBurst, srcBurst)
+			srcBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.SrcBurst, srcBurst)
 		}
 		if gw.Spec.TCPSynRateLimit.DstRate != "" {
 			dstRate = cleanRateLimit(gw.Spec.TCPSynRateLimit.DstRate, dstRate)
 		}
 		if gw.Spec.TCPSynRateLimit.DstBurst != "" {
-			dstBurst = cleanRateLimit(gw.Spec.TCPSynRateLimit.DstBurst, dstBurst)
+			dstBurst = cleanBurstLimit(gw.Spec.TCPSynRateLimit.DstBurst, dstBurst)
 		}
 	}
 
@@ -1227,10 +1248,8 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 		if len(stdOutput) > 0 {
 			klog.Infof("NAT gateway command failed - stdout: %v", stdOutput)
 		}
-		// Note: stdOutput is wrapped into the error so callers can inspect dispatcher
-		// responses (e.g. "Unknown command: <op>") when detecting controller/image skew.
 		klog.Errorf("NAT gateway command execution error: %v", err)
-		return fmt.Errorf("%w: stderr=%s stdout=%s", err, strings.TrimSpace(errOutput), strings.TrimSpace(stdOutput))
+		return err
 	}
 
 	if len(stdOutput) > 0 {

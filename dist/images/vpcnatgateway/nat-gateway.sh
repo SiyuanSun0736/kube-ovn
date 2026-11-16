@@ -650,20 +650,25 @@ function apply_nft_syn_limit() {
     nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_src_meter"
     nft_transaction_ignore_errors "delete set ip $NFT_TABLE syn_dst_meter"
 
-    local tx_cmds=(
-        "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return"
-        "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
-    )
+    local tx_cmds=()
     if [ "$src_enabled" -eq 1 ]; then
         local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
         [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
-        tx_cmds=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }" "${tx_cmds[@]}")
-        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_src_meter { ip saddr limit rate over $nft_src_rate burst $src_burst packets } drop")
+        tx_cmds+=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }")
     fi
     if [ "$dst_enabled" -eq 1 ]; then
         local dst_expire_sec=$(( (dst_htable_expire + 999) / 1000 ))
         [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
-        tx_cmds=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }" "${tx_cmds[@]}")
+        tx_cmds+=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }")
+    fi
+    tx_cmds+=(
+        "add rule ip $NFT_TABLE syn-limit iifname \"lo\" return"
+        "add rule ip $NFT_TABLE syn-limit iifname != \"$EXTERNAL_INTERFACE\" return"
+    )
+    if [ "$src_enabled" -eq 1 ]; then
+        tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_src_meter { ip saddr limit rate over $nft_src_rate burst $src_burst packets } drop")
+    fi
+    if [ "$dst_enabled" -eq 1 ]; then
         tx_cmds+=("add rule ip $NFT_TABLE syn-limit tcp flags & (fin|syn|rst|ack) == syn update @syn_dst_meter { ip daddr limit rate over $nft_dst_rate burst $dst_burst packets } drop")
     fi
 
@@ -696,7 +701,9 @@ function tcp_syn_limit_set() {
     check_inited
 
     # Shorten nf_conntrack_tcp_timeout_syn_recv from Linux default 60s to 5s to mitigate conntrack table exhaustion
-    sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 >/dev/null 2>&1 || true
+    if ! sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 >/dev/null 2>&1; then
+        echo "Warning: failed to tune net.netfilter.nf_conntrack_tcp_timeout_syn_recv to 5s" >&2
+    fi
 
     local src_enabled=1
     local dst_enabled=1

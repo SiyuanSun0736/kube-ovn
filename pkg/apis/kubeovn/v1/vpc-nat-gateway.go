@@ -103,20 +103,20 @@ type VpcNatGatewaySpec struct {
 }
 
 type TCPSynRateLimit struct {
-	// TCP SYN packet rate limit on source IP (e.g. "2000/s", "0" to disable).
-	// If unset, defaults to 2000/s (DefaultNatGwTCPSynSrcRate).
+	// TCP SYN packet rate limit on source IP (e.g. "1000/s", "0" to disable).
+	// If unset, defaults to 1000/s (DefaultNatGwTCPSynSrcRate).
 	// +kubebuilder:validation:Optional
 	SrcRate string `json:"srcRate,omitempty"`
-	// TCP SYN packet burst limit on source IP (packet count, e.g. "4000").
-	// If unset, defaults to 4000 (DefaultNatGwTCPSynSrcBurst).
+	// TCP SYN packet burst limit on source IP (packet count, e.g. "2000").
+	// If unset, defaults to 2000 (DefaultNatGwTCPSynSrcBurst).
 	// +kubebuilder:validation:Optional
 	SrcBurst string `json:"srcBurst,omitempty"`
-	// TCP SYN packet rate limit on destination IP (e.g. "5000/s", "0" to disable).
-	// If unset, defaults to 5000/s (DefaultNatGwTCPSynDstRate).
+	// TCP SYN packet rate limit on destination IP (e.g. "20000/s", "0" to disable).
+	// If unset, defaults to 20000/s (DefaultNatGwTCPSynDstRate).
 	// +kubebuilder:validation:Optional
 	DstRate string `json:"dstRate,omitempty"`
-	// TCP SYN packet burst limit on destination IP (packet count, e.g. "10000").
-	// If unset, defaults to 10000 (DefaultNatGwTCPSynDstBurst).
+	// TCP SYN packet burst limit on destination IP (packet count, e.g. "40000").
+	// If unset, defaults to 40000 (DefaultNatGwTCPSynDstBurst).
 	// +kubebuilder:validation:Optional
 	DstBurst string `json:"dstBurst,omitempty"`
 }

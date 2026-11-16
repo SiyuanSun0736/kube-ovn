@@ -886,16 +886,16 @@ spec:
                   properties:
                     srcRate:
                       type: string
-                      description: TCP SYN rate limit per source IP (e.g. "2000/s", "0" to disable).
+                      description: TCP SYN rate limit per source IP (e.g. "1000/s", "0" to disable).
                     srcBurst:
                       type: string
-                      description: TCP SYN burst limit per source IP (packet count, e.g. "4000").
+                      description: TCP SYN burst limit per source IP (packet count, e.g. "2000").
                     dstRate:
                       type: string
-                      description: TCP SYN rate limit per destination IP (e.g. "5000/s", "0" to disable).
+                      description: TCP SYN rate limit per destination IP (e.g. "20000/s", "0" to disable).
                     dstBurst:
                       type: string
-                      description: TCP SYN burst limit per destination IP (packet count, e.g. "10000").
+                      description: TCP SYN burst limit per destination IP (packet count, e.g. "40000").
                 bgpSpeaker:
                   type: object
                   description: BGP speaker configuration

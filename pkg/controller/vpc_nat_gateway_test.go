@@ -1120,9 +1120,9 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 
 	// 3. Command execution failure returns error
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
-		return errors.New("exit status 1: Error: invalid SYN dst_rate 'unknown command'")
+		return errors.New("exit status 1: Error: execution failed")
 	}
-	gw.Spec.TCPSynRateLimit.DstRate = "unknown command"
+	gw.Spec.TCPSynRateLimit.DstRate = "5000/s"
 	err = ctrl.syncNatGwTCPSynRateLimit(gw, pod, false)
 	require.Error(t, err)
 
@@ -1149,4 +1149,27 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	require.Equal(t, "stateful", ctrl.getNatGwDataplaneMode(gw))
 	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: " stateless "}
 	require.Equal(t, "stateless", ctrl.getNatGwDataplaneMode(gw))
+}
+
+func TestCleanRateAndBurstLimit(t *testing.T) {
+	// Rate limit validation
+	require.Equal(t, "1000/s", cleanRateLimit("1000/s", "fallback"))
+	require.Equal(t, "2000/sec", cleanRateLimit("2000/sec", "fallback"))
+	require.Equal(t, "5000/second", cleanRateLimit("5000/second", "fallback"))
+	require.Equal(t, "0", cleanRateLimit("0", "fallback"))
+	require.Equal(t, "disable", cleanRateLimit("disable", "fallback"))
+	require.Equal(t, "none", cleanRateLimit("none", "fallback"))
+	require.Equal(t, "fallback", cleanRateLimit("invalid", "fallback"))
+	require.Equal(t, "fallback", cleanRateLimit("-10/s", "fallback"))
+	require.Equal(t, "fallback", cleanRateLimit("100/m", "fallback"))
+	require.Equal(t, "fallback", cleanRateLimit("", "fallback"))
+	require.Equal(t, "fallback", cleanRateLimit("1000/s\nfoo", "fallback"))
+
+	// Burst limit validation
+	require.Equal(t, "2000", cleanBurstLimit("2000", "fallback"))
+	require.Equal(t, "1", cleanBurstLimit("1", "fallback"))
+	require.Equal(t, "fallback", cleanBurstLimit("0", "fallback"))
+	require.Equal(t, "fallback", cleanBurstLimit("-100", "fallback"))
+	require.Equal(t, "fallback", cleanBurstLimit("abc", "fallback"))
+	require.Equal(t, "fallback", cleanBurstLimit("", "fallback"))
 }
