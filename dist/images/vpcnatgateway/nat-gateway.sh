@@ -514,7 +514,6 @@ function apply_nft_connlimit() {
 function tcp_connlimit_set() {
     local limit=${1:-}
     local mode=${2:-stateful}
-    local backend=${TCP_LIMITER_BACKEND:-"auto"}
 
     check_inited
 
@@ -538,18 +537,6 @@ function tcp_connlimit_set() {
         return 0
     fi
 
-    case "$backend" in
-        nft|auto) ;;
-        iptables)
-            echo "Error: iptables limiter backend is removed, only nftables is supported" >&2
-            return 1
-            ;;
-        *)
-            echo "Error: invalid TCP_LIMITER_BACKEND '$backend' (expected auto|nft)" >&2
-            return 1
-            ;;
-    esac
-
     echo "Applying TCP connlimit=$limit (mode=$mode)"
     apply_nft_connlimit "$limit"
 }
@@ -564,38 +551,57 @@ function to_nft_rate() {
     esac
 }
 
-function calc_bucket_expire_ms() {
+function calc_bucket_expire_sec() {
     local rate=$1
     local burst=$2
     local num="${rate%/*}"
 
     if [ -z "$num" ] || ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ]; then
-        echo "10000"
+        echo "10"
         return 0
     fi
 
     if [ -z "$burst" ] || ! [[ "$burst" =~ ^[0-9]+$ ]] || [ "$burst" -le 0 ]; then
-        echo "10000"
+        echo "10"
         return 0
     fi
 
-    # Ensure idle expiry is at least the token refill period ceil(burst * 1000 / num),
-    # with a minimum baseline of 10000ms (10s) and an upper bound of 86400000ms (24h)
-    # to prevent premature entry eviction or kernel u32 parameter overflow.
-    local q=$(( burst / num ))
-    if [ "$q" -ge 86400 ]; then
-        echo "86400000"
-        return 0
+    # Ensure idle expiry is at least the token refill period ceil(burst / num),
+    # with a minimum baseline of 10s and an upper bound of 86400s (24h)
+    # to prevent premature entry eviction or kernel parameter overflow.
+    local refill_sec=$(( (burst + num - 1) / num ))
+    if [ "$refill_sec" -lt 10 ]; then
+        refill_sec=10
+    elif [ "$refill_sec" -gt 86400 ]; then
+        refill_sec=86400
     fi
+    echo "$refill_sec"
+}
 
-    local r=$(( burst % num ))
-    local refill_ms=$(( q * 1000 + (r * 1000 + num - 1) / num ))
-    if [ "$refill_ms" -lt 10000 ]; then
-        refill_ms=10000
-    elif [ "$refill_ms" -gt 86400000 ]; then
-        refill_ms=86400000
+function parse_syn_rate_burst() {
+    local target=$1
+    local rate=$2
+    local burst=$3
+    local rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
+    local num_pattern="^[0-9]+$"
+
+    [[ "$rate" =~ ^[0-9]+$ ]] && rate="${rate}/s"
+    if ! [[ "$rate" =~ $rate_pattern ]]; then
+        echo "Error: invalid SYN ${target}_rate '$rate'" >&2
+        return 1
     fi
-    echo "$refill_ms"
+    local nft_rate
+    if ! nft_rate=$(to_nft_rate "$rate") || [ -z "$nft_rate" ]; then
+        echo "Error: invalid SYN ${target}_rate unit in '$rate'" >&2
+        return 1
+    fi
+    if ! [[ "$burst" =~ $num_pattern ]] || [ "$burst" -le 0 ]; then
+        echo "Error: invalid SYN ${target}_burst '$burst'" >&2
+        return 1
+    fi
+    local expire_sec
+    expire_sec=$(calc_bucket_expire_sec "$rate" "$burst")
+    echo "$nft_rate $expire_sec"
 }
 
 function is_syn_limit_disabled() {
@@ -611,23 +617,23 @@ function is_syn_limit_disabled() {
 #   $1 src_enabled:        是否启用源 IP 限流 (0/1)
 #   $2 nft_src_rate:       nft 格式源 IP 限速 (如 1000/second)
 #   $3 src_burst:          源 IP 突发容忍包数
-#   $4 src_htable_expire:  源 IP 哈希表项空闲老化时间 (单位毫秒 ms，换算为秒写入 set timeout)
+#   $4 src_expire_sec:     源 IP 哈希表项空闲老化时间 (单位秒 s，写入 set timeout)
 #                          当特定源 IP 静默超过此时间无新报文时，内核自动回收其哈希表项以释放内存
 #   $5 dst_enabled:        是否启用目的 EIP 限流 (0/1)
 #   $6 nft_dst_rate:       nft 格式目的 EIP 限速 (如 20000/second)
 #   $7 dst_burst:          目的 EIP 突发容忍包数
-#   $8 dst_htable_expire:  目的 EIP 哈希表项空闲老化时间 (单位毫秒 ms)
+#   $8 dst_expire_sec:     目的 EIP 哈希表项空闲老化时间 (单位秒 s)
 #   $9 src_htable_max:     源 IP 哈希表容量上限 (写入 set size，限制最大同时跟踪的源 IP 数量，防内存爆表)
 #  ${10} dst_htable_max:   目的 EIP 哈希表容量上限 (写入 set size)
 function apply_nft_syn_limit() {
     local src_enabled=$1
     local nft_src_rate=$2
     local src_burst=$3
-    local src_htable_expire=$4
+    local src_expire_sec=$4
     local dst_enabled=$5
     local nft_dst_rate=$6
     local dst_burst=$7
-    local dst_htable_expire=$8
+    local dst_expire_sec=$8
     local src_htable_max=$9
     local dst_htable_max=${10}
 
@@ -652,12 +658,10 @@ function apply_nft_syn_limit() {
 
     local tx_cmds=()
     if [ "$src_enabled" -eq 1 ]; then
-        local src_expire_sec=$(( (src_htable_expire + 999) / 1000 ))
         [ "$src_expire_sec" -le 0 ] && src_expire_sec=10
         tx_cmds+=("add set ip $NFT_TABLE syn_src_meter { type ipv4_addr; flags dynamic, timeout; size $src_htable_max; timeout ${src_expire_sec}s; }")
     fi
     if [ "$dst_enabled" -eq 1 ]; then
-        local dst_expire_sec=$(( (dst_htable_expire + 999) / 1000 ))
         [ "$dst_expire_sec" -le 0 ] && dst_expire_sec=10
         tx_cmds+=("add set ip $NFT_TABLE syn_dst_meter { type ipv4_addr; flags dynamic, timeout; size $dst_htable_max; timeout ${dst_expire_sec}s; }")
     fi
@@ -686,15 +690,6 @@ function tcp_syn_limit_set() {
     local src_burst=${2:-${TCP_SYN_SRC_BURST:-"2000"}}
     local dst_rate=${3:-${TCP_SYN_DST_RATE:-"20000/s"}}
     local dst_burst=${4:-${TCP_SYN_DST_BURST:-"40000"}}
-    local backend=${TCP_LIMITER_BACKEND:-"auto"}
-    # nftables 动态集合（dynamic set / meter）在内核底层以哈希表（hash table，简称 htable）承载单 IP 计数桶：
-    # - src_htable_max: 源 IP 哈希表最大容量（写入 set size）。默认 262,144（~256k 活跃源 IP），
-    #   确保遭遇海量伪造源 IP 的 SYN Flood 攻击或分布式扫描时，内核哈希表内存被严格封顶在 ~16-32MB，
-    #   防止物理机内核 slab 内存耗尽。超大规模集群可通过 TCP_SYN_SRC_HTABLE_MAX 环境变量调整。
-    # - dst_htable_max: 目的 EIP 聚合限流哈希表容量（写入 set size）。默认 2048，覆盖常规 VPC 绑定的 EIP 上限。
-    # - src/dst_htable_expire: 单 IP 限流桶在哈希表中的空闲老化时间（写入 set timeout，毫秒 ms）。
-    #   当 IP 静默无流量达到该时长后，内核垃圾回收定时器自动释放其哈希表项，避免内存泄漏，
-    #   并在下次再次发包时重新赋予完整 burst 突发额度。该时长根据令牌充满所需周期自适应计算（10s ~ 24h）。
     local src_htable_max=${TCP_SYN_SRC_HTABLE_MAX:-262144}
     local dst_htable_max=${TCP_SYN_DST_HTABLE_MAX:-2048}
 
@@ -721,61 +716,33 @@ function tcp_syn_limit_set() {
         return 0
     fi
 
-    # Validate every enabled parameter against safe numeric/rate grammar (rate count must be positive, second granularity only)
-    local rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
-    local num_pattern="^[0-9]+$"
     local nft_src_rate=""
+    local src_expire_sec=10
     local nft_dst_rate=""
-    local src_htable_expire=10000
-    local dst_htable_expire=10000
+    local dst_expire_sec=10
 
     if [ "$src_enabled" -eq 1 ]; then
-        [[ "$src_rate" =~ ^[0-9]+$ ]] && src_rate="${src_rate}/s"
-        if ! [[ "$src_rate" =~ $rate_pattern ]]; then
-            echo "Error: invalid SYN src_rate '$src_rate'" >&2
+        local src_parsed
+        if ! src_parsed=$(parse_syn_rate_burst "src" "$src_rate" "$src_burst"); then
             return 1
         fi
-        if ! nft_src_rate=$(to_nft_rate "$src_rate") || [ -z "$nft_src_rate" ]; then
-            echo "Error: invalid SYN src_rate unit in '$src_rate'" >&2
-            return 1
-        fi
-        if ! [[ "$src_burst" =~ $num_pattern ]] || [ "$src_burst" -le 0 ]; then
-            echo "Error: invalid SYN src_burst '$src_burst'" >&2
-            return 1
-        fi
-        src_htable_expire=$(calc_bucket_expire_ms "$src_rate" "$src_burst")
+        read -r nft_src_rate src_expire_sec <<< "$src_parsed"
     fi
 
     if [ "$dst_enabled" -eq 1 ]; then
-        [[ "$dst_rate" =~ ^[0-9]+$ ]] && dst_rate="${dst_rate}/s"
-        if ! [[ "$dst_rate" =~ $rate_pattern ]]; then
-            echo "Error: invalid SYN dst_rate '$dst_rate'" >&2
+        local dst_parsed
+        if ! dst_parsed=$(parse_syn_rate_burst "dst" "$dst_rate" "$dst_burst"); then
             return 1
         fi
-        if ! nft_dst_rate=$(to_nft_rate "$dst_rate") || [ -z "$nft_dst_rate" ]; then
-            echo "Error: invalid SYN dst_rate unit in '$dst_rate'" >&2
-            return 1
-        fi
-        if ! [[ "$dst_burst" =~ $num_pattern ]] || [ "$dst_burst" -le 0 ]; then
-            echo "Error: invalid SYN dst_burst '$dst_burst'" >&2
-            return 1
-        fi
-        dst_htable_expire=$(calc_bucket_expire_ms "$dst_rate" "$dst_burst")
+        read -r nft_dst_rate dst_expire_sec <<< "$dst_parsed"
     fi
 
-    case "$backend" in
-        nft|auto) ;;
-        iptables)
-            echo "Error: iptables limiter backend is removed, only nftables is supported" >&2
-            return 1
-            ;;
-        *)
-            echo "Error: invalid TCP_LIMITER_BACKEND '$backend' (expected auto|nft)" >&2
-            return 1
-            ;;
-    esac
-
     echo "Applying TCP SYN pre-routing rate limit: src_rate=$src_rate (enabled=$src_enabled), src_burst=$src_burst, dst_rate=$dst_rate (enabled=$dst_enabled), dst_burst=$dst_burst"
+    apply_nft_syn_limit \
+        "$src_enabled" "$nft_src_rate" "$src_burst" "$src_expire_sec" \
+        "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_expire_sec" \
+        "$src_htable_max" "$dst_htable_max"
+}
 
     apply_nft_syn_limit "$src_enabled" "$nft_src_rate" "$src_burst" "$src_htable_expire" "$dst_enabled" "$nft_dst_rate" "$dst_burst" "$dst_htable_expire" "$src_htable_max" "$dst_htable_max"
 }

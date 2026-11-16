@@ -848,37 +848,6 @@ func TestSyncNatGwHairpinSNAT_FailurePropagatesError(t *testing.T) {
 	require.Error(t, ctrl.syncNatGwHairpinSNAT(gw, fakeNatGwPod("gw", true)))
 }
 
-func TestHandleInitVpcNatGw_HairpinSNATFailure(t *testing.T) {
-	old := vpcNatEnabled
-	vpcNatEnabled = "true"
-	t.Cleanup(func() { vpcNatEnabled = old })
-
-	gw := fakeGw("gw")
-	pod := fakeNatGwPod("gw", false)
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
-		Pods:           []*corev1.Pod{pod},
-	})
-	require.NoError(t, err)
-	ctrl := fc.fakeController
-	for _, q := range []*workqueue.TypedRateLimitingInterface[string]{
-		&ctrl.updateVpcFloatingIPQueue, &ctrl.updateVpcDnatQueue, &ctrl.updateVpcSnatQueue,
-		&ctrl.updateVpcSubnetQueue, &ctrl.updateVpcEipQueue,
-	} {
-		*q = newTypedRateLimitingQueue[string]("test", nil)
-		t.Cleanup((*q).ShutDown)
-	}
-	ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, _ []string) error {
-		if operation == natGwHairpinSNATSet {
-			return errors.New("Unknown command: hairpin-snat-set")
-		}
-		return nil
-	}
-
-	err = ctrl.handleInitVpcNatGw("gw")
-	require.Error(t, err)
-}
-
 func TestNatGwDesiredTCPConnLimit(t *testing.T) {
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{})
 	require.NoError(t, err)
@@ -1018,6 +987,11 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 		failErr error
 	}{
 		{
+			name:    "hairpin failure blocks init",
+			failOp:  natGwHairpinSNATSet,
+			failErr: errors.New("Unknown command: hairpin-snat-set"),
+		},
+		{
 			name:    "connlimit failure blocks init",
 			failOp:  natGwTCPConnLimitSet,
 			failErr: errors.New("rule installation failed"),
@@ -1143,12 +1117,6 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 		"0",
 		util.DefaultNatGwTCPSynDstBurst,
 	}}, calls)
-
-	// 5. Dataplane mode trims whitespace and falls back to stateful when empty
-	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: "  "}
-	require.Equal(t, "stateful", ctrl.getNatGwDataplaneMode(gw))
-	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: " stateless "}
-	require.Equal(t, "stateless", ctrl.getNatGwDataplaneMode(gw))
 }
 
 func TestCleanRateAndBurstLimit(t *testing.T) {

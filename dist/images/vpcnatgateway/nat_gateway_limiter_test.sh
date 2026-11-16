@@ -62,32 +62,32 @@ if is_stateless_active "unknown"; then
     exit 1
 fi
 
-# 3. Test calc_bucket_expire_ms
+# 3. Test calc_bucket_expire_sec
 assert_expire() {
     local rate=$1
     local burst=$2
     local want=$3
     local got
-    got=$(calc_bucket_expire_ms "$rate" "$burst")
+    got=$(calc_bucket_expire_sec "$rate" "$burst")
     if [ "$got" != "$want" ]; then
-        echo "FAIL calc_bucket_expire_ms '$rate' '$burst': got '$got', want '$want'" >&2
+        echo "FAIL calc_bucket_expire_sec '$rate' '$burst': got '$got', want '$want'" >&2
         exit 1
     fi
 }
 
-assert_expire "1000/s" "2000" "10000"
-assert_expire "20000/s" "40000" "10000"
-assert_expire "10/s" "500" "50000"
-assert_expire "1/s" "100" "100000"
-# Excessively large duration should be capped at 86400000ms (24h)
-assert_expire "1/s" "90000" "86400000"
-# Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
-assert_expire "0/s" "10" "10000"
-assert_expire "invalid" "10" "10000"
-# Zero or invalid burst should safely fall back to baseline 10000ms
-assert_expire "1000/s" "0" "10000"
-assert_expire "1000/s" "invalid" "10000"
-assert_expire "1000/s" "" "10000"
+assert_expire "1000/s" "2000" "10"
+assert_expire "20000/s" "40000" "10"
+assert_expire "10/s" "500" "50"
+assert_expire "1/s" "100" "100"
+# Excessively large duration should be capped at 86400s (24h)
+assert_expire "1/s" "90000" "86400"
+# Zero or invalid rate should safely fall back to baseline 10s without division by zero
+assert_expire "0/s" "10" "10"
+assert_expire "invalid" "10" "10"
+# Zero or invalid burst should safely fall back to baseline 10s
+assert_expire "1000/s" "0" "10"
+assert_expire "1000/s" "invalid" "10"
+assert_expire "1000/s" "" "10"
 
 # 4. Test rate pattern validation
 rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
@@ -153,7 +153,6 @@ mock_iptables() {
     fi
     return 0
 }
-nft_cmd="nft"
 iptables_cmd="mock_iptables"
 iptables_save_cmd="true"
 EXTERNAL_INTERFACE="net1"
@@ -174,7 +173,7 @@ if ! grep -q -- 'NFT_TX: add rule ip kube-ovn conn-limit iifname != "net1" retur
     exit 1
 fi
 
-# 6b. When nft rule installation fails, tcp_connlimit_set returns error and rejects iptables backend
+# 6b. When nft rule installation fails, tcp_connlimit_set returns error
 : > "$mock_log"
 if MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
     echo "FAIL: tcp_connlimit_set must return error when nft rule installation fails" >&2
@@ -182,10 +181,6 @@ if MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
 fi
 if grep -q -- "IPT:" "$mock_log"; then
     echo "FAIL: tcp_connlimit_set must never touch iptables even on nft failure" >&2
-    exit 1
-fi
-if TCP_LIMITER_BACKEND=iptables tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
-    echo "FAIL: TCP_LIMITER_BACKEND=iptables must be rejected" >&2
     exit 1
 fi
 
