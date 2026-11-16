@@ -937,7 +937,7 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation] = "50000"
-	pod.Annotations[util.VpcNatGatewayDataplaneModeAnnotation] = "stateful"
+	pod.Annotations[util.VpcNatGatewayDataplaneModeStateAnnotation] = "stateful"
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
 	require.Empty(t, calls)
 

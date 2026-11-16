@@ -37,22 +37,23 @@ const (
 	// implements, and the gateway that serves a Service handled by the nftable LB service
 	// feature (a LoadBalancer Service also carries the eip annotation its ingress IP comes
 	// from). A Service without it is not handled.
-	VpcNatGatewayAnnotation                 = "ovn.kubernetes.io/vpc_nat_gw"
-	VpcNatGatewayInitAnnotation             = "ovn.kubernetes.io/vpc_nat_gw_init"
-	VpcNatGatewayContainerRestartAnnotation = "ovn.kubernetes.io/vpc_nat_gw_container_restarted"
-	VpcNatGatewayActivatedAnnotation        = "ovn.kubernetes.io/vpc_nat_gw_activated"
-	VpcEipsAnnotation                       = "ovn.kubernetes.io/vpc_eips"
-	VpcFloatingIPMd5Annotation              = "ovn.kubernetes.io/vpc_floating_ips"
-	VpcDnatMd5Annotation                    = "ovn.kubernetes.io/vpc_dnat_md5"
-	VpcSnatMd5Annotation                    = "ovn.kubernetes.io/vpc_snat_md5"
-	VpcCIDRsAnnotation                      = "ovn.kubernetes.io/vpc_cidrs"
-	VpcCIDRsAnnotationTemplate              = "%s.kubernetes.io/vpc_cidrs"
-	VpcLbAnnotation                         = "ovn.kubernetes.io/vpc_lb"
-	VpcExternalLabel                        = "ovn.kubernetes.io/vpc_external"
-	VpcEipAnnotation                        = "ovn.kubernetes.io/vpc_eip"
-	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
-	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
-	VpcNatGatewayDataplaneModeAnnotation    = "ovn.kubernetes.io/nat-dataplane-mode"
+	VpcNatGatewayAnnotation                   = "ovn.kubernetes.io/vpc_nat_gw"
+	VpcNatGatewayInitAnnotation               = "ovn.kubernetes.io/vpc_nat_gw_init"
+	VpcNatGatewayContainerRestartAnnotation   = "ovn.kubernetes.io/vpc_nat_gw_container_restarted"
+	VpcNatGatewayActivatedAnnotation          = "ovn.kubernetes.io/vpc_nat_gw_activated"
+	VpcEipsAnnotation                         = "ovn.kubernetes.io/vpc_eips"
+	VpcFloatingIPMd5Annotation                = "ovn.kubernetes.io/vpc_floating_ips"
+	VpcDnatMd5Annotation                      = "ovn.kubernetes.io/vpc_dnat_md5"
+	VpcSnatMd5Annotation                      = "ovn.kubernetes.io/vpc_snat_md5"
+	VpcCIDRsAnnotation                        = "ovn.kubernetes.io/vpc_cidrs"
+	VpcCIDRsAnnotationTemplate                = "%s.kubernetes.io/vpc_cidrs"
+	VpcLbAnnotation                           = "ovn.kubernetes.io/vpc_lb"
+	VpcExternalLabel                          = "ovn.kubernetes.io/vpc_external"
+	VpcEipAnnotation                          = "ovn.kubernetes.io/vpc_eip"
+	VpcDnatEPortLabel                         = "ovn.kubernetes.io/vpc_dnat_eport"
+	VpcNatAnnotation                          = "ovn.kubernetes.io/vpc_nat"
+	VpcNatGatewayDataplaneModeAnnotation      = "ovn.kubernetes.io/nat-dataplane-mode"
+	VpcNatGatewayDataplaneModeStateAnnotation = "ovn.kubernetes.io/nat-dataplane-mode-state"
 	// VpcNatTCPConnLimitStateAnnotation records the applied limit value on the gateway Pod.
 	VpcNatTCPConnLimitStateAnnotation = "ovn.kubernetes.io/tcp-connlimit-state"
 	// VpcNatTCPSynLimitStateAnnotation records the applied 4-tuple SYN limit state on the gateway Pod.
@@ -61,10 +62,17 @@ const (
 	NatDataplaneModeStateful     = "stateful"
 	NatDataplaneModeStateless    = "stateless"
 	NatDataplaneModeStatelessNft = "stateless-nft"
-	OvnEipTypeLabel              = "ovn.kubernetes.io/ovn_eip_type"
-	EipV4IpLabel                 = "ovn.kubernetes.io/eip_v4_ip"
-	EipUIDLabel                  = "ovn.kubernetes.io/eip_uid"
-	EipV6IpLabel                 = "ovn.kubernetes.io/eip_v6_ip"
+
+	DefaultNatGwTCPConnLimit   = 50000
+	DefaultNatGwTCPSynSrcRate  = "1000/s"
+	DefaultNatGwTCPSynSrcBurst = "2000"
+	DefaultNatGwTCPSynDstRate  = "20000/s"
+	DefaultNatGwTCPSynDstBurst = "40000"
+
+	OvnEipTypeLabel = "ovn.kubernetes.io/ovn_eip_type"
+	EipV4IpLabel    = "ovn.kubernetes.io/eip_v4_ip"
+	EipUIDLabel     = "ovn.kubernetes.io/eip_uid"
+	EipV6IpLabel    = "ovn.kubernetes.io/eip_v6_ip"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
 	SwitchLBRuleVip            = "switch_lb_vip"
@@ -227,15 +235,10 @@ const (
 
 	DefaultMTU = 1500
 
-	DefaultNatGwTCPConnLimit   = 50000
-	DefaultNatGwTCPSynSrcRate  = "1000/s"
-	DefaultNatGwTCPSynSrcBurst = "2000"
-	DefaultNatGwTCPSynDstRate  = "20000/s"
-	DefaultNatGwTCPSynDstBurst = "40000"
-	GeneveHeaderLength         = 100
-	VxlanHeaderLength          = 50
-	SttHeaderLength            = 72
-	TCPIPHeaderLength          = 40
+	GeneveHeaderLength = 100
+	VxlanHeaderLength  = 50
+	SttHeaderLength    = 72
+	TCPIPHeaderLength  = 40
 
 	OvnProvider                         = "ovn"
 	DefaultNetworkAnnotation            = "v1.multus-cni.io/default-network"

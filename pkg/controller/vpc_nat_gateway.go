@@ -383,7 +383,7 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	appliedMode := ""
 	appliedLimit := ""
 	if pod.Annotations != nil {
-		appliedMode = strings.TrimSpace(pod.Annotations[util.VpcNatGatewayDataplaneModeAnnotation])
+		appliedMode = strings.TrimSpace(pod.Annotations[util.VpcNatGatewayDataplaneModeStateAnnotation])
 		appliedLimit = strings.TrimSpace(pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation])
 	}
 
@@ -400,8 +400,8 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 	}
 
 	patch := util.KVPatch{
-		util.VpcNatTCPConnLimitStateAnnotation:    effectiveLimitStr,
-		util.VpcNatGatewayDataplaneModeAnnotation: dataplaneMode,
+		util.VpcNatTCPConnLimitStateAnnotation:         effectiveLimitStr,
+		util.VpcNatGatewayDataplaneModeStateAnnotation: dataplaneMode,
 	}
 	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
 		klog.Errorf("failed to patch pod %s/%s annotations for tcp connlimit: %v", pod.Namespace, pod.Name, err)
@@ -1523,11 +1523,7 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 							Lifecycle: &corev1.Lifecycle{
 								PostStart: &corev1.LifecycleHandler{
 									Exec: &corev1.ExecAction{
-										// Shorten net.netfilter.nf_conntrack_tcp_timeout_syn_recv from Linux default 60s to 5s.
-										// During large-scale SYN flood or port scans, half-open SYN_RECV conntrack entries
-										// expire 12x faster, drastically mitigating conntrack table exhaustion while remaining
-										// generous enough for standard TCP 3-way handshake completion under normal WAN RTT.
-										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1 && (sysctl -w net.netfilter.nf_conntrack_tcp_timeout_syn_recv=5 2>/dev/null || true)"},
+										Command: []string{"sh", "-c", "sysctl -w net.ipv4.ip_forward=1"},
 									},
 								},
 							},

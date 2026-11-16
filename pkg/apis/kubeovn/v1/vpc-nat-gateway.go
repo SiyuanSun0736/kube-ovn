@@ -148,7 +148,7 @@ type VpcNatGatewayStatus struct {
 	Tolerations     []corev1.Toleration `json:"tolerations" patchStrategy:"merge"`
 	Affinity        corev1.Affinity     `json:"affinity" patchStrategy:"merge"`
 	// TCPConnLimit is the current active TCP connlimit value applied to the NAT gateway.
-	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty" patchStrategy:"merge"`
+	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
 	// TCPSynRateLimit is the current active TCP SYN rate limit applied to the NAT gateway.
 	TCPSynRateLimit *TCPSynRateLimit `json:"tcpSynRateLimit,omitempty" patchStrategy:"merge"`
 }
