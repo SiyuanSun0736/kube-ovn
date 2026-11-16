@@ -161,15 +161,15 @@ iptables_cmd="mock_iptables"
 iptables_save_cmd="true"
 EXTERNAL_INTERFACE="net1"
 
-# 6a. Auto mode with both nft and iptables present must only install nft rules (no double enforcement)
+# 6a. Single-backend nftables installs nft rules and never touches iptables
 : > "$mock_log"
 tcp_connlimit_set "50000" "stateful" >/dev/null
-if grep -q -- "-A VPC_CONNLIMIT" "$mock_log"; then
-    echo "FAIL: auto mode must not install iptables VPC_CONNLIMIT when nft succeeds" >&2
+if grep -q -- "IPT:" "$mock_log"; then
+    echo "FAIL: tcp_connlimit_set must not invoke iptables" >&2
     exit 1
 fi
 if ! grep -q -- "NFT_TX: add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count over 50000 drop" "$mock_log"; then
-    echo "FAIL: auto mode did not install expected nft conn-limit rule" >&2
+    echo "FAIL: did not install expected nft conn-limit rule" >&2
     exit 1
 fi
 if ! grep -q -- 'NFT_TX: add rule ip kube-ovn conn-limit iifname != "net1" return' "$mock_log"; then
@@ -177,15 +177,18 @@ if ! grep -q -- 'NFT_TX: add rule ip kube-ovn conn-limit iifname != "net1" retur
     exit 1
 fi
 
-# 6b. Auto mode falls back to iptables when nft rule installation fails
+# 6b. When nft rule installation fails, tcp_connlimit_set returns error and rejects iptables backend
 : > "$mock_log"
-MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1
-if ! grep -q -- 'IPT: -t mangle -I PREROUTING 1 -i net1 -p tcp --syn -j VPC_CONNLIMIT' "$mock_log"; then
-    echo "FAIL: iptables connlimit PREROUTING jump must scope to external interface" >&2
+if MOCK_NFT_FAIL=1 tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
+    echo "FAIL: tcp_connlimit_set must return error when nft rule installation fails" >&2
     exit 1
 fi
-if ! grep -q -- "IPT: -t mangle -A VPC_CONNLIMIT -p tcp --syn -m connlimit --connlimit-above 50000" "$mock_log"; then
-    echo "FAIL: auto mode must fall back to iptables when nft fails" >&2
+if grep -q -- "IPT:" "$mock_log"; then
+    echo "FAIL: tcp_connlimit_set must never touch iptables even on nft failure" >&2
+    exit 1
+fi
+if TCP_LIMITER_BACKEND=iptables tcp_connlimit_set "50000" "stateful" >/dev/null 2>&1; then
+    echo "FAIL: TCP_LIMITER_BACKEND=iptables must be rejected" >&2
     exit 1
 fi
 
