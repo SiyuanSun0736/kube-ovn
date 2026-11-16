@@ -827,104 +827,54 @@ func TestNatGwStatusWritersKeepHairpinSNAT(t *testing.T) {
 	}
 }
 
-// A gateway Pod that still runs a script without hairpin-snat-set (controller upgraded ahead of
-// the gateway image) must not be sent the command: it fails on every retry and stops the whole
-// gateway reconcile from converging. The empty status is what marks such a Pod.
-func TestSyncNatGwHairpinSNATSkipsUnprogrammedPod(t *testing.T) {
+func TestSyncNatGwHairpinSNAT_FailurePropagatesError(t *testing.T) {
 	t.Parallel()
 
-	for _, tt := range []struct {
-		name    string
-		status  string
-		enabled bool
-	}{
-		{name: "never programmed, default gateway"},
-		{name: "never programmed, gateway asking for the fallback", enabled: true},
-		{name: "recorded unsupported, default gateway", status: hairpinSNATUnsupported},
-		{name: "recorded unsupported, gateway asking for the fallback", status: hairpinSNATUnsupported, enabled: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	gw := fakeGw("gw")
+	gw.Status.HairpinSNAT = hairpinSNATDisable
+	gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(true)
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
 
-			gw := fakeGw("gw")
-			gw.Status.HairpinSNAT = tt.status
-			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
-			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
-			})
-			require.NoError(t, err)
-			ctrl := fc.fakeController
-
-			var calls [][]string
-			ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, rules []string) error {
-				calls = append(calls, append([]string{operation}, rules...))
-				return errors.New("Unknown command: hairpin-snat-set")
-			}
-
-			require.NoError(t, ctrl.syncNatGwHairpinSNAT(gw, fakeNatGwPod("gw", true)))
-			require.Empty(t, calls)
-		})
+	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
+		return errors.New("Unknown command: hairpin-snat-set")
 	}
+
+	require.Error(t, ctrl.syncNatGwHairpinSNAT(gw, fakeNatGwPod("gw", true)))
 }
 
-// At init the command is sent, and a script that does not support it is tolerated only when the
-// gateway does not ask for the fallback: the status then stays empty instead of claiming a state
-// the data plane does not have. A gateway that does ask for it fails loudly, because the running
-// image cannot deliver it.
-func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
-	for _, tt := range []struct {
-		name      string
-		enabled   bool
-		expectErr bool
-	}{
-		{name: "default gateway initializes anyway"},
-		{name: "requested fallback fails loudly", enabled: true, expectErr: true},
+func TestHandleInitVpcNatGw_HairpinSNATFailure(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	gw := fakeGw("gw")
+	pod := fakeNatGwPod("gw", false)
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+	for _, q := range []*workqueue.TypedRateLimitingInterface[string]{
+		&ctrl.updateVpcFloatingIPQueue, &ctrl.updateVpcDnatQueue, &ctrl.updateVpcSnatQueue,
+		&ctrl.updateVpcSubnetQueue, &ctrl.updateVpcEipQueue,
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			old := vpcNatEnabled
-			vpcNatEnabled = "true"
-			t.Cleanup(func() { vpcNatEnabled = old })
-
-			gw := fakeGw("gw")
-			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
-			pod := fakeNatGwPod("gw", false)
-			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
-				Pods:           []*corev1.Pod{pod},
-			})
-			require.NoError(t, err)
-			ctrl := fc.fakeController
-			for _, q := range []*workqueue.TypedRateLimitingInterface[string]{
-				&ctrl.updateVpcFloatingIPQueue, &ctrl.updateVpcDnatQueue, &ctrl.updateVpcSnatQueue,
-				&ctrl.updateVpcSubnetQueue, &ctrl.updateVpcEipQueue,
-			} {
-				*q = newTypedRateLimitingQueue[string]("test", nil)
-				t.Cleanup((*q).ShutDown)
-			}
-			ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, _ []string) error {
-				if operation == natGwHairpinSNATSet {
-					return errors.New("Unknown command: hairpin-snat-set")
-				}
-				return nil
-			}
-
-			err = ctrl.handleInitVpcNatGw("gw")
-			if tt.expectErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-
-			patched, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
-			require.NoError(t, getErr)
-			require.Equal(t, hairpinSNATUnsupported, patched.Status.HairpinSNAT,
-				"a script that cannot switch the fallback must be recorded as such, not as a programmed state")
-			// ... and the Pod is still marked initialized, i.e. the gateway is usable
-			initialized, podErr := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
-			require.NoError(t, podErr)
-			require.Equal(t, "true", initialized.Annotations[util.VpcNatGatewayInitAnnotation])
-		})
+		*q = newTypedRateLimitingQueue[string]("test", nil)
+		t.Cleanup((*q).ShutDown)
 	}
+	ctrl.execRulesInPod = func(_ *corev1.Pod, operation string, _ []string) error {
+		if operation == natGwHairpinSNATSet {
+			return errors.New("Unknown command: hairpin-snat-set")
+		}
+		return nil
+	}
+
+	err = ctrl.handleInitVpcNatGw("gw")
+	require.Error(t, err)
 }
 
 func TestNatGwDesiredTCPConnLimit(t *testing.T) {
@@ -1051,72 +1001,29 @@ func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, newPod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "10000", "stateless"}}, calls)
 
-	// Case 3: Unsupported older image returns unknown command error -> handled gracefully
+	// Case 3: Command execution failure propagates error directly
 	calls = nil
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Unknown command: tcp-connlimit-set")
 	}
-	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, skewPod, false))
-	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
-	require.NoError(t, getErr)
-	require.Nil(t, patchedGw.Status.TCPConnLimit, "status.tcpConnLimit must be cleared when pod image does not support the command")
+	require.Error(t, ctrl.syncNatGwTCPConnLimit(gw, skewPod, false))
 }
 
 func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		setupGw    func(*kubeovnv1.VpcNatGateway)
-		failOp     string
-		failErr    error
-		expectErr  bool
-		expectAnno string
-		expectVal  string
+		name    string
+		failOp  string
+		failErr error
 	}{
 		{
-			name:       "connlimit failure tolerated during init (fail-open)",
-			failOp:     natGwTCPConnLimitSet,
-			failErr:    errors.New("iptables rule installation failed"),
-			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
-			expectVal:  "",
+			name:    "connlimit failure blocks init",
+			failOp:  natGwTCPConnLimitSet,
+			failErr: errors.New("rule installation failed"),
 		},
 		{
-			name: "custom connlimit failure blocks init",
-			setupGw: func(g *kubeovnv1.VpcNatGateway) {
-				g.Spec.TCPConnLimit = ptr.To(int32(20000))
-			},
-			failOp:    natGwTCPConnLimitSet,
-			failErr:   errors.New("iptables rule installation failed"),
-			expectErr: true,
-		},
-		{
-			name:       "syn limit failure tolerated during init (fail-open)",
-			failOp:     natGwTCPSynLimitSet,
-			failErr:    errors.New("nftables rule installation failed"),
-			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
-			expectVal:  "",
-		},
-		{
-			name: "custom syn limit failure blocks init",
-			setupGw: func(g *kubeovnv1.VpcNatGateway) {
-				g.Annotations = map[string]string{util.VpcNatTCPSynDstRateLimitAnnotation: "5000/s"}
-			},
-			failOp:    natGwTCPSynLimitSet,
-			failErr:   errors.New("nftables rule installation failed"),
-			expectErr: true,
-		},
-		{
-			name:       "unsupported connlimit command tolerated during init",
-			failOp:     natGwTCPConnLimitSet,
-			failErr:    errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="),
-			expectAnno: util.VpcNatTCPConnLimitStateAnnotation,
-			expectVal:  tcpConnLimitUnsupported,
-		},
-		{
-			name:       "unsupported syn limit command tolerated during init",
-			failOp:     natGwTCPSynLimitSet,
-			failErr:    errors.New("exit status 1: stderr=Unknown command: tcp-syn-limit-set stdout="),
-			expectAnno: util.VpcNatTCPSynLimitStateAnnotation,
-			expectVal:  tcpSynLimitUnsupported,
+			name:    "syn limit failure blocks init",
+			failOp:  natGwTCPSynLimitSet,
+			failErr: errors.New("nftables rule installation failed"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1125,9 +1032,6 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			t.Cleanup(func() { vpcNatEnabled = old })
 
 			gw := fakeGw("gw-sec")
-			if tc.setupGw != nil {
-				tc.setupGw(gw)
-			}
 			pod := fakeNatGwPod("gw-sec", false)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 				VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
@@ -1150,15 +1054,7 @@ func TestInitVpcNatGateway_SecurityRuleFailurePropagation(t *testing.T) {
 			}
 
 			err = ctrl.handleInitVpcNatGw("gw-sec")
-			if tc.expectErr {
-				require.Error(t, err, "custom limiter failure must fail init to alert operator")
-				return
-			}
-			require.NoError(t, err, "limiter failure must not gate data plane initialization")
-			initializedPod, getErr := ctrl.config.KubeClient.CoreV1().Pods(pod.Namespace).Get(t.Context(), pod.Name, metav1.GetOptions{})
-			require.NoError(t, getErr)
-			require.Equal(t, "true", initializedPod.Annotations[util.VpcNatGatewayInitAnnotation], "gateway must be marked initialized")
-			require.Equal(t, tc.expectVal, initializedPod.Annotations[tc.expectAnno], "failed limiter must be marked unsupported on pod")
+			require.Error(t, err, "security rule failure must fail init to alert operator")
 		})
 	}
 }
@@ -1214,14 +1110,13 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 		"16000",
 	}}, calls)
 
-	// 3. User input containing 'unknown command' in value must NOT be misclassified as unsupported command
+	// 3. Command execution failure returns error
 	ctrl.execRulesInPod = func(_ *corev1.Pod, _ string, _ []string) error {
 		return errors.New("exit status 1: Error: invalid SYN dst_rate 'unknown command'")
 	}
 	gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation] = "unknown command"
 	err = ctrl.syncNatGwTCPSynRateLimit(gw, pod, false)
 	require.Error(t, err)
-	require.NotEqual(t, tcpSynLimitUnsupported, pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation])
 
 	// 4. Disable destination SYN rate limit via "0"
 	calls = nil
@@ -1246,23 +1141,4 @@ func TestSyncNatGwTCPSynRateLimit(t *testing.T) {
 	require.Equal(t, "stateful", ctrl.getNatGwDataplaneMode(gw))
 	gw.Annotations = map[string]string{util.VpcNatGatewayDataplaneModeAnnotation: " stateless "}
 	require.Equal(t, "stateless", ctrl.getNatGwDataplaneMode(gw))
-}
-
-func TestIsUnsupportedCommandError(t *testing.T) {
-	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
-	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Unknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
-	require.True(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=UNSUPPORTED_COMMAND: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
-	require.True(t, isUnsupportedCommandError(errors.New("exit status 127: stderr=UNSUPPORTED_COMMAND: tcp-connlimit-set\nUnknown command: tcp-connlimit-set stdout="), natGwTCPConnLimitSet))
-	require.True(t, isUnsupportedCommandError(errors.New("Unknown command: tcp-syn-limit-set"), natGwTCPSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("Error: invalid SYN src_rate 'unknown command'"), natGwTCPSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: Unknown command: other-op"), natGwTCPConnLimitSet))
-
-	// False positive prevention: user input reflecting sentinel or unknown command inside validation error MUST NOT match
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid SYN src_rate 'UNSUPPORTED_COMMAND: tcp-syn-limit-set' stdout="), natGwTCPSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid SYN src_rate 'Unknown command: tcp-syn-limit-set' stdout="), natGwTCPSynLimitSet))
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=Error: invalid tcp connlimit value 'UNSUPPORTED_COMMAND: tcp-connlimit-set': must be an integer stdout="), natGwTCPConnLimitSet))
-
-	// False positive prevention: "unknown command: tcp-connlimit-set" inside stdout must NOT match when stderr is present
-	require.False(t, isUnsupportedCommandError(errors.New("exit status 1: stderr=iptables error stdout=unknown command: tcp-connlimit-set"), natGwTCPConnLimitSet))
-	require.False(t, isUnsupportedCommandError(nil, natGwTCPConnLimitSet))
 }

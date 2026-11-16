@@ -62,14 +62,6 @@ const (
 	// in VpcNatGatewayStatus.HairpinSNAT.
 	hairpinSNATEnable  = "enable"
 	hairpinSNATDisable = "disable"
-	// Value recorded in Pod state annotations (VpcNatTCPConnLimitStateAnnotation, VpcNatTCPSynLimitStateAnnotation,
-	// and VpcNatGatewayStatus.HairpinSNAT) when the running gateway image lacks support for the command.
-	// This string value is immutable for backward compatibility across controller and image versions.
-	natGwFeatureUnsupported         = "unsupported"
-	natGwUnsupportedCommandSentinel = "UNSUPPORTED_COMMAND"
-	hairpinSNATUnsupported          = natGwFeatureUnsupported
-	tcpConnLimitUnsupported         = natGwFeatureUnsupported
-	tcpSynLimitUnsupported          = natGwFeatureUnsupported
 
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
@@ -297,14 +289,6 @@ func hairpinSNATMode(gw *kubeovnv1.VpcNatGateway) string {
 // from the state the status records as programmed. The chain is rewritten in place, so no Pod
 // recreation.
 //
-// "unsupported" (or an empty value, before init has run at all) means the Pod runs a gateway
-// script without hairpin-snat-set: see handleInitVpcNatGw, which records that instead of a state
-// it could not program. Sending the command to such a Pod would fail on every retry and stop the
-// whole gateway reconcile from converging, and no subcommand of that script writes HAIRPIN_SNAT,
-// so the unconditional lanIP fallback it installs at init cannot be turned off from here at all.
-// The field therefore takes effect once the Pod is replaced by a gateway image that has the
-// command, whose init programs the chain and records the real state.
-//
 // TODO: the status gate means out-of-band changes to the chain are not repaired. A replaced Pod
 // re-converges through handleInitVpcNatGw, but a hand-run "nat-gateway.sh init" (the
 // natGwScriptHostPath workflow) resets the fallback to off while the status still claims it is on,
@@ -312,9 +296,6 @@ func hairpinSNATMode(gw *kubeovnv1.VpcNatGateway) string {
 // back on every reconcile, i.e. a pod exec per gateway event, which is why this is a note and not
 // a fix.
 func (c *Controller) syncNatGwHairpinSNAT(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod) error {
-	if gw.Status.HairpinSNAT == "" || gw.Status.HairpinSNAT == hairpinSNATUnsupported {
-		return nil
-	}
 	mode := hairpinSNATMode(gw)
 	if mode == gw.Status.HairpinSNAT {
 		return nil
@@ -382,74 +363,7 @@ func isStatelessMode(mode string) bool {
 	return mode == util.NatDataplaneModeStateless || mode == util.NatDataplaneModeStatelessNft
 }
 
-func isUnsupportedCommandError(err error, operation string) bool {
-	if err == nil || operation == "" {
-		return false
-	}
-	target := strings.ToLower(operation)
-	sentinel := strings.ToLower(natGwUnsupportedCommandSentinel + ": " + target)
-	legacyTarget := "unknown command: " + target
-
-	errStr := strings.ToLower(err.Error())
-
-	// 1. If command exited with status 127 (POSIX standard "command not found" emitted by gateway script),
-	// check if the sentinel or target is present.
-	isExit127 := strings.Contains(errStr, "exit status 127") ||
-		strings.Contains(errStr, "exit code 127") ||
-		strings.Contains(errStr, "command terminated with exit code 127")
-	if isExit127 && (strings.Contains(errStr, sentinel) || strings.Contains(errStr, legacyTarget)) {
-		return true
-	}
-
-	// 2. Extract the stderr segment if wrapped by execNatGwRules (stderr=... stdout=...).
-	// Never match against full error string or stdout to prevent forged command strings
-	// reflected in validation errors or unrelated stdout messages.
-	targetSegment := errStr
-	if idxStderr := strings.Index(errStr, "stderr="); idxStderr != -1 {
-		idxStdout := strings.Index(errStr[idxStderr:], "stdout=")
-		if idxStdout != -1 {
-			targetSegment = errStr[idxStderr+len("stderr=") : idxStderr+idxStdout]
-		} else {
-			targetSegment = errStr[idxStderr+len("stderr="):]
-		}
-	} else if strings.HasPrefix(targetSegment, "exit status ") || strings.HasPrefix(targetSegment, "command terminated with ") {
-		if idx := strings.Index(targetSegment, ": "); idx != -1 {
-			targetSegment = targetSegment[idx+2:]
-		}
-	}
-
-	// 3. Line-by-line inspection: must match exact standalone sentinel or unknown command line.
-	// Reject lines that are parameter validation errors (e.g. starting with "error:" or containing
-	// quoted parameter reflections like 'UNSUPPORTED_COMMAND: ...').
-	for _, rawLine := range strings.Split(targetSegment, "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "error:") {
-			continue
-		}
-		if line == sentinel || line == legacyTarget {
-			return true
-		}
-	}
-
-	return false
-}
-
 func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
-	// If the Pod was already marked as running an image without tcp-connlimit-set, check whether to skip
-	if pod.Annotations != nil && strings.TrimSpace(pod.Annotations[util.VpcNatTCPConnLimitStateAnnotation]) == tcpConnLimitUnsupported {
-		if gw.Status.TCPConnLimit != nil {
-			if err := c.clearNatGwTCPConnLimitStatus(gw.Name); err != nil {
-				klog.Errorf("failed to clear status.tcpConnLimit for unsupported nat gw %s, %v", gw.Name, err)
-				return err
-			}
-		}
-		if gw.Spec.TCPConnLimit == nil {
-			return nil
-		}
-		klog.Warningf("nat gw %s pod runs an image without %s: custom limit cannot take effect until pod is replaced", gw.Name, natGwTCPConnLimitSet)
-		return nil
-	}
-
 	desiredLimit := c.getNatGwDesiredTCPConnLimit(gw)
 	dataplaneMode := c.getNatGwDataplaneMode(gw)
 
@@ -479,21 +393,6 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 
 	args := []string{strconv.FormatInt(int64(desiredLimit), 10), dataplaneMode}
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTCPConnLimitSet, args); err != nil {
-		if isUnsupportedCommandError(err, natGwTCPConnLimitSet) {
-			klog.Warningf("nat gw %s runs a script without %s: connlimit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTCPConnLimitSet, err)
-			if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-				util.VpcNatTCPConnLimitStateAnnotation: tcpConnLimitUnsupported,
-			}); patchErr != nil {
-				klog.Errorf("failed to patch pod %s/%s unsupported connlimit annotation: %v", pod.Namespace, pod.Name, patchErr)
-			}
-			if gw.Status.TCPConnLimit != nil {
-				if clearErr := c.clearNatGwTCPConnLimitStatus(gw.Name); clearErr != nil {
-					klog.Errorf("failed to clear status.tcpConnLimit for unsupported nat gw %s, %v", gw.Name, clearErr)
-					return clearErr
-				}
-			}
-			return nil
-		}
 		klog.Errorf("failed to set tcp connlimit %d for nat gw %s, %v", desiredLimit, gw.Name, err)
 		return err
 	}
@@ -511,10 +410,6 @@ func (c *Controller) syncNatGwTCPConnLimit(gw *kubeovnv1.VpcNatGateway, pod *cor
 }
 
 func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *corev1.Pod, force bool) error {
-	if pod.Annotations != nil && strings.TrimSpace(pod.Annotations[util.VpcNatTCPSynLimitStateAnnotation]) == tcpSynLimitUnsupported {
-		return nil
-	}
-
 	args := c.getNatGwTCPSynRateLimitArgs(gw)
 	desiredState := strings.Join(args, ",")
 
@@ -523,15 +418,6 @@ func (c *Controller) syncNatGwTCPSynRateLimit(gw *kubeovnv1.VpcNatGateway, pod *
 	}
 
 	if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwTCPSynLimitSet, args); err != nil {
-		if isUnsupportedCommandError(err, natGwTCPSynLimitSet) {
-			klog.Warningf("nat gw %s runs a script without %s: SYN rate limit cannot take effect until the Pod is replaced by a gateway image that has it (%v)", gw.Name, natGwTCPSynLimitSet, err)
-			if patchErr := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, util.KVPatch{
-				util.VpcNatTCPSynLimitStateAnnotation: tcpSynLimitUnsupported,
-			}); patchErr != nil {
-				klog.Errorf("failed to patch pod %s/%s unsupported syn limit annotation: %v", pod.Namespace, pod.Name, patchErr)
-			}
-			return nil
-		}
 		klog.Errorf("failed to set tcp syn limit for nat gw %s, %v", gw.Name, err)
 		return err
 	}
@@ -567,31 +453,6 @@ func (c *Controller) patchNatGwTCPConnLimitStatus(key string, limit int32) error
 		patch, metav1.PatchOptions{}, "status")
 	if err != nil {
 		klog.Errorf("failed to patch status.tcpConnLimit=%d for vpc nat gw %s: %v", limit, oriGw.Name, err)
-	}
-	return err
-}
-
-func (c *Controller) clearNatGwTCPConnLimitStatus(key string) error {
-	oriGw, err := c.vpcNatGatewayLister.Get(key)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
-		return err
-	}
-	if oriGw.Status.TCPConnLimit == nil {
-		return nil
-	}
-	patch, err := json.Marshal(map[string]any{"status": map[string]any{"tcpConnLimit": nil}})
-	if err != nil {
-		klog.Errorf("failed to marshal clear status.tcpConnLimit patch for vpc nat gw %s: %v", key, err)
-		return err
-	}
-	_, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), oriGw.Name, types.MergePatchType,
-		patch, metav1.PatchOptions{}, "status")
-	if err != nil {
-		klog.Errorf("failed to clear status.tcpConnLimit for vpc nat gw %s: %v", oriGw.Name, err)
 	}
 	return err
 }
@@ -881,58 +742,24 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
 	}
 
-	// The state is recorded only after the command succeeded, so the status never claims a state
-	// the data plane does not have. A controller running ahead of the gateway image (the script
-	// comes from cm/ovn-vpc-nat-config data.image and may predate hairpin-snat-set) would fail
-	// here: a gateway that does not ask for the fallback tolerates that and initializes anyway,
-	// recording "unsupported" so the state of the field is visible instead of silently ignored.
-	// A gateway that does ask for it fails loudly instead, because the image cannot deliver it.
 	mode := hairpinSNATMode(gw)
 	if err = c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwHairpinSNATSet, []string{mode}); err != nil {
-		if mode != hairpinSNATDisable {
-			klog.Errorf("failed to set hairpin snat state %s for nat gw %s, %v", mode, key, err)
-			return err
-		}
-		klog.Warningf("nat gw %s runs a script without %s: spec.enableLanIpAsHairpinSnat cannot take effect until the Pod is replaced by a gateway image that has it (%v)", key, natGwHairpinSNATSet, err)
-		mode = hairpinSNATUnsupported
+		klog.Errorf("failed to set hairpin snat state %s for nat gw %s, %v", mode, key, err)
+		return err
 	}
 	if err = c.patchNatGwHairpinSNATStatus(key, mode); err != nil {
 		klog.Errorf("failed to patch hairpin snat status for nat gw %s, %v", key, err)
 		return err
 	}
 
-	isCustomConnLimit := gw.Spec.TCPConnLimit != nil
-	if connLimitErr := c.syncNatGwTCPConnLimit(gw, pod, true); connLimitErr != nil {
-		klog.Errorf("failed to set tcp connlimit during init for nat gw %s: %v", key, connLimitErr)
-		if isCustomConnLimit {
-			return connLimitErr
-		}
-		// Note: For default unconfigured connlimit, do not mark the Pod as permanently unsupported
-		// on transient execution errors so subsequent reconciles can retry. Unsupported older images
-		// are already marked inside syncNatGwTCPConnLimit.
-		if gw.Status.TCPConnLimit != nil {
-			if clearErr := c.clearNatGwTCPConnLimitStatus(gw.Name); clearErr != nil {
-				klog.Errorf("failed to clear status.tcpConnLimit for nat gw %s: %v", gw.Name, clearErr)
-			}
-		}
+	if err = c.syncNatGwTCPConnLimit(gw, pod, true); err != nil {
+		klog.Errorf("failed to set tcp connlimit during init for nat gw %s: %v", key, err)
+		return err
 	}
 
-	isCustomSynLimit := false
-	if gw.Annotations != nil {
-		if gw.Annotations[util.VpcNatTCPSynSrcRateLimitAnnotation] != "" ||
-			gw.Annotations[util.VpcNatTCPSynSrcBurstLimitAnnotation] != "" ||
-			gw.Annotations[util.VpcNatTCPSynDstRateLimitAnnotation] != "" ||
-			gw.Annotations[util.VpcNatTCPSynDstBurstLimitAnnotation] != "" {
-			isCustomSynLimit = true
-		}
-	}
-	if synLimitErr := c.syncNatGwTCPSynRateLimit(gw, pod, true); synLimitErr != nil {
-		klog.Errorf("failed to set tcp syn limit during init for nat gw %s: %v", key, synLimitErr)
-		if isCustomSynLimit {
-			return synLimitErr
-		}
-		// Note: For default baseline SYN limits, transient execution errors do not mark unsupported
-		// so subsequent reconciles can retry. Unsupported older images are marked inside syncNatGwTCPSynRateLimit.
+	if err = c.syncNatGwTCPSynRateLimit(gw, pod, true); err != nil {
+		klog.Errorf("failed to set tcp syn limit during init for nat gw %s: %v", key, err)
+		return err
 	}
 
 	if gw.Spec.QoSPolicy != "" {

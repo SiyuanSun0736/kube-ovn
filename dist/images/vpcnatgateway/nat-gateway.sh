@@ -2705,10 +2705,9 @@ case $opt in
         qos_del "$@"
         ;;
     *)
-        echo "UNSUPPORTED_COMMAND: $opt" >&2
-        echo "Unknown command: $opt" >&2
-        echo "" >&2
-        show_help >&2
-        exit 127
+        echo "Unknown command: $opt"
+        echo ""
+        show_help
+        exit 1
         ;;
 esac
