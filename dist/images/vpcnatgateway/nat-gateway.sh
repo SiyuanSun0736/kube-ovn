@@ -567,9 +567,6 @@ function to_nft_rate() {
     local unit="${val#*/}"
     case "$unit" in
         s|sec|second) echo "${num}/second" ;;
-        m|min|minute) echo "${num}/minute" ;;
-        h|hour)       echo "${num}/hour" ;;
-        d|day)        echo "${num}/day" ;;
         *) return 1 ;;
     esac
 }
@@ -578,8 +575,6 @@ function calc_bucket_expire_ms() {
     local rate=$1
     local burst=$2
     local num="${rate%/*}"
-    local unit="${rate#*/}"
-    local unit_ms=1000
 
     if [ -z "$num" ] || ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ]; then
         echo "10000"
@@ -591,28 +586,17 @@ function calc_bucket_expire_ms() {
         return 0
     fi
 
-    case "$unit" in
-        s|sec|second) unit_ms=1000 ;;
-        m|min|minute) unit_ms=60000 ;;
-        h|hour)       unit_ms=3600000 ;;
-        d|day)        unit_ms=86400000 ;;
-        *)            unit_ms=1000 ;;
-    esac
-
-    # Ensure idle expiry is at least the token refill period ceil(burst * unit_ms / num),
+    # Ensure idle expiry is at least the token refill period ceil(burst * 1000 / num),
     # with a minimum baseline of 10000ms (10s) and an upper bound of 86400000ms (24h)
     # to prevent premature entry eviction or kernel u32 parameter overflow.
-    # Prevent 32-bit arithmetic overflow: if burst / num >= 86400000 / unit_ms,
-    # the refill period already meets or exceeds the 86400000ms cap.
-    local max_ratio=$(( 86400000 / unit_ms ))
     local q=$(( burst / num ))
-    if [ "$q" -ge "$max_ratio" ]; then
+    if [ "$q" -ge 86400 ]; then
         echo "86400000"
         return 0
     fi
 
     local r=$(( burst % num ))
-    local refill_ms=$(( q * unit_ms + (r * unit_ms + num - 1) / num ))
+    local refill_ms=$(( q * 1000 + (r * 1000 + num - 1) / num ))
     if [ "$refill_ms" -lt 10000 ]; then
         refill_ms=10000
     elif [ "$refill_ms" -gt 86400000 ]; then
@@ -624,7 +608,7 @@ function calc_bucket_expire_ms() {
 function is_syn_limit_disabled() {
     local val=$1
     case "$val" in
-        0|0/s|0/sec|0/second|0/m|0/min|0/minute|0/h|0/hour|0/d|0/day|disable|disabled|none|off) return 0 ;;
+        0|0/s|0/sec|0/second|disable|disabled|none|off) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -720,8 +704,8 @@ function tcp_syn_limit_set() {
         return 0
     fi
 
-    # Validate every enabled parameter against safe numeric/rate grammar (rate count must be positive)
-    local rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
+    # Validate every enabled parameter against safe numeric/rate grammar (rate count must be positive, second granularity only)
+    local rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
     local num_pattern="^[0-9]+$"
     local nft_src_rate=""
     local nft_dst_rate=""

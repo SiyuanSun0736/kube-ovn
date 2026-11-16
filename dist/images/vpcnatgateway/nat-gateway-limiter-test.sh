@@ -28,18 +28,13 @@ assert_rate "9/s" "9/second"
 assert_rate "500/s" "500/second"
 assert_rate "500/sec" "500/second"
 assert_rate "500/second" "500/second"
-assert_rate "100/m" "100/minute"
-assert_rate "100/min" "100/minute"
-assert_rate "100/minute" "100/minute"
-assert_rate "200/h" "200/hour"
-assert_rate "200/hour" "200/hour"
-assert_rate "50/d" "50/day"
-assert_rate "50/day" "50/day"
 
-if to_nft_rate "500/invalid" 2>/dev/null; then
-    echo "FAIL to_nft_rate accepted invalid unit" >&2
-    exit 1
-fi
+for invalid_unit in "100/m" "100/min" "100/minute" "200/h" "200/hour" "50/d" "50/day" "500/invalid"; do
+    if to_nft_rate "$invalid_unit" 2>/dev/null; then
+        echo "FAIL to_nft_rate accepted non-second unit '$invalid_unit'" >&2
+        exit 1
+    fi
+done
 
 # 2. Test is_stateless_active mode handling
 if ! is_stateless_active "stateless"; then
@@ -82,12 +77,10 @@ assert_expire() {
 
 assert_expire "1000/s" "2000" "10000"
 assert_expire "20000/s" "40000" "10000"
-assert_expire "1/minute" "1" "60000"
-assert_expire "1/m" "5" "300000"
-assert_expire "2/hour" "1" "1800000"
+assert_expire "10/s" "500" "50000"
+assert_expire "1/s" "100" "100000"
 # Excessively large duration should be capped at 86400000ms (24h)
-assert_expire "1/day" "10" "86400000"
-assert_expire "1/hour" "40000" "86400000"
+assert_expire "1/s" "90000" "86400000"
 # Zero or invalid rate should safely fall back to baseline 10000ms without division by zero
 assert_expire "0/s" "10" "10000"
 assert_expire "invalid" "10" "10000"
@@ -97,33 +90,37 @@ assert_expire "1000/s" "invalid" "10000"
 assert_expire "1000/s" "" "10000"
 
 # 4. Test rate pattern validation
-rate_pattern="^[1-9][0-9]*/(s|sec|second|m|min|minute|h|hour|d|day)$"
+rate_pattern="^[1-9][0-9]*/(s|sec|second)$"
 if [[ "0/s" =~ $rate_pattern ]]; then
     echo "FAIL: rate_pattern must reject 0/s" >&2
+    exit 1
+fi
+if [[ "100/m" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must reject non-second 100/m" >&2
     exit 1
 fi
 if ! [[ "1/s" =~ $rate_pattern ]]; then
     echo "FAIL: rate_pattern must accept 1/s" >&2
     exit 1
 fi
-if ! [[ "9/s" =~ $rate_pattern ]]; then
-    echo "FAIL: rate_pattern must accept 9/s" >&2
+if ! [[ "9/sec" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 9/sec" >&2
     exit 1
 fi
-if ! [[ "100/s" =~ $rate_pattern ]]; then
-    echo "FAIL: rate_pattern must accept 100/s" >&2
+if ! [[ "100/second" =~ $rate_pattern ]]; then
+    echo "FAIL: rate_pattern must accept 100/second" >&2
     exit 1
 fi
 
 # 5. Test is_syn_limit_disabled
-for disabled_val in "0" "0/s" "disable" "disabled" "none" "off"; do
+for disabled_val in "0" "0/s" "0/sec" "0/second" "disable" "disabled" "none" "off"; do
     if ! is_syn_limit_disabled "$disabled_val"; then
         echo "FAIL: is_syn_limit_disabled must return 0 for '$disabled_val'" >&2
         exit 1
     fi
 done
 
-for enabled_val in "100/s" "1000/s" "1/minute" "enable" "0/invalid" "0/foo"; do
+for enabled_val in "100/s" "1000/s" "500/sec" "100/second" "enable" "0/invalid" "0/foo"; do
     if is_syn_limit_disabled "$enabled_val"; then
         echo "FAIL: is_syn_limit_disabled must return 1 for '$enabled_val'" >&2
         exit 1
