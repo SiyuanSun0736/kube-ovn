@@ -212,4 +212,15 @@ if grep -q "add set ip kube-ovn syn_dst_meter" "$mock_log"; then
     exit 1
 fi
 
+# 7. Test NFT_TABLE environment variable override preservation
+custom_table_output=$(NFT_TABLE="custom-table" bash -c '
+    script="'"$script"'"
+    eval "$(sed "/^opt=\$1$/,\$d" "$script")"
+    echo "$NFT_TABLE"
+')
+if [ "$custom_table_output" != "custom-table" ]; then
+    echo "FAIL: custom NFT_TABLE environment variable was overwritten: got '$custom_table_output', want 'custom-table'" >&2
+    exit 1
+fi
+
 echo "PASS: nat-gateway connlimit & stateless detection tests passed"

@@ -1283,7 +1283,6 @@ function del_dnat() {
 #   Shell variables: UPPER_CASE
 #   nft object names: lower_case (Linux/nftables convention, case-sensitive)
 
-NFT_TABLE="kube-ovn"
 NFT_SERVICES_MAP="service-ips"
 # WARNING: this base chain is owned exclusively by the share-dnat feature. add_nft_dnat_map
 # flushes it on every add/update and re-adds its single vmap dispatch rule, so any other rule
