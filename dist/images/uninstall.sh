@@ -103,6 +103,8 @@ ip6tables -t mangle -X OVN-OUTPUT
 ip6tables -t mangle -F OVN-POSTROUTING
 ip6tables -t mangle -X OVN-POSTROUTING
 
+nft delete table inet kube_ovn_pf
+
 sleep 1
 
 ipset destroy ovn60subnets-nat
