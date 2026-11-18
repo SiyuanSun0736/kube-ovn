@@ -352,6 +352,7 @@ const (
 	OvnMasquerade              = "OVN-MASQUERADE"
 	OvnNatOutGoingPolicy       = "OVN-NAT-POLICY"
 	OvnNatOutGoingPolicySubnet = "OVN-NAT-PSUBNET-"
+	OvnPortForwardConnLimit    = "OVN-PF-CONNLIMIT"
 
 	TProxyListenPort = 8102
 	TProxyRouteTable = 10001
@@ -529,7 +530,11 @@ const (
 	//   2. BgpAnnotation=true (ovn.kubernetes.io/bgp: "true"): implies Default Mode (ECMP).
 	//      (bgp=cluster is the equivalent for Pod/Subnet paths; LB VIP path uses "true".)
 	// Takes priority over BgpVipAnnotation when both are present.
-	MetalLBAllowSharedIPAnnotation = "metallb.universe.tf/allow-shared-ip"
+	MetalLBAllowSharedIPAnnotation   = "metallb.universe.tf/allow-shared-ip"
+	MetalLBLoadBalancerIPsAnnotation = "metallb.universe.tf/loadBalancerIPs"
+
+	PortForwardConnLimitAnnotation = "ovn.kubernetes.io/port-forward-connlimit"
+	TCPConnLimitAnnotation         = "ovn.kubernetes.io/tcp-connlimit"
 )
 
 // Readonly kinds of Kubernetes objects
