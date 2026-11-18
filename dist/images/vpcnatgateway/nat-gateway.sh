@@ -90,6 +90,10 @@ function show_help() {
     echo "  nft-lanvip-sync          - Reconcile lanIP-as-Service-VIP identities to exactly the given complete set (empty wipes them)"
     echo "  snat-add                 - Add SNAT rule"
     echo "  snat-del                 - Delete SNAT rule"
+    echo "  stateless-init           - Initialize stateless IPv4 forwarding and TCP MSS clamping"
+    echo "  stateless-fip-add/del    - Add/delete a bidirectional IPv4 FIP mapping"
+    echo "  stateless-dnat-add/del   - Add/delete a bidirectional TCP/UDP port mapping"
+    echo "  stateless-snat-add/del   - Add/delete a bidirectional host-only SNAT mapping"
     echo "  qos-add                  - Add QoS rule"
     echo "  qos-del                  - Delete QoS rule"
     echo "  eip-ingress-qos-add      - Add EIP ingress QoS"
@@ -2545,9 +2549,151 @@ function eip_egress_qos_del() {
 }
 
 
+# Stateless rules own a table per public identity. Both directions are replaced
+# in one nft transaction and deleted together, even if the old backend is lost.
+# Conntracked hairpin continues through the existing iptables NAT chains.
+function stateless_ipv4() {
+    local value=$1 octet
+    [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local octets
+    IFS=. read -r -a octets <<< "$value"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" == 0 || "$octet" != 0* ]] && ((10#$octet <= 255)) || return 1
+    done
+}
+
+function stateless_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+function stateless_init() {
+    # Unlike HA this mode imposes no external CNI or member requirements.
+    if ! nft list table ip kube_ovn_stateless_nat >/dev/null 2>&1; then
+        nft add table ip kube_ovn_stateless_nat || return 1
+    fi
+    if ! nft list chain ip kube_ovn_stateless_nat forward >/dev/null 2>&1; then
+        nft 'add chain ip kube_ovn_stateless_nat forward { type filter hook forward priority mangle; policy accept; }' || return 1
+    fi
+    nft -f - <<'NFT'
+flush chain ip kube_ovn_stateless_nat forward
+add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+NFT
+}
+
+function stateless_mapping_add() {
+    check_inited
+    local kind=$1 rule=$2 eip internal_ip external_port protocol internal_port extra
+    local incoming outgoing reverse table
+    if [[ "$kind" == dnat ]]; then
+        IFS=, read -r eip external_port protocol internal_ip internal_port extra <<< "$rule"
+        if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$external_port" || ! stateless_port "$internal_port"; then
+            echo "Invalid stateless DNAT ports/protocol: $rule" >&2
+            return 1
+        fi
+        external_port=$((10#$external_port))
+        internal_port=$((10#$internal_port))
+    else
+        IFS=, read -r eip internal_ip extra <<< "$rule"
+        if [[ "$kind" == snat ]]; then internal_ip=${internal_ip%/32}; fi
+    fi
+    if [[ -n "$extra" ]] || ! stateless_ipv4 "$eip" || ! stateless_ipv4 "$internal_ip"; then
+        echo "Invalid stateless $kind IPv4 mapping: $rule (SNAT requires a host or /32)" >&2
+        return 1
+    fi
+    table="ko_sl_${kind}_${eip//./_}"
+    incoming="ip daddr $eip"
+    outgoing="ip saddr $internal_ip"
+    reverse="ip saddr set $eip"
+    if [[ "$kind" == dnat ]]; then
+        table="${table}_${protocol}_${external_port}"
+        incoming="$incoming $protocol dport $external_port notrack ip daddr set $internal_ip $protocol dport set $internal_port"
+        outgoing="$outgoing $protocol sport $internal_port"
+        reverse="$reverse $protocol sport set $external_port"
+        # These helpers may exit on an idempotent replay: isolate that exit so
+        # a retry still completes the nft half after an earlier partial failure.
+        (add_dnat "$rule") || return 1
+    else
+        incoming="$incoming notrack ip daddr set $internal_ip"
+        if [[ "$kind" == snat ]]; then
+            table="${table}_${internal_ip//./_}"
+        else
+            (add_floating_ip "$rule") || return 1
+        fi
+    fi
+    if ! nft list table ip "$table" >/dev/null 2>&1; then
+        nft add table ip "$table" || return 1
+    fi
+    if ! nft list chain ip "$table" prerouting >/dev/null 2>&1; then
+        nft "add chain ip $table prerouting { type filter hook prerouting priority -250; policy accept; }" || return 1
+    fi
+    if ! nft list chain ip "$table" postrouting >/dev/null 2>&1; then
+        nft "add chain ip $table postrouting { type filter hook postrouting priority 99; policy accept; }" || return 1
+    fi
+    # fib scopes notrack to packets actually routed externally. In particular,
+    # gateway LAN IP, other local VIPs and hairpin replies remain tracked.
+    nft -f - <<NFT
+flush table ip $table
+add rule ip $table prerouting iifname "$EXTERNAL_INTERFACE" $incoming
+add rule ip $table prerouting iifname "$VPC_INTERFACE" $outgoing fib daddr oifname "$EXTERNAL_INTERFACE" notrack
+add rule ip $table postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked $outgoing $reverse
+NFT
+}
+
+function stateless_mapping_del() {
+    local kind=$1 rule=$2 eip port protocol internal_ip extra table
+    if [[ "$kind" == dnat ]]; then
+        IFS=, read -r eip port protocol extra <<< "$rule"
+        if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$port"; then
+            return 0
+        fi
+        port=$((10#$port))
+        table="ko_sl_dnat_${eip//./_}_${protocol}_${port}"
+    elif [[ "$kind" == snat ]]; then
+        IFS=, read -r eip internal_ip extra <<< "$rule"
+        internal_ip=${internal_ip%/32}
+        if ! stateless_ipv4 "$internal_ip"; then
+            return 0
+        fi
+        table="ko_sl_snat_${eip//./_}_${internal_ip//./_}"
+    else
+        eip=$rule
+        extra=""
+        table="ko_sl_fip_${eip//./_}"
+    fi
+    if ! stateless_ipv4 "$eip" || [[ -n "$extra" ]]; then
+        return 0
+    fi
+    # First establish nft availability; an inspection failure must not silently
+    # turn a failed deletion into success. Listing all tables also handles ENOENT.
+    local tables
+    tables=$(nft list tables) || return 1
+    if grep -Fxq "table ip $table" <<< "$tables"; then
+        nft delete table ip "$table" || return 1
+    fi
+    case "$kind" in
+        fip) (del_floating_ip "$eip") || return 1 ;;
+        dnat) (del_dnat "$rule") || return 1 ;;
+    esac
+    return 0
+}
+
+function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mapping_add fip "$rule" || return 1; done; }
+function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
+function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
+function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
+function stateless_snat_add() { local rule; for rule in "$@"; do stateless_mapping_add snat "$rule" || return 1; done; }
+function stateless_snat_del() { local rule; for rule in "$@"; do stateless_mapping_del snat "$rule" || return 1; done; }
+
 opt=$1
 shift
 case $opt in
+    stateless-init) stateless_init "$@" ;;
+    stateless-fip-add) stateless_fip_add "$@" ;;
+    stateless-fip-del) stateless_fip_del "$@" ;;
+    stateless-dnat-add) stateless_dnat_add "$@" ;;
+    stateless-dnat-del) stateless_dnat_del "$@" ;;
+    stateless-snat-add) stateless_snat_add "$@" ;;
+    stateless-snat-del) stateless_snat_del "$@" ;;
     init)
         # get user interfaces if provided from input
         # Use "$*" so manual invocations like `init net1, net2` (with whitespace

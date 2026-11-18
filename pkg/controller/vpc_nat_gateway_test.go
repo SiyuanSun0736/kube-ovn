@@ -678,10 +678,11 @@ func TestHairpinSNATModeDefaultsToOn(t *testing.T) {
 // back.
 func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		enabled  bool
-		wantOps  [][]string
-		wantStat string
+		name          string
+		dataplaneMode string
+		enabled       bool
+		wantOps       [][]string
+		wantStat      string
 	}{
 		{
 			name: "default gateway records the state it programmed",
@@ -704,6 +705,18 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			},
 			wantStat: hairpinSNATEnable,
 		},
+		{
+			name:          "stateless init precedes readiness and disables connlimit",
+			dataplaneMode: util.NatDataplaneModeStatelessNft,
+			wantOps: [][]string{
+				{natGwInit},
+				{"stateless-init"},
+				{natGwHairpinSNATSet, hairpinSNATDisable},
+				{natGwTCPConnLimitSet, "0", util.NatDataplaneModeStatelessNft},
+				{natGwTCPSynLimitSet, "0", "0", "0", "0"},
+			},
+			wantStat: hairpinSNATDisable,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			old := vpcNatEnabled
@@ -711,6 +724,7 @@ func TestHandleInitVpcNatGwAppliesHairpinSNAT(t *testing.T) {
 			t.Cleanup(func() { vpcNatEnabled = old })
 
 			gw := fakeGw("gw")
+			gw.Spec.DataplaneMode = tt.dataplaneMode
 			gw.Spec.EnableLanIPAsHairpinSNAT = ptr.To(tt.enabled)
 			pod := fakeNatGwPod("gw", false)
 			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{

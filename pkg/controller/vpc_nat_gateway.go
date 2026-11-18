@@ -364,7 +364,11 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 }
 
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
-	return strings.TrimSpace(gw.Spec.DataplaneMode)
+	mode, err := util.NatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("resolve dataplane mode for gateway %s: %v", gw.Name, err)
+	}
+	return mode
 }
 
 func isStatelessMode(mode string) bool {
@@ -494,6 +498,22 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		return nil
 	}
 	if err = c.rejectStaleVpcNatGwQoSGeneration(gw); err != nil {
+		return err
+	}
+
+	mode, err := util.NatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("failed to validate dataplane mode for gateway %s: %v", key, err)
+		return err
+	}
+	if gw.Status.DataplaneMode != "" && gw.Status.DataplaneMode != mode {
+		err = fmt.Errorf("gateway %s: dataplane mode is immutable (%q -> %q); delete and recreate the gateway to switch mode", key, gw.Status.DataplaneMode, mode)
+		klog.Error(err)
+		return err
+	}
+	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
+		err = fmt.Errorf("gateway %s: stateless dataplane mode does not support tcpConnLimit (must be 0 or unset)", key)
+		klog.Error(err)
 		return err
 	}
 
@@ -764,6 +784,18 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		// The init script may fail on first run but succeed on retry after chains are established
 		klog.Warningf("vpc nat gateway %s init attempt failed (will retry): %v", key, err)
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
+	}
+
+	dataplaneMode, err := util.NatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("initialize gateway %s dataplane mode: %v", key, err)
+		return err
+	}
+	if dataplaneMode == util.NatDataplaneModeStatelessNft {
+		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, "stateless-init", nil); err != nil {
+			klog.Errorf("initialize stateless gateway %s: %v", key, err)
+			return err
+		}
 	}
 
 	mode := hairpinSNATMode(gw)
