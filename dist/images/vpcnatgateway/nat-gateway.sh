@@ -2609,13 +2609,10 @@ function stateless_mapping_add() {
         incoming="$incoming $protocol dport $external_port notrack ip daddr set $internal_ip $protocol dport set $internal_port"
         outgoing="$outgoing $protocol sport $internal_port"
         reverse="$reverse $protocol sport set $external_port"
-        (add_dnat "$rule") || return 1
     else
         incoming="$incoming notrack ip daddr set $internal_ip"
         if [[ "$kind" == snat ]]; then
             table="${table}_${internal_ip//./_}"
-        else
-            (add_floating_ip "$rule") || return 1
         fi
     fi
 
@@ -2668,10 +2665,6 @@ function stateless_mapping_del() {
     if grep -Fxq "table ip $table" <<< "$tables"; then
         nft delete table ip "$table" || return 1
     fi
-    case "$kind" in
-        fip) (del_floating_ip "$eip") || return 1 ;;
-        dnat) (del_dnat "$rule") || return 1 ;;
-    esac
     return 0
 }
 
