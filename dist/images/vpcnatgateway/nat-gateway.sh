@@ -2702,22 +2702,20 @@ function stateless_mapping_add() {
         fi
     fi
 
-    # 3. 单事务原子提交（Atomic Transaction）：通过单个 nft -f 命令一次性下发双向规则，杜绝中间半状态
+    # 3. 单事务原子提交（Atomic Transaction）：通过单个 nft -f 命令一次性下发双向规则，杜绝中间半状态。
+    # 规则说明：
+    # - prerouting 链 (priority -250)：早于内核 conntrack (priority -200)，使 notrack 与目的改写生效；
+    # - postrouting 链 (priority 99)：早于有状态源 NAT (priority 100)，优先处理无状态源改写；
+    # - 规则 1 [反向回包/入向请求改写]：来自外网网卡，匹配 EIP（及端口），打上 notrack 并改写目的 IP/端口为私网目标；
+    # - 规则 2 [正向出向请求匹配]：来自私网网卡，匹配私网源 IP，FIB 路由验证出接口确实是外网卡后打 notrack；
+    # - 规则 3 [正向出向请求改写]：在 postrouting 链对 untracked 报文将源 IP（及源端口）改写为公网 EIP。
     if ! nft -f - <<NFT
 add table ip $table
 flush table ip $table
-# prerouting 链（priority -250）：必须在内核 conntrack（priority -200）之前执行，notrack 与目的改写才能生效
 add chain ip $table prerouting { type filter hook prerouting priority -250; policy accept; }
-# postrouting 链（priority 99）：在有状态源 NAT（priority 100）之前执行，优先处理无状态源地址改写
 add chain ip $table postrouting { type filter hook postrouting priority 99; policy accept; }
-
-# [反向回包/入向请求改写]：来自外网网卡的流量，匹配 EIP（及外部端口），打上 notrack 并改写目的 IP（及端口）为私网目标
 add rule ip $table prerouting iifname "$EXTERNAL_INTERFACE" $incoming
-
-# [正向出向请求匹配]：来自私网网卡的流量，匹配私网源 IP，通过 FIB 路由表确认出接口确实是外网卡后标记 notrack
 add rule ip $table prerouting iifname "$VPC_INTERFACE" $outgoing fib daddr oifname "$EXTERNAL_INTERFACE" notrack
-
-# [正向出向请求改写]：在 postrouting 链针对处于 untracked 状态的出向报文，将源 IP 改写为 EIP（DNAT 还会改写源端口）
 add rule ip $table postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked $outgoing $reverse
 NFT
     then
