@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,110 +11,102 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+func TestParseNftChainRules(t *testing.T) {
+	rawOutput := `table inet kube_ovn_pf {
+	chain prerouting {
+		type filter hook prerouting priority -150; policy accept;
+		iifname != "eth0" return comment "ovn-pf-gate" # handle 2
+		ip daddr 1.2.3.4 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 drop comment "ovn-pf-1.2.3.4-80" # handle 3
+		ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 200 drop comment 'ovn-pf-2001:db8::1-443' # handle 4
+		tcp dport 22 accept # handle 5
+	}
+}`
+
+	entries := parseNftChainRules(rawOutput)
+	require.Len(t, entries, 4)
+
+	// Gate rule
+	require.Equal(t, "2", entries[0].handle)
+	require.Equal(t, "ovn-pf-gate", entries[0].comment)
+	require.Equal(t, 0, entries[0].limit)
+
+	// IPv4 rule
+	require.Equal(t, "3", entries[1].handle)
+	require.Equal(t, "ovn-pf-1.2.3.4-80", entries[1].comment)
+	require.Equal(t, 100, entries[1].limit)
+
+	// IPv6 rule with single quote
+	require.Equal(t, "4", entries[2].handle)
+	require.Equal(t, "ovn-pf-2001:db8::1-443", entries[2].comment)
+	require.Equal(t, 200, entries[2].limit)
+
+	// Rule without comment
+	require.Equal(t, "5", entries[3].handle)
+	require.Equal(t, "", entries[3].comment)
+	require.Equal(t, 0, entries[3].limit)
+
+	// Find by comment
+	matched := findNftRulesByComment(entries, "ovn-pf-1.2.3.4-80")
+	require.Len(t, matched, 1)
+	require.Equal(t, "3", matched[0].handle)
+	require.Equal(t, 100, matched[0].limit)
+
+	matchedGate := findNftRulesByComment(entries, "ovn-pf-gate")
+	require.Len(t, matchedGate, 1)
+	require.Equal(t, "2", matchedGate[0].handle)
+
+	matchedNone := findNftRulesByComment(entries, "non-existent")
+	require.Empty(t, matchedNone)
+}
+
+func TestBuildNftGateRule(t *testing.T) {
+	ruleWithNic := buildNftGateRule("eth0")
+	require.Equal(t, `add rule inet kube_ovn_pf prerouting iifname != "eth0" return comment "ovn-pf-gate"`, ruleWithNic)
+
+	ruleWithoutNic := buildNftGateRule("")
+	require.Equal(t, `add rule inet kube_ovn_pf prerouting iifname "lo" return comment "ovn-pf-gate"`, ruleWithoutNic)
+}
+
 func TestBuildNftAddRuleCmd(t *testing.T) {
-	t.Run("ipv4 rule command", func(t *testing.T) {
-		r := portForwardConnLimitRule{
-			ip:        "1.2.3.4",
-			port:      80,
-			connLimit: 1000,
-		}
-		expected := `add rule inet kube_ovn_pf prerouting ip daddr 1.2.3.4 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 1000 drop comment "ovn-pf-1.2.3.4-80"`
-		require.Equal(t, expected, buildNftAddRuleCmd(r))
-	})
+	ruleV4 := portForwardConnLimitRule{
+		ip:        "1.1.1.1",
+		port:      80,
+		connLimit: 100,
+	}
+	expectedV4 := `add rule inet kube_ovn_pf prerouting ip daddr 1.1.1.1 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 drop comment "ovn-pf-1.1.1.1-80"`
+	require.Equal(t, expectedV4, buildNftAddRuleCmd(ruleV4))
 
-	t.Run("ipv6 rule command", func(t *testing.T) {
-		r := portForwardConnLimitRule{
-			ip:        "fd00::100",
-			port:      443,
-			connLimit: 5000,
-		}
-		expected := `add rule inet kube_ovn_pf prerouting ip6 daddr fd00::100 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 5000 drop comment "ovn-pf-fd00::100-443"`
-		require.Equal(t, expected, buildNftAddRuleCmd(r))
-	})
+	ruleV6 := portForwardConnLimitRule{
+		ip:        "2001:db8::1",
+		port:      443,
+		connLimit: 500,
+	}
+	expectedV6 := `add rule inet kube_ovn_pf prerouting ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 500 drop comment "ovn-pf-2001:db8::1-443"`
+	require.Equal(t, expectedV6, buildNftAddRuleCmd(ruleV6))
 }
 
-func TestParseNftRuleHandles(t *testing.T) {
-	output := `table inet kube_ovn_pf {
-	chain prerouting { # handle 1
-		type filter hook prerouting priority -150; policy accept;
-		ip daddr 1.2.3.4 tcp dport 80 tcp flags syn / fin,syn,rst,ack ct count over 100 drop comment "ovn-pf-1.2.3.4-80" # handle 2
-		ip daddr 1.2.3.4 tcp dport 8080 tcp flags syn / fin,syn,rst,ack ct count over 500 drop comment "ovn-pf-1.2.3.4-8080" # handle 3
-		ip6 daddr fd00::100 tcp dport 443 tcp flags syn / fin,syn,rst,ack ct count over 200 drop comment "ovn-pf-fd00::100-443" # handle 4
-	}
-}`
-
-	t.Run("match specific handle", func(t *testing.T) {
-		handles := parseNftRuleHandles(output, "ovn-pf-1.2.3.4-80")
-		require.Equal(t, []string{"2"}, handles)
-
-		handles = parseNftRuleHandles(output, "ovn-pf-1.2.3.4-8080")
-		require.Equal(t, []string{"3"}, handles)
-
-		handles = parseNftRuleHandles(output, "ovn-pf-fd00::100-443")
-		require.Equal(t, []string{"4"}, handles)
-	})
-
-	t.Run("no match", func(t *testing.T) {
-		handles := parseNftRuleHandles(output, "ovn-pf-1.2.3.4-9090")
-		require.Empty(t, handles)
-	})
-}
-
-func TestParseNftRuleLimit(t *testing.T) {
-	output := `table inet kube_ovn_pf {
-	chain prerouting { # handle 1
-		type filter hook prerouting priority -150; policy accept;
-		ip daddr 1.2.3.4 tcp dport 80 tcp flags syn / fin,syn,rst,ack ct count over 100 drop comment "ovn-pf-1.2.3.4-80" # handle 2
-		ip6 daddr fd00::100 tcp dport 443 tcp flags syn / fin,syn,rst,ack ct count over 5000 drop comment "ovn-pf-fd00::100-443" # handle 3
-	}
-}`
-
-	t.Run("found limit", func(t *testing.T) {
-		limit, found := parseNftRuleLimit(output, "ovn-pf-1.2.3.4-80")
-		require.True(t, found)
-		require.Equal(t, 100, limit)
-
-		limit, found = parseNftRuleLimit(output, "ovn-pf-fd00::100-443")
-		require.True(t, found)
-		require.Equal(t, 5000, limit)
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		limit, found := parseNftRuleLimit(output, "ovn-pf-nonexistent-80")
-		require.False(t, found)
-		require.Equal(t, 0, limit)
-	})
+func TestIsNftTableOrChainNotExist(t *testing.T) {
+	require.False(t, isNftTableOrChainNotExist(nil))
+	require.False(t, isNftTableOrChainNotExist(errors.New("permission denied")))
+	require.True(t, isNftTableOrChainNotExist(errors.New("Error: No such file or directory")))
+	require.True(t, isNftTableOrChainNotExist(errors.New("table does not exist")))
 }
 
 func TestParsePortForwardConnLimitRules(t *testing.T) {
 	c := &Controller{}
 
-	t.Run("nil service", func(t *testing.T) {
-		rules := c.parsePortForwardConnLimitRules(nil)
-		require.Nil(t, rules)
-	})
+	t.Run("nil service or non-loadbalancer", func(t *testing.T) {
+		require.Nil(t, c.parsePortForwardConnLimitRules(nil))
 
-	t.Run("non-loadbalancer service", func(t *testing.T) {
 		svc := &corev1.Service{
 			Spec: corev1.ServiceSpec{
 				Type: corev1.ServiceTypeClusterIP,
 			},
 		}
-		rules := c.parsePortForwardConnLimitRules(svc)
-		require.Nil(t, rules)
+		require.Nil(t, c.parsePortForwardConnLimitRules(svc))
 	})
 
-	t.Run("missing connlimit annotation", func(t *testing.T) {
-		svc := &corev1.Service{
-			Spec: corev1.ServiceSpec{
-				Type: corev1.ServiceTypeLoadBalancer,
-			},
-		}
-		rules := c.parsePortForwardConnLimitRules(svc)
-		require.Nil(t, rules)
-	})
-
-	t.Run("invalid or zero connlimit annotation", func(t *testing.T) {
+	t.Run("invalid annotation", func(t *testing.T) {
 		svc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: map[string]string{

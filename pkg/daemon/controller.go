@@ -202,6 +202,8 @@ func NewController(config *Configuration,
 		util.LogFatalAndExit(nil, "failed to wait for caches to sync")
 	}
 
+	controller.gcPortForwardConnLimitRules()
+
 	if _, err = providerNetworkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.enqueueAddProviderNetwork,
 		UpdateFunc: controller.enqueueUpdateProviderNetwork,
