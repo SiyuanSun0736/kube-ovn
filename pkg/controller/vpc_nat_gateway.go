@@ -363,7 +363,8 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
 }
 
-// getNatGwDataplaneMode 解析指定网关配置的 DataplaneMode，并在发现不合法模式时记录错误日志。
+// getNatGwDataplaneMode 获取并校验指定 VPC NAT 网关的 DataplaneMode 配置。
+// 若发现配置了不支持的模式，将记录包含完整上下文的错误日志，并返回规范化后的模式字符串。
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	mode, err := util.NatGatewayDataplaneMode(gw)
 	if err != nil {
@@ -372,7 +373,7 @@ func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	return mode
 }
 
-// isStatelessMode 检查给定的模式字符串是否匹配 stateless-nft 无状态数据面模式。
+// isStatelessMode 判定指定的模式字符串是否为 "stateless-nft" 独立无状态数据面模式。
 func isStatelessMode(mode string) bool {
 	return mode == util.NatDataplaneModeStatelessNft
 }
@@ -508,11 +509,18 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		klog.Errorf("failed to validate dataplane mode for gateway %s: %v", key, err)
 		return err
 	}
+	// 校验数据面模式的不可变性约束：
+	// 网关数据面（有状态 vs 无状态）决定了底层网络驱动、内核 nftables 表结构与流表逻辑。
+	// 运行期间严禁热切换数据面模式；若需切换必须删除并重新创建网关实例，防止产生中间脏状态。
 	if gw.Status.DataplaneMode != "" && gw.Status.DataplaneMode != mode {
 		err = fmt.Errorf("gateway %s: dataplane mode is immutable (%q -> %q); delete and recreate the gateway to switch mode", key, gw.Status.DataplaneMode, mode)
 		klog.Error(err)
 		return err
 	}
+	// 校验 TCP 连接数限制互斥性约束：
+	// tcpConnLimit 功能底层依赖 Linux conntrack 的 xt_connlimit / hashlimit 模块。
+	// 无状态模式（stateless-nft）已通过 notrack 彻底绕过了 conntrack 状态跟踪，
+	// 因此二者在机制上互斥，无状态网关禁止配置大于 0 的 tcpConnLimit。
 	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
 		err = fmt.Errorf("gateway %s: stateless dataplane mode does not support tcpConnLimit (must be 0 or unset)", key)
 		klog.Error(err)
@@ -793,6 +801,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		klog.Errorf("initialize gateway %s dataplane mode: %v", key, err)
 		return err
 	}
+	// 若网关配置为无状态数据面模式，向网关 Pod 发送 stateless-init 命令，
+	// 在容器内预先建立全局基础 nftables 表及链，并下发针对 untracked 数据包的 TCP MSS 自动钳制策略
 	if dataplaneMode == util.NatDataplaneModeStatelessNft {
 		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, "stateless-init", nil); err != nil {
 			klog.Errorf("initialize stateless gateway %s: %v", key, err)

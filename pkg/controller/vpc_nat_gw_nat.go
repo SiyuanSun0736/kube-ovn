@@ -2077,7 +2077,16 @@ func (c *Controller) redoSnat(key, redo string, eipReady bool) error {
 	return nil
 }
 
-// createFipInPod 向网关 Pod 下发 FIP 创建指令：在 stateless-nft 模式下路由至 stateless-fip-add，否则调用原生 natGwSubnetFipAdd。
+// createFipInPod 向指定的 VPC NAT 网关 Pod 下发创建 1:1 双向 Floating IP 规则指令。
+//
+// 核心逻辑与多模式调度：
+// 1. 获取网关 Pod 实例，确保网关数据面容器就绪；
+// 2. 将 (v4ip, internalIP) 组装为标准的逗号分隔规则格式（如 "192.0.2.1,10.0.0.2"）；
+// 3. 调用 c.natGatewayOperation(dp, natGwSubnetFipAdd) 动态仲裁：
+//   - 若网关处于 stateless-nft 模式，指令转换为 "stateless-fip-add"，在 Pod 内下发无状态独立表；
+//   - 若为常规有状态模式，保持原生 "natGwSubnetFipAdd"，在 Pod 内下发 iptables 规则；
+//
+// 4. 通过 c.execNatGwRulesInPods 在目标网关 Pod 内执行。
 func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2328,7 +2337,15 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 	return firstErr
 }
 
-// deleteFipInPod 向网关 Pod 下发 FIP 删除指令：在 stateless-nft 模式下路由至 stateless-fip-del，否则调用原生 natGwSubnetFipDel。
+// deleteFipInPod 向指定的 VPC NAT 网关 Pod 下发删除 1:1 Floating IP 规则指令。
+//
+// 核心逻辑与多模式调度：
+// 1. 检查网关数据面容器存活状态，若 Pod 已被整体销毁则视为空操作（规则随容器可写层直接释放）；
+// 2. 调用 c.natGatewayOperation(dp, natGwSubnetFipDel) 进行模式路由：
+//   - 无状态模式路由至 "stateless-fip-del"，在 Pod 内原子删除对应的专属 nft 表；
+//   - 有状态模式路由至 "natGwSubnetFipDel"，在 Pod 内移除 iptables 规则；
+//
+// 3. 仅需传入单公网地址 v4ip 作为删除标识。
 func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2363,7 +2380,13 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	return nil
 }
 
-// createDnatInPod 向网关 Pod 下发 DNAT 创建指令：在 stateless-nft 模式下对端口做十进制规整并路由至 stateless-dnat-add，否则调用原生 natGwDnatAdd。
+// createDnatInPod 向指定的 VPC NAT 网关 Pod 下发创建端口转发（DNAT）规则指令。
+//
+// 核心逻辑与技术细节：
+//  1. 调用 c.natGatewayOperation 动态解析指令：若为 stateless-nft 则路由至 "stateless-dnat-add"；
+//  2. 端口规整（Port Normalization）：在无状态模式下，通过 strconv.Atoi 将 externalPort 与 internalPort
+//     强制解析并重新转为不带任何前导零的标准 10 进制整数字符串，防止 Shell 脚本在 nftables 表名拼接与端口匹配时出现歧义；
+//  3. 将 (v4ip, externalPort, protocol, internalIP, internalPort) 拼接为标准五元组规则下发执行。
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2394,7 +2417,12 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 	return nil
 }
 
-// deleteDnatInPod 向网关 Pod 下发 DNAT 删除指令：在 stateless-nft 模式下路由至 stateless-dnat-del，否则调用原生 natGwDnatDel。
+// deleteDnatInPod 向指定的 VPC NAT 网关 Pod 下发删除端口转发（DNAT）规则指令。
+//
+// 核心逻辑与技术细节：
+// 1. 数据面存活检查：若网关实例已不存在则安全跳过清理；
+// 2. 指令动态路由：stateless-nft 模式路由至 "stateless-dnat-del"，并同步对 externalPort 做整型规整；
+// 3. 将三元组标识符 (v4ip, externalPort, protocol) 传递给 Pod，定位并原子删除其专属 nftables 表。
 func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2436,7 +2464,16 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 	return nil
 }
 
-// createSnatInPod 向网关 Pod 下发 SNAT 创建指令：在 stateless-nft 模式下校验并转换为单主机 IP 路由至 stateless-snat-add，否则调用原生 natGwSnatAdd。
+// createSnatInPod 向指定的 VPC NAT 网关 Pod 下发创建源地址转换（SNAT）规则指令。
+//
+// 核心逻辑与技术细节：
+// 1. 调用 c.natGatewayOperation(dp, natGwSnatAdd) 动态判断模式：
+//   - 无状态模式（"stateless-snat-add"）：严格要求 internalCIDR 必须代表单一私网主机 IP（支持单 IP 或 /32），
+//     调用 util.StatelessNATIPv4Host 剔除掩码，规整为纯 IP 形式组装规则；
+//   - 有状态模式（"snat-add"）：支持多主机网段，探测 iptables 版本并在 >= 1.6.2 时追加 "--random-fully" 参数，
+//     降低高并发源端口分配碰撞概率；
+//
+// 2. 将最终规则下发至网关 Pod 对应的内核数据面生效。
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2476,7 +2513,14 @@ func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	return nil
 }
 
-// deleteSnatInPod 向网关 Pod 下发 SNAT 删除指令：在 stateless-nft 模式下校验并路由至 stateless-snat-del，否则调用原生 natGwSnatDel。
+// deleteSnatInPod 向指定的 VPC NAT 网关 Pod 下发删除源地址转换（SNAT）规则指令。
+//
+// 核心逻辑与技术细节：
+//  1. 数据面存活检查：若网关实例已不存在则安全跳过；
+//  2. 指令动态路由：stateless-nft 模式路由至 "stateless-snat-del"；
+//  3. 异常容错机制：在无状态模式下，若 internalCIDR 并非合法的单主机 IP，记录 Warning 日志并直接返回 nil，
+//     避免因规则格式无法识别而卡死工作队列的垃圾回收流程；
+//  4. 下发至网关 Pod，原子移除对应的 nftables 专属表或 iptables 规则。
 func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
