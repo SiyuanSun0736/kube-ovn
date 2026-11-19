@@ -2609,8 +2609,6 @@ function stateless_mapping_add() {
         incoming="$incoming $protocol dport $external_port notrack ip daddr set $internal_ip $protocol dport set $internal_port"
         outgoing="$outgoing $protocol sport $internal_port"
         reverse="$reverse $protocol sport set $external_port"
-        # These helpers may exit on an idempotent replay: isolate that exit so
-        # a retry still completes the nft half after an earlier partial failure.
         (add_dnat "$rule") || return 1
     else
         incoming="$incoming notrack ip daddr set $internal_ip"
@@ -2620,23 +2618,23 @@ function stateless_mapping_add() {
             (add_floating_ip "$rule") || return 1
         fi
     fi
-    if ! nft list table ip "$table" >/dev/null 2>&1; then
-        nft add table ip "$table" || return 1
-    fi
-    if ! nft list chain ip "$table" prerouting >/dev/null 2>&1; then
-        nft "add chain ip $table prerouting { type filter hook prerouting priority -250; policy accept; }" || return 1
-    fi
-    if ! nft list chain ip "$table" postrouting >/dev/null 2>&1; then
-        nft "add chain ip $table postrouting { type filter hook postrouting priority 99; policy accept; }" || return 1
-    fi
-    # fib scopes notrack to packets actually routed externally. In particular,
-    # gateway LAN IP, other local VIPs and hairpin replies remain tracked.
-    nft -f - <<NFT
-flush table ip $table
+
+    # Atomic application using a single nft transaction
+    if ! nft -f - <<NFT
+add table ip $table
+add chain ip $table prerouting { type filter hook prerouting priority -250; policy accept; }
+add chain ip $table postrouting { type filter hook postrouting priority 99; policy accept; }
+flush chain ip $table prerouting
+flush chain ip $table postrouting
 add rule ip $table prerouting iifname "$EXTERNAL_INTERFACE" $incoming
 add rule ip $table prerouting iifname "$VPC_INTERFACE" $outgoing fib daddr oifname "$EXTERNAL_INTERFACE" notrack
 add rule ip $table postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked $outgoing $reverse
 NFT
+    then
+        # Cleanup partial table on failure
+        nft delete table ip "$table" >/dev/null 2>&1
+        return 1
+    fi
 }
 
 function stateless_mapping_del() {
