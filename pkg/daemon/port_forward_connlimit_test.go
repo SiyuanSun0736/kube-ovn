@@ -16,8 +16,8 @@ func TestParseNftChainRules(t *testing.T) {
 	chain prerouting {
 		type filter hook prerouting priority -150; policy accept;
 		iifname != "eth0" return comment "ovn-pf-gate" # handle 2
-		ip daddr 1.2.3.4 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 drop comment "ovn-pf-1.2.3.4-80" # handle 3
-		ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 200 drop comment 'ovn-pf-2001:db8::1-443' # handle 4
+		ip daddr 1.2.3.4 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 counter drop comment "ovn-pf-1.2.3.4-80" # handle 3
+		ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 200 counter drop comment 'ovn-pf-2001:db8::1-443' # handle 4
 		tcp dport 22 accept # handle 5
 	}
 }`
@@ -29,6 +29,7 @@ func TestParseNftChainRules(t *testing.T) {
 	require.Equal(t, "2", entries[0].handle)
 	require.Equal(t, "ovn-pf-gate", entries[0].comment)
 	require.Equal(t, 0, entries[0].limit)
+	require.Contains(t, entries[0].raw, `iifname != "eth0"`)
 
 	// IPv4 rule
 	require.Equal(t, "3", entries[1].handle)
@@ -61,10 +62,10 @@ func TestParseNftChainRules(t *testing.T) {
 
 func TestBuildNftGateRule(t *testing.T) {
 	ruleWithNic := buildNftGateRule("eth0")
-	require.Equal(t, `add rule inet kube_ovn_pf prerouting iifname != "eth0" return comment "ovn-pf-gate"`, ruleWithNic)
+	require.Equal(t, `insert rule inet kube_ovn_pf prerouting iifname != "eth0" return comment "ovn-pf-gate"`, ruleWithNic)
 
 	ruleWithoutNic := buildNftGateRule("")
-	require.Equal(t, `add rule inet kube_ovn_pf prerouting iifname "lo" return comment "ovn-pf-gate"`, ruleWithoutNic)
+	require.Equal(t, `insert rule inet kube_ovn_pf prerouting iifname "lo" return comment "ovn-pf-gate"`, ruleWithoutNic)
 }
 
 func TestBuildNftAddRuleCmd(t *testing.T) {
@@ -73,7 +74,7 @@ func TestBuildNftAddRuleCmd(t *testing.T) {
 		port:      80,
 		connLimit: 100,
 	}
-	expectedV4 := `add rule inet kube_ovn_pf prerouting ip daddr 1.1.1.1 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 drop comment "ovn-pf-1.1.1.1-80"`
+	expectedV4 := `add rule inet kube_ovn_pf prerouting ip daddr 1.1.1.1 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 counter drop comment "ovn-pf-1.1.1.1-80"`
 	require.Equal(t, expectedV4, buildNftAddRuleCmd(ruleV4))
 
 	ruleV6 := portForwardConnLimitRule{
@@ -81,7 +82,7 @@ func TestBuildNftAddRuleCmd(t *testing.T) {
 		port:      443,
 		connLimit: 500,
 	}
-	expectedV6 := `add rule inet kube_ovn_pf prerouting ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 500 drop comment "ovn-pf-2001:db8::1-443"`
+	expectedV6 := `add rule inet kube_ovn_pf prerouting ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 500 counter drop comment "ovn-pf-2001:db8::1-443"`
 	require.Equal(t, expectedV6, buildNftAddRuleCmd(ruleV6))
 }
 
@@ -252,4 +253,22 @@ func TestPortForwardConnLimitRuleKey(t *testing.T) {
 		port: 80,
 	}
 	require.Equal(t, expected, r.key())
+}
+
+func TestExtractServicePublicIPs(t *testing.T) {
+	svc := &corev1.Service{
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{
+					{IP: "198.51.100.20"},
+					{IP: "198.51.100.5"},
+					{IP: "198.51.100.10"},
+					{IP: "invalid-ip"},
+					{IP: ""},
+				},
+			},
+		},
+	}
+	ips := extractServicePublicIPs(svc)
+	require.Equal(t, []string{"198.51.100.10", "198.51.100.20", "198.51.100.5"}, ips)
 }
