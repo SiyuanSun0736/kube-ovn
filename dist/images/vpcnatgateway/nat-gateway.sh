@@ -2552,6 +2552,9 @@ function eip_egress_qos_del() {
 # Stateless rules own a table per public identity. Both directions are replaced
 # in one nft transaction and deleted together, even if the old backend is lost.
 # Conntracked hairpin continues through the existing iptables NAT chains.
+
+# stateless_ipv4 validates whether the input string is a valid IPv4 dotted-decimal
+# address (0.0.0.0 to 255.255.255.255), explicitly rejecting leading zeros and out-of-range octets.
 function stateless_ipv4() {
     local value=$1 octet
     [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -2562,10 +2565,13 @@ function stateless_ipv4() {
     done
 }
 
+# stateless_port validates whether the input string is a valid numeric L4 port number (1-65535).
 function stateless_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
+# stateless_init initializes the base nftables table and forward chain for stateless NAT,
+# configuring TCP MSS clamping to the route MTU for untracked TCP SYN/RST packets.
 function stateless_init() {
     # Unlike HA this mode imposes no external CNI or member requirements.
     if ! nft list table ip kube_ovn_stateless_nat >/dev/null 2>&1; then
@@ -2580,6 +2586,9 @@ add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn |
 NFT
 }
 
+# stateless_mapping_add atomically configures bidirectional stateless NAT (FIP, DNAT, or SNAT)
+# inside a dedicated per-identity nftables table. It marks matched incoming and outgoing flows
+# with 'notrack' to bypass Linux conntrack entirely, while preserving hairpin NAT via iptables.
 function stateless_mapping_add() {
     check_inited
     local kind=$1 rule=$2 eip internal_ip external_port protocol internal_port extra
@@ -2638,6 +2647,9 @@ NFT
     fi
 }
 
+# stateless_mapping_del deletes the dedicated nftables table for a stateless NAT mapping
+# and cleans up the associated iptables hairpin rule. Invalid inputs are treated as no-ops
+# to ensure cleanup idempotency.
 function stateless_mapping_del() {
     local kind=$1 rule=$2 eip port protocol internal_ip extra table
     if [[ "$kind" == dnat ]]; then
@@ -2676,11 +2688,22 @@ function stateless_mapping_del() {
     return 0
 }
 
+# stateless_fip_add adds one or more bidirectional 1:1 stateless Floating IP mappings.
 function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mapping_add fip "$rule" || return 1; done; }
+
+# stateless_fip_del deletes one or more bidirectional 1:1 stateless Floating IP mappings.
 function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
+
+# stateless_dnat_add adds one or more bidirectional stateless port forwarding (DNAT) mappings.
 function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
+
+# stateless_dnat_del deletes one or more bidirectional stateless port forwarding (DNAT) mappings.
 function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
+
+# stateless_snat_add adds one or more bidirectional stateless host-only SNAT mappings.
 function stateless_snat_add() { local rule; for rule in "$@"; do stateless_mapping_add snat "$rule" || return 1; done; }
+
+# stateless_snat_del deletes one or more bidirectional stateless host-only SNAT mappings.
 function stateless_snat_del() { local rule; for rule in "$@"; do stateless_mapping_del snat "$rule" || return 1; done; }
 
 opt=$1

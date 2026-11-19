@@ -6,6 +6,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 export NAT_GW_ENV_FILE="$tmp_dir/env"
 eval "$(sed '/^opt=\$1$/,$d' "$script")"
 # Capture external operations; no privileged network changes in unit tests.
+# Mock nft binary to record invocations, simulate table listing, and inspect command batches.
 nft() {
     printf '%s\n' "$*" >> "$tmp_dir/calls"
     if [[ "$*" == 'list tables' ]]; then
@@ -13,6 +14,8 @@ nft() {
     fi
     if [[ "$*" == '-f -' ]]; then cat >> "$tmp_dir/batches"; fi
 }
+
+# Mock hairpin iptables functions to verify they are invoked alongside nftables transactions.
 add_floating_ip() { echo "fip $*" >> "$tmp_dir/hairpin"; }
 del_floating_ip() { echo "del-fip $*" >> "$tmp_dir/hairpin"; }
 add_dnat() { echo "dnat $*" >> "$tmp_dir/hairpin"; }

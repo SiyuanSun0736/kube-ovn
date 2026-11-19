@@ -10,8 +10,10 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-// natGatewayOperation never falls back to stateful NAT on a failed lookup: the
-// caller returns the error to the rate-limited work queue before publishing Ready.
+// natGatewayOperation translates generic NAT operations (e.g., natGwSubnetFipAdd)
+// into their stateless-nft equivalents when the gateway dataplaneMode is stateless-nft.
+// It never falls back to stateful NAT on a failed lookup: the caller returns the error
+// to the rate-limited work queue before publishing Ready.
 func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	gw, err := c.vpcNatGatewayLister.Get(dp)
 	if err != nil {
@@ -42,6 +44,8 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	}
 }
 
+// isStatelessNatGateway reports whether the specified VPC NAT gateway is configured
+// with the stateless-nft dataplane mode.
 func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	if name == "" {
 		return false, nil
@@ -61,6 +65,9 @@ type statelessMapping struct {
 	isShare                               bool
 }
 
+// validateStatelessMapping enforces mutual exclusivity and disambiguation rules
+// for stateless NAT mappings belonging to the same gateway. It prevents multiple rules
+// from claiming the same private host or colliding on public EIP assignments.
 func (c *Controller) validateStatelessMapping(eipName string, candidate statelessMapping) error {
 	eip, err := c.iptablesEipsLister.Get(eipName)
 	if err != nil {

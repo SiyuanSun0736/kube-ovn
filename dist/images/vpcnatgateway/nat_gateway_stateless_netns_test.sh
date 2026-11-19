@@ -8,6 +8,7 @@ if [[ $(readlink /proc/self/ns/net) == "$(readlink /proc/1/ns/net)" ]]; then
 fi
 script="$(cd "$(dirname "$0")" && pwd)/nat-gateway.sh"
 tmp=$(mktemp -d)
+# cleanup terminates background python servers and destroys test network namespaces.
 cleanup() {
     for ns in sl-gw sl-lan sl-wan; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null || true
@@ -30,6 +31,8 @@ ip -n sl-lan route add default via 10.0.0.1
 # WAN deliberately has no route to the private subnet: replies must use NAT.
 ip netns exec sl-gw sysctl -qw net.ipv4.ip_forward=1
 export NAT_GW_ENV_FILE="$tmp/env"
+
+# gw executes nat-gateway.sh inside the gateway network namespace.
 gw() { ip netns exec sl-gw bash "$script" "$@"; }
 gw init eth0,net1 > "$tmp/init.log" 2>&1
 gw hairpin-snat-set enable > /dev/null
@@ -47,11 +50,15 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
 PY
 for ns in sl-lan sl-wan; do ip netns exec "$ns" python3 "$tmp/echo_server.py" & done
+
+# request sends an HTTP GET request from the specified namespace and returns the seen client IP.
 request() { ip netns exec "$1" curl --noproxy '*' --fail --silent --show-error --max-time 3 "http://$2:8080/"; }
 for attempt in {1..20}; do
     if request sl-lan 10.0.0.2 >/dev/null 2>&1; then break; fi
     sleep .1
 done
+
+# assert_no_conntrack verifies that no tracked TCP sessions exist in the gateway netns conntrack table.
 assert_no_conntrack() {
     local count
     count=$(ip netns exec sl-gw conntrack -L -p tcp 2>/dev/null | wc -l)
