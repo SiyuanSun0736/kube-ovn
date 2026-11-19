@@ -10,10 +10,8 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-// natGatewayOperation translates generic NAT operations (e.g., natGwSubnetFipAdd)
-// into their stateless-nft equivalents when the gateway dataplaneMode is stateless-nft.
-// It never falls back to stateful NAT on a failed lookup: the caller returns the error
-// to the rate-limited work queue before publishing Ready.
+// natGatewayOperation 在网关 dataplaneMode 为 stateless-nft 时，将通用 NAT 操作指令（如 natGwSubnetFipAdd）
+// 转换为其无状态指令；否则保持原有有状态操作名。查询网关失败时直接向上层抛出错误重试，严禁静默降级为有状态 NAT。
 func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	gw, err := c.vpcNatGatewayLister.Get(dp)
 	if err != nil {
@@ -44,8 +42,7 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	}
 }
 
-// isStatelessNatGateway reports whether the specified VPC NAT gateway is configured
-// with the stateless-nft dataplane mode.
+// isStatelessNatGateway 判断指定名称的 VPC NAT 网关是否启用了 stateless-nft 无状态数据面模式。
 func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	if name == "" {
 		return false, nil
@@ -58,16 +55,15 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	return mode == util.NatDataplaneModeStatelessNft, err
 }
 
-// statelessMapping describes the public and private selectors of one rule.
-// Reverse rewriting cannot disambiguate two public identities for one backend.
+// statelessMapping 描述无状态映射规则的公网与私网选择器元数据。
+// 在无连接跟踪状态下，反向路径改写无法为一个后端私网 IP 区分多个公网身份。
 type statelessMapping struct {
 	kind, name, eip, host, protocol, port string
 	isShare                               bool
 }
 
-// validateStatelessMapping enforces mutual exclusivity and disambiguation rules
-// for stateless NAT mappings belonging to the same gateway. It prevents multiple rules
-// from claiming the same private host or colliding on public EIP assignments.
+// validateStatelessMapping 对同一网关下的无状态 NAT 映射规则执行互斥性与排他性校验。
+// 防止多个规则占用相同私网主机引发反向路径二义性冲突，或在公网 EIP 上发生非法共享冲突。
 func (c *Controller) validateStatelessMapping(eipName string, candidate statelessMapping) error {
 	eip, err := c.iptablesEipsLister.Get(eipName)
 	if err != nil {

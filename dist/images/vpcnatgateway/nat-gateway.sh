@@ -2549,12 +2549,11 @@ function eip_egress_qos_del() {
 }
 
 
-# Stateless rules own a table per public identity. Both directions are replaced
-# in one nft transaction and deleted together, even if the old backend is lost.
-# Conntracked hairpin continues through the existing iptables NAT chains.
+# 无状态规则按公网身份独立建表。两个方向的规则在单个 nftables 事务中完成原子替换与级联清理，
+# 即使后端 Pod 遗失也能完整回滚。对于发卡（hairpin）流量，继续复用现有 iptables NAT 链保证连通。
 
-# stateless_ipv4 validates whether the input string is a valid IPv4 dotted-decimal
-# address (0.0.0.0 to 255.255.255.255), explicitly rejecting leading zeros and out-of-range octets.
+# stateless_ipv4 校验输入是否为标准的 IPv4 点分十进制地址（0.0.0.0 至 255.255.255.255），
+# 显式拒绝非法前导零以及超出 255 的非法八位字节。
 function stateless_ipv4() {
     local value=$1 octet
     [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -2565,15 +2564,15 @@ function stateless_ipv4() {
     done
 }
 
-# stateless_port validates whether the input string is a valid numeric L4 port number (1-65535).
+# stateless_port 校验输入是否为合法的 4 层数值端口号（1-65535）。
 function stateless_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
-# stateless_init initializes the base nftables table and forward chain for stateless NAT,
-# configuring TCP MSS clamping to the route MTU for untracked TCP SYN/RST packets.
+# stateless_init 初始化无状态 NAT 所需的基础表及 forward 链，
+# 并为 untracked 的 TCP SYN/RST 数据包配置基于路由 MTU 的 TCP MSS 自动钳制。
 function stateless_init() {
-    # Unlike HA this mode imposes no external CNI or member requirements.
+    # 与 HA 模式不同，该模式不对外部 CNI 或节点成员做硬性依赖要求
     if ! nft list table ip kube_ovn_stateless_nat >/dev/null 2>&1; then
         nft add table ip kube_ovn_stateless_nat || return 1
     fi
@@ -2586,9 +2585,8 @@ add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn |
 NFT
 }
 
-# stateless_mapping_add atomically configures bidirectional stateless NAT (FIP, DNAT, or SNAT)
-# inside a dedicated per-identity nftables table. It marks matched incoming and outgoing flows
-# with 'notrack' to bypass Linux conntrack entirely, while preserving hairpin NAT via iptables.
+# stateless_mapping_add 在独立的专属 nftables 表中原子化添加双向无状态 NAT（FIP/DNAT/SNAT）规则。
+# 通过为入向与出向流打上 notrack 标记来彻底绕过 Linux conntrack，同时调用底层 helper 保留 iptables 发卡通信能力。
 function stateless_mapping_add() {
     check_inited
     local kind=$1 rule=$2 eip internal_ip external_port protocol internal_port extra
@@ -2618,8 +2616,7 @@ function stateless_mapping_add() {
         incoming="$incoming $protocol dport $external_port notrack ip daddr set $internal_ip $protocol dport set $internal_port"
         outgoing="$outgoing $protocol sport $internal_port"
         reverse="$reverse $protocol sport set $external_port"
-        # These helpers may exit on an idempotent replay: isolate that exit so
-        # a retry still completes the nft half after an earlier partial failure.
+        # 兼容处理重放场景，避免历史局部失败导致重试中断
         (add_dnat "$rule") || return 1
     else
         incoming="$incoming notrack ip daddr set $internal_ip"
@@ -2630,7 +2627,7 @@ function stateless_mapping_add() {
         fi
     fi
 
-    # Atomic application using a single nft transaction
+    # 通过单个 nft 事务实现原子提交
     if ! nft -f - <<NFT
 add table ip $table
 flush table ip $table
@@ -2641,15 +2638,14 @@ add rule ip $table prerouting iifname "$VPC_INTERFACE" $outgoing fib daddr oifna
 add rule ip $table postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked $outgoing $reverse
 NFT
     then
-        # Cleanup partial table on failure
+        # 失败时回滚并清理残留的局部表
         nft delete table ip "$table" >/dev/null 2>&1
         return 1
     fi
 }
 
-# stateless_mapping_del deletes the dedicated nftables table for a stateless NAT mapping
-# and cleans up the associated iptables hairpin rule. Invalid inputs are treated as no-ops
-# to ensure cleanup idempotency.
+# stateless_mapping_del 删除无状态 NAT 映射对应的专属 nftables 表，并清理关联的 iptables 发卡规则。
+# 非法参数将安全地作为 no-op 忽略，保证清理流程的幂等性。
 function stateless_mapping_del() {
     local kind=$1 rule=$2 eip port protocol internal_ip extra table
     if [[ "$kind" == dnat ]]; then
@@ -2674,8 +2670,7 @@ function stateless_mapping_del() {
     if ! stateless_ipv4 "$eip" || [[ -n "$extra" ]]; then
         return 0
     fi
-    # First establish nft availability; an inspection failure must not silently
-    # turn a failed deletion into success. Listing all tables also handles ENOENT.
+    # 优先校验 nftables 状态；避免因环境异常将删除失败误判为成功
     local tables
     tables=$(nft list tables) || return 1
     if grep -Fxq "table ip $table" <<< "$tables"; then
@@ -2688,22 +2683,22 @@ function stateless_mapping_del() {
     return 0
 }
 
-# stateless_fip_add adds one or more bidirectional 1:1 stateless Floating IP mappings.
+# stateless_fip_add 批量添加双向 1:1 无状态 Floating IP 映射规则
 function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mapping_add fip "$rule" || return 1; done; }
 
-# stateless_fip_del deletes one or more bidirectional 1:1 stateless Floating IP mappings.
+# stateless_fip_del 批量删除双向 1:1 无状态 Floating IP 映射规则
 function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
 
-# stateless_dnat_add adds one or more bidirectional stateless port forwarding (DNAT) mappings.
+# stateless_dnat_add 批量添加双向无状态端口转发（DNAT）映射规则
 function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
 
-# stateless_dnat_del deletes one or more bidirectional stateless port forwarding (DNAT) mappings.
+# stateless_dnat_del 批量删除双向无状态端口转发（DNAT）映射规则
 function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
 
-# stateless_snat_add adds one or more bidirectional stateless host-only SNAT mappings.
+# stateless_snat_add 批量添加双向无状态单主机 SNAT 映射规则
 function stateless_snat_add() { local rule; for rule in "$@"; do stateless_mapping_add snat "$rule" || return 1; done; }
 
-# stateless_snat_del deletes one or more bidirectional stateless host-only SNAT mappings.
+# stateless_snat_del 批量删除双向无状态单主机 SNAT 映射规则
 function stateless_snat_del() { local rule; for rule in "$@"; do stateless_mapping_del snat "$rule" || return 1; done; }
 
 opt=$1

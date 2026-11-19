@@ -2077,8 +2077,7 @@ func (c *Controller) redoSnat(key, redo string, eipReady bool) error {
 	return nil
 }
 
-// createFipInPod dispatches the FIP creation command to the gateway pod, routing to
-// stateless-fip-add when the gateway is in stateless-nft mode or natGwSubnetFipAdd otherwise.
+// createFipInPod 向网关 Pod 下发 FIP 创建指令：在 stateless-nft 模式下路由至 stateless-fip-add，否则调用原生 natGwSubnetFipAdd。
 func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2329,8 +2328,7 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 	return firstErr
 }
 
-// deleteFipInPod dispatches the FIP deletion command to the gateway pod, routing to
-// stateless-fip-del when the gateway is in stateless-nft mode or natGwSubnetFipDel otherwise.
+// deleteFipInPod 向网关 Pod 下发 FIP 删除指令：在 stateless-nft 模式下路由至 stateless-fip-del，否则调用原生 natGwSubnetFipDel。
 func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2365,8 +2363,7 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 	return nil
 }
 
-// createDnatInPod dispatches the DNAT creation command to the gateway pod, routing to
-// stateless-dnat-add with normalized integer port strings in stateless-nft mode or natGwDnatAdd otherwise.
+// createDnatInPod 向网关 Pod 下发 DNAT 创建指令：在 stateless-nft 模式下对端口做十进制规整并路由至 stateless-dnat-add，否则调用原生 natGwDnatAdd。
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2397,8 +2394,7 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 	return nil
 }
 
-// deleteDnatInPod dispatches the DNAT deletion command to the gateway pod, routing to
-// stateless-dnat-del in stateless-nft mode or natGwDnatDel otherwise.
+// deleteDnatInPod 向网关 Pod 下发 DNAT 删除指令：在 stateless-nft 模式下路由至 stateless-dnat-del，否则调用原生 natGwDnatDel。
 func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2440,8 +2436,7 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 	return nil
 }
 
-// createSnatInPod dispatches the SNAT creation command to the gateway pod, routing to
-// stateless-snat-add (requiring a single host IP) in stateless-nft mode or natGwSnatAdd otherwise.
+// createSnatInPod 向网关 Pod 下发 SNAT 创建指令：在 stateless-nft 模式下校验并转换为单主机 IP 路由至 stateless-snat-add，否则调用原生 natGwSnatAdd。
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2481,8 +2476,7 @@ func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	return nil
 }
 
-// deleteSnatInPod dispatches the SNAT deletion command to the gateway pod, routing to
-// stateless-snat-del in stateless-nft mode or natGwSnatDel otherwise.
+// deleteSnatInPod 向网关 Pod 下发 SNAT 删除指令：在 stateless-nft 模式下校验并路由至 stateless-snat-del，否则调用原生 natGwSnatDel。
 func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from

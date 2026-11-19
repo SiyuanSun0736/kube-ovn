@@ -363,7 +363,7 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
 }
 
-// getNatGwDataplaneMode resolves the configured DataplaneMode for a gateway and logs any validation errors.
+// getNatGwDataplaneMode 解析指定网关配置的 DataplaneMode，并在发现不合法模式时记录错误日志。
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	mode, err := util.NatGatewayDataplaneMode(gw)
 	if err != nil {
@@ -372,7 +372,7 @@ func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	return mode
 }
 
-// isStatelessMode checks if the given mode string matches the stateless-nft dataplane mode.
+// isStatelessMode 检查给定的模式字符串是否匹配 stateless-nft 无状态数据面模式。
 func isStatelessMode(mode string) bool {
 	return mode == util.NatDataplaneModeStatelessNft
 }
