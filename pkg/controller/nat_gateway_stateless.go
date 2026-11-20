@@ -25,17 +25,17 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	}
 	switch operation {
 	case natGwSubnetFipAdd:
-		return "stateless-fip-add", nil
+		return natGwStatelessFipAdd, nil
 	case natGwSubnetFipDel:
-		return "stateless-fip-del", nil
+		return natGwStatelessFipDel, nil
 	case natGwDnatAdd:
-		return "stateless-dnat-add", nil
+		return natGwStatelessDnatAdd, nil
 	case natGwDnatDel:
-		return "stateless-dnat-del", nil
+		return natGwStatelessDnatDel, nil
 	case natGwSnatAdd:
-		return "stateless-snat-add", nil
+		return natGwStatelessSnatAdd, nil
 	case natGwSnatDel:
-		return "stateless-snat-del", nil
+		return natGwStatelessSnatDel, nil
 	default:
 		return operation, nil
 	}
@@ -131,9 +131,16 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		if !gatewayEips[existing.eip] || (existing.kind == candidate.kind && existing.name == candidate.name) {
 			continue
 		}
-		// Stateful Share records (LoadBalancer Services) are permitted to share backends
-		// with other Share records and reuse identities in retire snapshots.
+		// Stateful Share records (LoadBalancer Services) only skip EIP exclusivity check;
+		// backend conflict check must still be performed to prevent reverse routing ambiguity.
 		if existing.isShare && candidate.isShare {
+			existingHost, err := util.StatelessNATIPv4Host(existing.host)
+			if err != nil {
+				return fmt.Errorf("stateless gateway %s has invalid %s %s: %w", eip.Spec.NatGwDp, existing.kind, existing.name, err)
+			}
+			if existingHost == candidate.host && existing.protocol == candidate.protocol && existing.port == candidate.port {
+				return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", eip.Spec.NatGwDp, candidate.host, existing.kind, existing.name)
+			}
 			continue
 		}
 		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share

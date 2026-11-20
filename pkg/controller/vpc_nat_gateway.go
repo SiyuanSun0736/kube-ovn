@@ -58,6 +58,14 @@ const (
 	natGwTCPConnLimitSet  = "tcp-connlimit-set"
 	natGwTCPSynLimitSet   = "tcp-syn-limit-set"
 
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
+
 	// The two states of the lanIP fallback the gateway script accepts, also the values recorded
 	// in VpcNatGatewayStatus.HairpinSNAT.
 	hairpinSNATEnable  = "enable"
@@ -792,12 +800,12 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 
 	dataplaneMode, err := util.NatGatewayDataplaneMode(gw)
 	if err != nil {
-		klog.Errorf("initialize gateway %s dataplane mode: %v", key, err)
-		return err
+		klog.Warningf("invalid dataplane mode for vpc nat gateway %s: %v, ignoring and fallback", key, err)
+		dataplaneMode = ""
 	}
 	// 无状态网关在 Pod 内初始化基础 nft 表及 TCP MSS 自动钳制
 	if dataplaneMode == util.NatDataplaneModeStatelessNft {
-		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, "stateless-init", nil); err != nil {
+		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwStatelessInit, nil); err != nil {
 			klog.Errorf("initialize stateless gateway %s: %v", key, err)
 			return err
 		}

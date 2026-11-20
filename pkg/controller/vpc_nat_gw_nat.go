@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -2375,14 +2374,6 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 		klog.Errorf("gateway %s operation %s: %v", dp, natGwDnatAdd, err)
 		return err
 	}
-	if operation == "stateless-dnat-add" {
-		if extP, err := strconv.Atoi(externalPort); err == nil {
-			externalPort = strconv.Itoa(extP)
-		}
-		if intP, err := strconv.Atoi(internalPort); err == nil {
-			internalPort = strconv.Itoa(intP)
-		}
-	}
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
 	addRules = append(addRules, rule)
@@ -2421,11 +2412,6 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 	if err != nil {
 		klog.Errorf("gateway %s operation %s: %v", dp, natGwDnatDel, err)
 		return err
-	}
-	if operation == "stateless-dnat-del" {
-		if extP, err := strconv.Atoi(externalPort); err == nil {
-			externalPort = strconv.Itoa(extP)
-		}
 	}
 	// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only
 	rule := fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)

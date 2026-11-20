@@ -3,13 +3,14 @@ package util
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 )
 
 // NatGatewayDataplaneMode 校验并提取 VpcNatGateway 的 DataplaneMode 配置。
 func NatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) (string, error) {
-	mode := gw.Spec.DataplaneMode
+	mode := strings.TrimSpace(gw.Spec.DataplaneMode)
 	if mode != "" && mode != NatDataplaneModeStatelessNft {
 		return "", fmt.Errorf("gateway %s: unsupported dataplaneMode %q", gw.Name, mode)
 	}
