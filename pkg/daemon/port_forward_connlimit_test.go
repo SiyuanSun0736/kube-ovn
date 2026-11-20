@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -58,14 +59,13 @@ func TestParseIptablesChainRules(t *testing.T) {
 }
 
 func TestBuildIptablesGateRules(t *testing.T) {
-	rulesWithNic := buildIptablesGateRules("eth0")
-	require.Len(t, rulesWithNic, 2)
-	require.Equal(t, `-A KUBE-OVN-PF -i lo -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithNic[0])
-	require.Equal(t, `-A KUBE-OVN-PF ! -i eth0 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithNic[1])
+	rulesV4 := buildIptablesGateRules(kubeovnv1.ProtocolIPv4)
+	require.Len(t, rulesV4, 1)
+	require.Equal(t, `-A KUBE-OVN-PF -s 127.0.0.0/8 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesV4[0])
 
-	rulesWithoutNic := buildIptablesGateRules("")
-	require.Len(t, rulesWithoutNic, 1)
-	require.Equal(t, `-A KUBE-OVN-PF -i lo -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithoutNic[0])
+	rulesV6 := buildIptablesGateRules(kubeovnv1.ProtocolIPv6)
+	require.Len(t, rulesV6, 1)
+	require.Equal(t, `-A KUBE-OVN-PF -s ::1/128 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesV6[0])
 }
 
 func TestBuildIptablesAddRuleCmd(t *testing.T) {

@@ -66,24 +66,15 @@ func execIptablesRestore(protocol, script string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-func (c *Controller) getExternalInterface() string {
-	if c == nil || c.config == nil {
-		return ""
+func buildIptablesGateRules(protocol string) []string {
+	if protocol == kubeovnv1.ProtocolIPv6 {
+		return []string{
+			fmt.Sprintf("-A %s -s ::1/128 -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
+		}
 	}
-	if iface := c.config.GetTunnelIface(); iface != "" {
-		return iface
+	return []string{
+		fmt.Sprintf("-A %s -s 127.0.0.0/8 -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
 	}
-	return c.config.Iface
-}
-
-func buildIptablesGateRules(extIface string) []string {
-	rules := []string{
-		fmt.Sprintf("-A %s -i lo -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
-	}
-	if extIface != "" {
-		rules = append(rules, fmt.Sprintf("-A %s ! -i %s -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, extIface, pfGateComment))
-	}
-	return rules
 }
 
 func buildIptablesAddRuleCmd(rule portForwardConnLimitRule) string {
@@ -170,19 +161,19 @@ func (c *Controller) listIptablesRules(protocol string) ([]iptablesRuleEntry, er
 }
 
 func (c *Controller) ensureIptablesChain(protocol string) error {
-	// Check if jump exists in PREROUTING
-	_, err := execIptables(protocol, "-t", "mangle", "-C", "PREROUTING", "-j", util.OvnPortForwardIptablesChain)
-	if err != nil {
-		// Create chain if not exists (ignore error if already exists)
-		_, _ = execIptables(protocol, "-t", "mangle", "-N", util.OvnPortForwardIptablesChain)
+	// Create chain if not exists (ignore error if already exists)
+	_, _ = execIptables(protocol, "-t", "mangle", "-N", util.OvnPortForwardIptablesChain)
 
-		// Insert jump at position 1 in PREROUTING
-		if out, insErr := execIptables(protocol, "-t", "mangle", "-I", "PREROUTING", "1", "-j", util.OvnPortForwardIptablesChain); insErr != nil {
-			klog.Errorf("failed to insert %s jump in mangle PREROUTING (protocol %s): %v, out: %s",
-				util.OvnPortForwardIptablesChain, protocol, insErr, string(out))
-			return insErr
+	// Ensure jump in both PREROUTING and OUTPUT hooks
+	for _, parent := range []string{"PREROUTING", "OUTPUT"} {
+		if _, err := execIptables(protocol, "-t", "mangle", "-C", parent, "-j", util.OvnPortForwardIptablesChain); err != nil {
+			if out, insErr := execIptables(protocol, "-t", "mangle", "-I", parent, "1", "-j", util.OvnPortForwardIptablesChain); insErr != nil {
+				klog.Errorf("failed to insert %s jump in mangle %s (protocol %s): %v, out: %s",
+					util.OvnPortForwardIptablesChain, parent, protocol, insErr, string(out))
+				return insErr
+			}
+			klog.Infof("ensured %s jump in mangle %s for protocol %s", util.OvnPortForwardIptablesChain, parent, protocol)
 		}
-		klog.Infof("ensured %s chain and PREROUTING jump for protocol %s", util.OvnPortForwardIptablesChain, protocol)
 	}
 	return nil
 }
@@ -287,8 +278,6 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 		rulesByProtoNew[proto] = append(rulesByProtoNew[proto], r)
 	}
 
-	extIface := c.getExternalInterface()
-
 	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
 		pOld := rulesByProtoOld[proto]
 		pNew := rulesByProtoNew[proto]
@@ -296,7 +285,7 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 			continue
 		}
 
-		if err := c.reconcileProtocolRules(proto, pOld, pNew, extIface); err != nil {
+		if err := c.reconcileProtocolRules(proto, pOld, pNew); err != nil {
 			klog.Errorf("failed to reconcile port-forward connlimit rules for protocol %s: %v", proto, err)
 			return err
 		}
@@ -305,7 +294,7 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 	return nil
 }
 
-func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules []portForwardConnLimitRule, extIface string) error {
+func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules []portForwardConnLimitRule) error {
 	oldMap := make(map[portForwardKey]portForwardConnLimitRule, len(oldRules))
 	for _, r := range oldRules {
 		oldMap[r.key()] = r
@@ -348,7 +337,7 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 	lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
 
 	// Re-insert gate rules at chain head
-	lines = append(lines, buildIptablesGateRules(extIface)...)
+	lines = append(lines, buildIptablesGateRules(protocol)...)
 
 	// Keep existing rules not belonging to toDeleteComments or toAddOrUpdate
 	for _, e := range entries {
@@ -409,8 +398,6 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 		}
 	}
 
-	extIface := c.getExternalInterface()
-
 	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
 		entries, err := c.listIptablesRules(proto)
 		if err != nil || len(entries) == 0 {
@@ -436,7 +423,7 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 		lines = append(lines, "*mangle")
 		lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
 		lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
-		lines = append(lines, buildIptablesGateRules(extIface)...)
+		lines = append(lines, buildIptablesGateRules(proto)...)
 
 		for _, e := range entries {
 			if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != pfGateComment {
