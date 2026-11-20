@@ -450,10 +450,6 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 		return errors.New("iptables nat gw not enable")
 	}
 
-	if err := c.validateFipRule(cachedFip); err != nil {
-		return err
-	}
-
 	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
@@ -469,6 +465,10 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 				return fmt.Errorf("failed to mark fip %s not ready after its eip became unavailable: %w", key, patchErr)
 			}
 		}
+		return err
+	}
+
+	if err := c.validateFipRule(cachedFip); err != nil {
 		return err
 	}
 
@@ -824,10 +824,6 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		return errors.New("iptables nat gw not enable")
 	}
 
-	if err := c.validateDnatRule(cachedDnat); err != nil {
-		return err
-	}
-
 	gwName := cachedDnat.Labels[util.VpcNatGatewayNameLabel]
 	var eip *kubeovnv1.IptablesEIP
 	if dnatUsesEip(&cachedDnat.Spec) {
@@ -849,6 +845,10 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			return err
 		}
 		gwName = eip.Spec.NatGwDp
+	}
+
+	if err := c.validateDnatRule(cachedDnat); err != nil {
+		return err
 	}
 	if dup, duplicateErr := c.isDnatDuplicated(gwName, cachedDnat); dup || duplicateErr != nil {
 		if dup && cachedDnat.Status.Ready {
@@ -1164,8 +1164,16 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 	}
 	klog.V(3).Infof("handle update snat %s", key)
 
-	if err := c.validateSnatRule(cachedSnat); err != nil {
-		return err
+	// add or update should make sure vpc nat enabled
+	if vpcNatEnabled != "true" {
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.SnatUsingEip, cachedSnat.Spec.EIP, cachedSnat.Labels, cachedSnat.Annotations,
+			func() error { return c.finalDeleteSnatInPod(key, cachedSnat) },
+			func() error { return c.patchSnatStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
+		return errors.New("iptables nat gw not enable")
 	}
 
 	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
@@ -1186,9 +1194,8 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		return err
 	}
 
-	// add or update should make sure vpc nat enabled
-	if vpcNatEnabled != "true" {
-		return errors.New("iptables nat gw not enable")
+	if err := c.validateSnatRule(cachedSnat); err != nil {
+		return err
 	}
 
 	if eip.Spec.NatGwDp == "" {

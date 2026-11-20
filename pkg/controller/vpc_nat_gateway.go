@@ -522,6 +522,11 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
+	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft && (len(gw.Status.ExternalSubnets) > 0 || gw.Status.HairpinSNAT != "") {
+		err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
+		klog.Error(err)
+		return err
+	}
 	// 无状态模式（notrack）绕过 conntrack，不支持配置 tcpConnLimit
 	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
 		err = fmt.Errorf("gateway %s: stateless dataplane mode does not support tcpConnLimit (must be 0 or unset)", key)

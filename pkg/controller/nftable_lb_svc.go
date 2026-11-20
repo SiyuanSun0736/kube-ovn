@@ -370,6 +370,23 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			return err
 		}
 	}
+	for _, record := range desired {
+		if dnatUsesEip(&record.Spec) {
+			if err = c.validateStatelessMapping(record.Spec.EIP, statelessMapping{
+				kind:         "DNAT",
+				name:         record.Name,
+				eip:          record.Spec.EIP,
+				host:         record.Spec.InternalIP,
+				protocol:     record.Spec.Protocol,
+				port:         record.Spec.InternalPort,
+				externalPort: record.Spec.ExternalPort,
+				isShare:      true,
+			}); err != nil {
+				c.recorder.Event(cachedSvc, v1.EventTypeWarning, "StatelessConflict", err.Error())
+				return err
+			}
+		}
+	}
 	// The Service is the authoritative writer; record events never trigger NAT changes. Write the
 	// claim before the rule it covers (CODE_STYLE.md): a rejected or half-finished record sync
 	// must never leave programmed share DNAT state that no record accounts for, because cleanup

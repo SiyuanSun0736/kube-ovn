@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -12,6 +13,9 @@ import (
 
 // natGatewayOperation 根据指定 VPC NAT 网关的 dataplaneMode 动态解析底层操作指令，查询失败时重新排队重试且严禁回退有状态。
 func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
+	if c == nil || c.vpcNatGatewayLister == nil {
+		return operation, nil
+	}
 	gw, err := c.vpcNatGatewayLister.Get(dp)
 	if err != nil {
 		return "", fmt.Errorf("get gateway %s for %s: %w", dp, operation, err)
@@ -19,6 +23,9 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	mode, err := util.NatGatewayDataplaneMode(gw)
 	if err != nil {
 		return "", err
+	}
+	if gw.Status.DataplaneMode != "" {
+		mode = gw.Status.DataplaneMode
 	}
 	if mode != util.NatDataplaneModeStatelessNft {
 		return operation, nil
@@ -46,12 +53,24 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	if name == "" {
 		return false, nil
 	}
+	if c == nil || c.vpcNatGatewayLister == nil {
+		return false, nil
+	}
 	gw, err := c.vpcNatGatewayLister.Get(name)
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	mode, err := util.NatGatewayDataplaneMode(gw)
-	return mode == util.NatDataplaneModeStatelessNft, err
+	if err != nil {
+		return false, err
+	}
+	if gw.Status.DataplaneMode != "" {
+		mode = gw.Status.DataplaneMode
+	}
+	return mode == util.NatDataplaneModeStatelessNft, nil
 }
 
 // statelessMapping 描述无状态规则的公私网选择器，无状态反向改写无法区分指向同一后端的多个公网身份。
@@ -62,6 +81,9 @@ type statelessMapping struct {
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
 func (c *Controller) validateStatelessMapping(eipName string, candidate statelessMapping) error {
+	if c == nil || c.iptablesEipsLister == nil || c.vpcNatGatewayLister == nil {
+		return nil
+	}
 	eip, err := c.iptablesEipsLister.Get(eipName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -70,7 +92,7 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		}
 		return err
 	}
-	if eip.Spec.NatGwDp == "" {
+	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
 		return nil
 	}
 	enabled, err := c.isStatelessNatGateway(eip.Spec.NatGwDp)
@@ -85,16 +107,10 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 	candidate.host = host
 
 	gwName := eip.Spec.NatGwDp
-	gwSelector := labels.SelectorFromSet(labels.Set{util.VpcNatGatewayNameLabel: gwName})
 
-	eips, err := c.iptablesEipsLister.List(gwSelector)
+	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
 		return err
-	}
-	if len(eips) == 0 {
-		if eips, err = c.iptablesEipsLister.List(labels.Everything()); err != nil {
-			return err
-		}
 	}
 	gatewayEips := map[string]bool{}
 	for _, item := range eips {
@@ -103,52 +119,61 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		}
 	}
 
-	fips, err := c.iptablesFipsLister.List(gwSelector)
+	fips, err := c.iptablesFipsLister.List(labels.Everything())
 	if err != nil {
 		return err
 	}
-	if len(fips) == 0 {
-		if fips, err = c.iptablesFipsLister.List(labels.Everything()); err != nil {
-			return err
-		}
-	}
-	snats, err := c.iptablesSnatRulesLister.List(gwSelector)
+	snats, err := c.iptablesSnatRulesLister.List(labels.Everything())
 	if err != nil {
 		return err
 	}
-	if len(snats) == 0 {
-		if snats, err = c.iptablesSnatRulesLister.List(labels.Everything()); err != nil {
-			return err
-		}
-	}
-	dnats, err := c.iptablesDnatRulesLister.List(gwSelector)
+	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
 	if err != nil {
 		return err
-	}
-	if len(dnats) == 0 {
-		if dnats, err = c.iptablesDnatRulesLister.List(labels.Everything()); err != nil {
-			return err
-		}
 	}
 
 	var mappings []statelessMapping
 	for _, item := range fips {
-		mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP})
+		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
+			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP})
+			if item.Status.InternalIP != "" && item.Status.InternalIP != item.Spec.InternalIP {
+				mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Status.InternalIP})
+			}
+		}
 	}
 	for _, item := range snats {
-		mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalCIDR})
+		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
+			mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalCIDR})
+			if item.Status.InternalCIDR != "" && item.Status.InternalCIDR != item.Spec.InternalCIDR {
+				mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Status.InternalCIDR})
+			}
+		}
 	}
 	for _, item := range dnats {
-		mappings = append(mappings, statelessMapping{
-			kind:         "DNAT",
-			name:         item.Name,
-			eip:          item.Spec.EIP,
-			host:         item.Spec.InternalIP,
-			protocol:     item.Spec.Protocol,
-			port:         item.Spec.InternalPort,
-			externalPort: item.Spec.ExternalPort,
-			isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
-		})
+		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
+			mappings = append(mappings, statelessMapping{
+				kind:         "DNAT",
+				name:         item.Name,
+				eip:          item.Spec.EIP,
+				host:         item.Spec.InternalIP,
+				protocol:     item.Spec.Protocol,
+				port:         item.Spec.InternalPort,
+				externalPort: item.Spec.ExternalPort,
+				isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			})
+			if item.Status.InternalIP != "" && (item.Status.InternalIP != item.Spec.InternalIP || item.Status.InternalPort != item.Spec.InternalPort) {
+				mappings = append(mappings, statelessMapping{
+					kind:         "DNAT",
+					name:         item.Name,
+					eip:          item.Spec.EIP,
+					host:         item.Status.InternalIP,
+					protocol:     item.Status.Protocol,
+					port:         item.Status.InternalPort,
+					externalPort: item.Status.ExternalPort,
+					isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+				})
+			}
+		}
 	}
 
 	for _, existing := range mappings {
@@ -168,17 +193,22 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 			if existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT" {
 				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, existing.kind, existing.name)
 			}
-			if existing.protocol == candidate.protocol && existing.externalPort == candidate.externalPort {
+			existingExtPort, _ := strconv.Atoi(existing.externalPort)
+			candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
+			if existing.protocol == candidate.protocol && (existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)) {
 				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
 			}
 		}
 		existingHost, err := util.StatelessNATIPv4Host(existing.host)
 		if err != nil {
-			return fmt.Errorf("stateless gateway %s has invalid %s %s: %w", eip.Spec.NatGwDp, existing.kind, existing.name, err)
+			continue
 		}
+		existingPort, _ := strconv.Atoi(existing.port)
+		candidatePort, _ := strconv.Atoi(candidate.port)
+		samePort := existing.port == candidate.port || (existingPort != 0 && existingPort == candidatePort)
 		// Stateless backends must have unambiguous reverse routing and cannot overlap with
 		// stateful Service backends.
-		if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && existing.port == candidate.port)) {
+		if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
 			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", eip.Spec.NatGwDp, candidate.host, existing.kind, existing.name)
 		}
 	}

@@ -2649,8 +2649,12 @@ NFT
         local out_chain="sl_fout_${internal_ip//./_}"
         if ! nft -f - <<NFT
 add table ip kube_ovn_stateless_nat
-add chain ip kube_ovn_stateless_nat $in_chain { notrack ip daddr set $internal_ip; }
-add chain ip kube_ovn_stateless_nat $out_chain { ip saddr set $eip; }
+add chain ip kube_ovn_stateless_nat $in_chain
+flush chain ip kube_ovn_stateless_nat $in_chain
+add rule ip kube_ovn_stateless_nat $in_chain notrack ip daddr set $internal_ip
+add chain ip kube_ovn_stateless_nat $out_chain
+flush chain ip kube_ovn_stateless_nat $out_chain
+add rule ip kube_ovn_stateless_nat $out_chain ip saddr set $eip
 add element ip kube_ovn_stateless_nat sl_fip_dnat { $eip : jump $in_chain }
 add element ip kube_ovn_stateless_nat sl_fip_snat { $internal_ip : jump $out_chain }
 NFT
@@ -2663,12 +2667,14 @@ NFT
         local out_chain="sl_sout_${internal_ip//./_}"
         if ! nft -f - <<NFT
 add table ip kube_ovn_stateless_nat
-add chain ip kube_ovn_stateless_nat $in_chain {
-    tcp flags & (syn | rst | ack) == syn drop;
-    icmp type echo-request drop;
-    notrack ip daddr set $internal_ip;
-}
-add chain ip kube_ovn_stateless_nat $out_chain { ip saddr set $eip; }
+add chain ip kube_ovn_stateless_nat $in_chain
+flush chain ip kube_ovn_stateless_nat $in_chain
+add rule ip kube_ovn_stateless_nat $in_chain tcp flags & (syn | rst | ack) == syn drop
+add rule ip kube_ovn_stateless_nat $in_chain icmp type echo-request drop
+add rule ip kube_ovn_stateless_nat $in_chain notrack ip daddr set $internal_ip
+add chain ip kube_ovn_stateless_nat $out_chain
+flush chain ip kube_ovn_stateless_nat $out_chain
+add rule ip kube_ovn_stateless_nat $out_chain ip saddr set $eip
 add element ip kube_ovn_stateless_nat sl_snat_in { $eip : jump $in_chain }
 add element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip : jump $out_chain }
 NFT
@@ -2766,8 +2772,12 @@ function stateless_mapping_del() {
     elif [[ "$kind" == snat ]]; then
         local in_chain="sl_sin_${eip//./_}"
         local out_chain="sl_sout_${internal_ip//./_}"
-        nft "delete element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip }" >/dev/null 2>&1
-        nft "delete chain ip kube_ovn_stateless_nat $out_chain" >/dev/null 2>&1
+        local out_rules
+        out_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$out_chain" 2>/dev/null)
+        if [[ -z "$out_rules" ]] || grep -q "ip saddr set $eip" <<< "$out_rules"; then
+            nft "delete element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip }" >/dev/null 2>&1
+            nft "delete chain ip kube_ovn_stateless_nat $out_chain" >/dev/null 2>&1
+        fi
         nft "delete element ip kube_ovn_stateless_nat sl_snat_in { $eip }" >/dev/null 2>&1
         nft "delete chain ip kube_ovn_stateless_nat $in_chain" >/dev/null 2>&1
     fi
