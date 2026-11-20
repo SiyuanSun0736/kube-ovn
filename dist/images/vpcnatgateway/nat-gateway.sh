@@ -2569,6 +2569,11 @@ function stateless_port() {
 }
 
 # stateless_init 初始化全局无状态表、Map 容器及基础 Hook 链，开销恒定为 1 对 Hook。
+# - 入向防外网主动针对 SNAT EIP 发起 TCP SYN 探测 Pod 端口
+# - 入向 FIP/SNAT 查 map 改写目的 IP 并打 notrack，DNAT vmap 分发至子链改写端口与 IP
+# - 出向 FIB 路由校验仅经外网卡流量打 notrack，内网发卡报文不打 notrack 留给 iptables 处理
+# - Forward 链执行 TCP MSS 自动钳制
+# - 出向 FIP/SNAT 查 map 改写源 IP，DNAT vmap 分发至子链反向改写端口与源 IP
 function stateless_init() {
     nft -f - <<NFT
 add table ip kube_ovn_stateless_nat
@@ -2587,27 +2592,14 @@ flush chain ip kube_ovn_stateless_nat prerouting
 flush chain ip kube_ovn_stateless_nat forward
 flush chain ip kube_ovn_stateless_nat postrouting
 
-# 防外网针对 SNAT EIP 扫描/主动建立 TCP 连接探测 Pod 端口（加固无状态 SNAT 安全）
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_snat_in tcp flags & (syn | rst | ack) == syn drop
-
-# FIP & SNAT 入向目的地址改写
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_fip_dnat notrack ip daddr set ip daddr map @sl_fip_dnat
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_snat_in notrack ip daddr set ip daddr map @sl_snat_in
-
-# DNAT 入向根据协议、端口与目的 IP 分发至无状态改写子链
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" vmap meta l4proto . th dport . ip daddr map @sl_dnat_in
-
-# FIB 路由校验：仅出向经由外网口的流量打 notrack，内网发卡报文不打 notrack 留给 iptables 处理
 add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" notrack
-
-# TCP MSS 自动钳制
 add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
-
-# FIP & SNAT 出向源地址改写
 add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr map @sl_fip_snat ip saddr set ip saddr map @sl_fip_snat
 add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr map @sl_snat_out ip saddr set ip saddr map @sl_snat_out
-
-# DNAT 出向根据协议、源端口与内部源 IP 分发至反向改写子链
 add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked vmap meta l4proto . th sport . ip saddr map @sl_dnat_out
 NFT
 }
