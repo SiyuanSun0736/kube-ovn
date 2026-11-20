@@ -370,17 +370,35 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			return err
 		}
 	}
+	existing, err := c.existingNftableLbSvcRules(namespace, name)
+	if err != nil {
+		return err
+	}
+	existingMap := make(map[string]*kubeovnv1.IptablesDnatRule, len(existing))
+	for _, rule := range existing {
+		existingMap[rule.Name] = rule
+	}
 	for _, record := range desired {
 		if dnatUsesEip(&record.Spec) {
+			isEstablished := false
+			if cur, ok := existingMap[record.Name]; ok && cur != nil {
+				isEstablished = (cur.Status.Ready || cur.Status.V4ip != "" || cur.Labels[util.EipUIDLabel] != "") &&
+					cur.Spec.InternalIP == record.Spec.InternalIP &&
+					cur.Spec.InternalPort == record.Spec.InternalPort &&
+					cur.Spec.ExternalPort == record.Spec.ExternalPort &&
+					cur.Spec.Protocol == record.Spec.Protocol &&
+					cur.Spec.EIP == record.Spec.EIP
+			}
 			if err = c.validateStatelessMapping(record.Spec.EIP, statelessMapping{
-				kind:         "DNAT",
-				name:         record.Name,
-				eip:          record.Spec.EIP,
-				host:         record.Spec.InternalIP,
-				protocol:     record.Spec.Protocol,
-				port:         record.Spec.InternalPort,
-				externalPort: record.Spec.ExternalPort,
-				isShare:      true,
+				kind:          "DNAT",
+				name:          record.Name,
+				eip:           record.Spec.EIP,
+				host:          record.Spec.InternalIP,
+				protocol:      record.Spec.Protocol,
+				port:          record.Spec.InternalPort,
+				externalPort:  record.Spec.ExternalPort,
+				isShare:       true,
+				isEstablished: isEstablished,
 			}); err != nil {
 				c.recorder.Event(cachedSvc, v1.EventTypeWarning, "StatelessConflict", err.Error())
 				return err
@@ -392,10 +410,6 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	// must never leave programmed share DNAT state that no record accounts for, because cleanup
 	// would find no ledger for it and release the Service finalizer anyway. A failed claim aborts
 	// the pass before the gateway is touched; a failed program keeps the claims for the retry.
-	existing, err := c.existingNftableLbSvcRules(namespace, name)
-	if err != nil {
-		return err
-	}
 	// Records deleted out of band before this pass leave no ledger for an identity the Service
 	// trimmed since (its EIP annotation is gone, or a gate closed): the restored records would
 	// only describe the identities still served, and the old nft map would be

@@ -373,7 +373,7 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 
 // getNatGwDataplaneMode 获取并校验指定 VPC NAT 网关的 DataplaneMode 配置。
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
-	mode, err := activeNatGatewayDataplaneMode(gw)
+	mode, err := c.activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		klog.Errorf("resolve dataplane mode for gateway %s: %v", gw.Name, err)
 	}
@@ -522,10 +522,13 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
-	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft && (len(gw.Status.ExternalSubnets) > 0 || gw.Status.HairpinSNAT != "") {
-		err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
-		klog.Error(err)
-		return err
+	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft {
+		pod, podErr := c.getNatGwPod(key, c.natGwNamespace(gw))
+		if podErr == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "" {
+			err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
+			klog.Error(err)
+			return err
+		}
 	}
 	// 无状态模式（notrack）绕过 conntrack，不支持配置 tcpConnLimit
 	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
@@ -803,7 +806,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
 	}
 
-	dataplaneMode, err := activeNatGatewayDataplaneMode(gw)
+	dataplaneMode, err := c.activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		klog.Warningf("invalid dataplane mode for vpc nat gateway %s: %v, ignoring and fallback", key, err)
 		dataplaneMode = ""
