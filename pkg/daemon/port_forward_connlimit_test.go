@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -11,86 +10,80 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-func TestParseNftChainRules(t *testing.T) {
-	rawOutput := `table inet kube_ovn_pf {
-	chain prerouting {
-		type filter hook prerouting priority -150; policy accept;
-		iifname != "eth0" return comment "ovn-pf-gate" # handle 2
-		ip daddr 1.2.3.4 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 counter drop comment "ovn-pf-1.2.3.4-80" # handle 3
-		ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 200 counter drop comment 'ovn-pf-2001:db8::1-443' # handle 4
-		tcp dport 22 accept # handle 5
-	}
-}`
+func TestParseIptablesChainRules(t *testing.T) {
+	rawOutput := `-N KUBE-OVN-PF
+-A KUBE-OVN-PF -i lo -m comment --comment ovn-pf-gate -j RETURN
+-A KUBE-OVN-PF ! -i eth0 -m comment --comment ovn-pf-gate -j RETURN
+-A KUBE-OVN-PF -d 1.2.3.4/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 100 --connlimit-mask 0 --connlimit-saddr -m comment --comment "ovn-pf-1.2.3.4-80" -j DROP
+-A KUBE-OVN-PF -d 2001:db8::1/128 -p tcp -m tcp --dport 443 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 200 --connlimit-mask 0 --connlimit-saddr -m comment --comment 'ovn-pf-2001:db8::1-443' -j DROP
+-A KUBE-OVN-PF -p tcp -m tcp --dport 22 -j ACCEPT
+`
 
-	entries := parseNftChainRules(rawOutput)
-	require.Len(t, entries, 4)
+	entries := parseIptablesChainRules(rawOutput)
+	require.Len(t, entries, 5)
 
-	// Gate rule
-	require.Equal(t, "2", entries[0].handle)
+	// Gate rule 1
 	require.Equal(t, "ovn-pf-gate", entries[0].comment)
 	require.Equal(t, 0, entries[0].limit)
-	require.Contains(t, entries[0].raw, `iifname != "eth0"`)
+	require.Contains(t, entries[0].raw, "-i lo")
+
+	// Gate rule 2
+	require.Equal(t, "ovn-pf-gate", entries[1].comment)
+	require.Equal(t, 0, entries[1].limit)
+	require.Contains(t, entries[1].raw, "! -i eth0")
 
 	// IPv4 rule
-	require.Equal(t, "3", entries[1].handle)
-	require.Equal(t, "ovn-pf-1.2.3.4-80", entries[1].comment)
-	require.Equal(t, 100, entries[1].limit)
+	require.Equal(t, "ovn-pf-1.2.3.4-80", entries[2].comment)
+	require.Equal(t, 100, entries[2].limit)
+	require.Contains(t, entries[2].raw, "--connlimit-above 100")
 
 	// IPv6 rule with single quote
-	require.Equal(t, "4", entries[2].handle)
-	require.Equal(t, "ovn-pf-2001:db8::1-443", entries[2].comment)
-	require.Equal(t, 200, entries[2].limit)
+	require.Equal(t, "ovn-pf-2001:db8::1-443", entries[3].comment)
+	require.Equal(t, 200, entries[3].limit)
 
 	// Rule without comment
-	require.Equal(t, "5", entries[3].handle)
-	require.Equal(t, "", entries[3].comment)
-	require.Equal(t, 0, entries[3].limit)
+	require.Equal(t, "", entries[4].comment)
+	require.Equal(t, 0, entries[4].limit)
 
 	// Find by comment
-	matched := findNftRulesByComment(entries, "ovn-pf-1.2.3.4-80")
+	matched := findIptablesRulesByComment(entries, "ovn-pf-1.2.3.4-80")
 	require.Len(t, matched, 1)
-	require.Equal(t, "3", matched[0].handle)
 	require.Equal(t, 100, matched[0].limit)
 
-	matchedGate := findNftRulesByComment(entries, "ovn-pf-gate")
-	require.Len(t, matchedGate, 1)
-	require.Equal(t, "2", matchedGate[0].handle)
+	matchedGate := findIptablesRulesByComment(entries, "ovn-pf-gate")
+	require.Len(t, matchedGate, 2)
 
-	matchedNone := findNftRulesByComment(entries, "non-existent")
+	matchedNone := findIptablesRulesByComment(entries, "non-existent")
 	require.Empty(t, matchedNone)
 }
 
-func TestBuildNftGateRule(t *testing.T) {
-	ruleWithNic := buildNftGateRule("eth0")
-	require.Equal(t, `insert rule inet kube_ovn_pf prerouting iifname != "eth0" return comment "ovn-pf-gate"`, ruleWithNic)
+func TestBuildIptablesGateRules(t *testing.T) {
+	rulesWithNic := buildIptablesGateRules("eth0")
+	require.Len(t, rulesWithNic, 2)
+	require.Equal(t, `-A KUBE-OVN-PF -i lo -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithNic[0])
+	require.Equal(t, `-A KUBE-OVN-PF ! -i eth0 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithNic[1])
 
-	ruleWithoutNic := buildNftGateRule("")
-	require.Equal(t, `insert rule inet kube_ovn_pf prerouting iifname "lo" return comment "ovn-pf-gate"`, ruleWithoutNic)
+	rulesWithoutNic := buildIptablesGateRules("")
+	require.Len(t, rulesWithoutNic, 1)
+	require.Equal(t, `-A KUBE-OVN-PF -i lo -m comment --comment "ovn-pf-gate" -j RETURN`, rulesWithoutNic[0])
 }
 
-func TestBuildNftAddRuleCmd(t *testing.T) {
+func TestBuildIptablesAddRuleCmd(t *testing.T) {
 	ruleV4 := portForwardConnLimitRule{
 		ip:        "1.1.1.1",
 		port:      80,
 		connLimit: 100,
 	}
-	expectedV4 := `add rule inet kube_ovn_pf prerouting ip daddr 1.1.1.1 tcp dport 80 tcp flags & (fin|syn|rst|ack) == syn ct count over 100 counter drop comment "ovn-pf-1.1.1.1-80"`
-	require.Equal(t, expectedV4, buildNftAddRuleCmd(ruleV4))
+	expectedV4 := `-A KUBE-OVN-PF -d 1.1.1.1/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 100 --connlimit-mask 0 -m comment --comment "ovn-pf-1.1.1.1-80" -j DROP`
+	require.Equal(t, expectedV4, buildIptablesAddRuleCmd(ruleV4))
 
 	ruleV6 := portForwardConnLimitRule{
 		ip:        "2001:db8::1",
 		port:      443,
 		connLimit: 500,
 	}
-	expectedV6 := `add rule inet kube_ovn_pf prerouting ip6 daddr 2001:db8::1 tcp dport 443 tcp flags & (fin|syn|rst|ack) == syn ct count over 500 counter drop comment "ovn-pf-2001:db8::1-443"`
-	require.Equal(t, expectedV6, buildNftAddRuleCmd(ruleV6))
-}
-
-func TestIsNftTableOrChainNotExist(t *testing.T) {
-	require.False(t, isNftTableOrChainNotExist(nil))
-	require.False(t, isNftTableOrChainNotExist(errors.New("permission denied")))
-	require.True(t, isNftTableOrChainNotExist(errors.New("Error: No such file or directory")))
-	require.True(t, isNftTableOrChainNotExist(errors.New("table does not exist")))
+	expectedV6 := `-A KUBE-OVN-PF -d 2001:db8::1/128 -p tcp -m tcp --dport 443 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 500 --connlimit-mask 0 -m comment --comment "ovn-pf-2001:db8::1-443" -j DROP`
+	require.Equal(t, expectedV6, buildIptablesAddRuleCmd(ruleV6))
 }
 
 func TestParsePortForwardConnLimitRules(t *testing.T) {

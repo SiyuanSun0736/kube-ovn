@@ -18,7 +18,7 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-const nftGateComment = "ovn-pf-gate"
+const pfGateComment = "ovn-pf-gate"
 
 type portForwardKey struct {
 	ip   string
@@ -35,25 +35,32 @@ func (r portForwardConnLimitRule) key() portForwardKey {
 	return portForwardKey{ip: r.ip, port: r.port}
 }
 
-type nftRuleEntry struct {
-	handle  string
+type iptablesRuleEntry struct {
 	comment string
 	limit   int
 	raw     string
 }
 
-func nftRuleComment(ip string, port int32) string {
+func iptablesRuleComment(ip string, port int32) string {
 	return fmt.Sprintf("ovn-pf-%s-%d", ip, port)
 }
 
-func execNft(args ...string) ([]byte, error) {
-	cmd := exec.Command("nft", args...) // #nosec G204
+func execIptables(protocol string, args ...string) ([]byte, error) {
+	binary := "iptables"
+	if protocol == kubeovnv1.ProtocolIPv6 {
+		binary = "ip6tables"
+	}
+	cmd := exec.Command(binary, args...) // #nosec G204
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	return cmd.CombinedOutput()
 }
 
-func execNftScript(script string) ([]byte, error) {
-	cmd := exec.Command("nft", "-f", "-") // #nosec G204
+func execIptablesRestore(protocol, script string) ([]byte, error) {
+	binary := "iptables-restore"
+	if protocol == kubeovnv1.ProtocolIPv6 {
+		binary = "ip6tables-restore"
+	}
+	cmd := exec.Command(binary, "--noflush") // #nosec G204
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	cmd.Stdin = strings.NewReader(script)
 	return cmd.CombinedOutput()
@@ -69,56 +76,60 @@ func (c *Controller) getExternalInterface() string {
 	return c.config.Iface
 }
 
-func buildNftGateRule(extIface string) string {
+func buildIptablesGateRules(extIface string) []string {
+	rules := []string{
+		fmt.Sprintf("-A %s -i lo -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
+	}
 	if extIface != "" {
-		return fmt.Sprintf("insert rule inet %s %s iifname != %q return comment %q",
-			util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, extIface, nftGateComment)
+		rules = append(rules, fmt.Sprintf("-A %s ! -i %s -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, extIface, pfGateComment))
 	}
-	return fmt.Sprintf("insert rule inet %s %s iifname %q return comment %q",
-		util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, "lo", nftGateComment)
+	return rules
 }
 
-func buildNftAddRuleCmd(rule portForwardConnLimitRule) string {
-	ipFamily := "ip"
+func buildIptablesAddRuleCmd(rule portForwardConnLimitRule) string {
+	cidr := "/32"
 	if util.CheckProtocol(rule.ip) == kubeovnv1.ProtocolIPv6 {
-		ipFamily = "ip6"
+		cidr = "/128"
 	}
-	comment := nftRuleComment(rule.ip, rule.port)
-	return fmt.Sprintf("add rule inet %s %s %s daddr %s tcp dport %d tcp flags & (fin|syn|rst|ack) == syn ct count over %d counter drop comment %q",
-		util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, ipFamily, rule.ip, rule.port, rule.connLimit, comment)
+	comment := iptablesRuleComment(rule.ip, rule.port)
+	return fmt.Sprintf("-A %s -d %s%s -p tcp -m tcp --dport %d --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above %d --connlimit-mask 0 -m comment --comment %q -j DROP",
+		util.OvnPortForwardIptablesChain, rule.ip, cidr, rule.port, rule.connLimit, comment)
 }
 
-func parseNftChainRules(output string) []nftRuleEntry {
-	var entries []nftRuleEntry
+func parseIptablesChainRules(output string) []iptablesRuleEntry {
+	var entries []iptablesRuleEntry
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "table ") || strings.HasPrefix(line, "chain ") || line == "}" {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "-N ") {
 			continue
 		}
 
-		idxHandle := strings.LastIndex(line, "# handle ")
-		if idxHandle == -1 {
-			continue
-		}
-		handle := strings.TrimSpace(line[idxHandle+len("# handle "):])
-		if handle == "" {
+		if !strings.HasPrefix(line, "-A "+util.OvnPortForwardIptablesChain) {
 			continue
 		}
 
 		var comment string
-		if _, rem, found := strings.Cut(line, "comment "); found {
-			rem = strings.TrimSpace(rem)
-			if len(rem) > 0 && (rem[0] == '"' || rem[0] == '\'') {
-				quote := rem[0]
-				if end := strings.IndexByte(rem[1:], quote); end != -1 {
-					comment = rem[1 : end+1]
+		if idx := strings.Index(line, "--comment "); idx != -1 {
+			rem := strings.TrimSpace(line[idx+len("--comment "):])
+			if len(rem) > 0 {
+				if rem[0] == '"' || rem[0] == '\'' {
+					quote := rem[0]
+					if end := strings.IndexByte(rem[1:], quote); end != -1 {
+						comment = rem[1 : end+1]
+					}
+				} else {
+					fields := strings.Fields(rem)
+					if len(fields) > 0 {
+						comment = fields[0]
+					}
 				}
 			}
 		}
 
 		var limit int
-		if _, rem, found := strings.Cut(line, "ct count over "); found {
+		if idx := strings.Index(line, "--connlimit-above "); idx != -1 {
+			rem := strings.TrimSpace(line[idx+len("--connlimit-above "):])
 			fields := strings.Fields(rem)
 			if len(fields) > 0 {
 				if l, err := strconv.Atoi(fields[0]); err == nil {
@@ -127,8 +138,7 @@ func parseNftChainRules(output string) []nftRuleEntry {
 			}
 		}
 
-		entries = append(entries, nftRuleEntry{
-			handle:  handle,
+		entries = append(entries, iptablesRuleEntry{
 			comment: comment,
 			limit:   limit,
 			raw:     line,
@@ -137,8 +147,8 @@ func parseNftChainRules(output string) []nftRuleEntry {
 	return entries
 }
 
-func findNftRulesByComment(entries []nftRuleEntry, targetComment string) []nftRuleEntry {
-	var res []nftRuleEntry
+func findIptablesRulesByComment(entries []iptablesRuleEntry, targetComment string) []iptablesRuleEntry {
+	var res []iptablesRuleEntry
 	for _, e := range entries {
 		if e.comment == targetComment {
 			res = append(res, e)
@@ -147,67 +157,33 @@ func findNftRulesByComment(entries []nftRuleEntry, targetComment string) []nftRu
 	return res
 }
 
-func (c *Controller) listNftRules() ([]nftRuleEntry, error) {
-	out, err := execNft("-a", "list", "chain", "inet", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain)
+func (c *Controller) listIptablesRules(protocol string) ([]iptablesRuleEntry, error) {
+	out, err := execIptables(protocol, "-t", "mangle", "-S", util.OvnPortForwardIptablesChain)
 	if err != nil {
 		outStr := string(out)
-		if strings.Contains(outStr, "No such file or directory") || strings.Contains(outStr, "does not exist") {
-			return nil, fmt.Errorf("table or chain does not exist: %w", err)
+		if strings.Contains(outStr, "No chain/target/match by that name") || strings.Contains(outStr, "does a matching rule exist") {
+			return nil, fmt.Errorf("chain does not exist: %w", err)
 		}
-		return nil, fmt.Errorf("nft command failed: %w, out: %s", err, outStr)
+		return nil, fmt.Errorf("iptables -S failed: %w, out: %s", err, outStr)
 	}
-	return parseNftChainRules(string(out)), nil
+	return parseIptablesChainRules(string(out)), nil
 }
 
-func isNftTableOrChainNotExist(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "No such file or directory") || strings.Contains(msg, "does not exist")
-}
+func (c *Controller) ensureIptablesChain(protocol string) error {
+	// Check if jump exists in PREROUTING
+	_, err := execIptables(protocol, "-t", "mangle", "-C", "PREROUTING", "-j", util.OvnPortForwardIptablesChain)
+	if err != nil {
+		// Create chain if not exists (ignore error if already exists)
+		_, _ = execIptables(protocol, "-t", "mangle", "-N", util.OvnPortForwardIptablesChain)
 
-func (c *Controller) ensureNftTableAndChain() error {
-	out, err := execNft("-a", "list", "chain", "inet", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain)
-	extIface := c.getExternalInterface()
-	expectedGateMatch := fmt.Sprintf("iifname != %q", extIface)
-	if extIface == "" {
-		expectedGateMatch = `iifname "lo"`
-	}
-
-	if err == nil {
-		entries := parseNftChainRules(string(out))
-		gateMatched := findNftRulesByComment(entries, nftGateComment)
-		if len(entries) > 0 && entries[0].comment == nftGateComment && strings.Contains(entries[0].raw, expectedGateMatch) && len(gateMatched) == 1 {
-			return nil
+		// Insert jump at position 1 in PREROUTING
+		if out, insErr := execIptables(protocol, "-t", "mangle", "-I", "PREROUTING", "1", "-j", util.OvnPortForwardIptablesChain); insErr != nil {
+			klog.Errorf("failed to insert %s jump in mangle PREROUTING (protocol %s): %v, out: %s",
+				util.OvnPortForwardIptablesChain, protocol, insErr, string(out))
+			return insErr
 		}
-
-		// Gate rule is missing, outdated, or not at chain head. Clean up and insert at head.
-		var batch []string
-		for _, m := range gateMatched {
-			batch = append(batch, fmt.Sprintf("delete rule inet %s %s handle %s", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, m.handle))
-		}
-		batch = append(batch, buildNftGateRule(extIface))
-
-		if gateOut, gateErr := execNftScript(strings.Join(batch, "\n") + "\n"); gateErr != nil {
-			klog.Errorf("failed to update nft gate rule for interface %q: %v, out: %s", extIface, gateErr, string(gateOut))
-			return gateErr
-		}
-		klog.Infof("updated nft gate rule for interface %q at chain head", extIface)
-		return nil
+		klog.Infof("ensured %s chain and PREROUTING jump for protocol %s", util.OvnPortForwardIptablesChain, protocol)
 	}
-
-	gateRule := buildNftGateRule(extIface)
-	script := fmt.Sprintf(`add table inet %[1]s
-add chain inet %[1]s %[2]s { type filter hook prerouting priority -150; policy accept; }
-%[3]s
-`, util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, gateRule)
-
-	if initOut, initErr := execNftScript(script); initErr != nil {
-		klog.Errorf("failed to init nft table %s and chain %s: %v, out: %s", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, initErr, string(initOut))
-		return initErr
-	}
-	klog.Infof("initialized nft table %s and chain %s with gate rule (iface: %q)", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, extIface)
 	return nil
 }
 
@@ -286,91 +262,134 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 		return nil
 	}
 
+	// Group by protocol (IPv4 vs IPv6)
+	rulesByProtoOld := map[string][]portForwardConnLimitRule{
+		kubeovnv1.ProtocolIPv4: nil,
+		kubeovnv1.ProtocolIPv6: nil,
+	}
+	for _, r := range oldRules {
+		proto := kubeovnv1.ProtocolIPv4
+		if util.CheckProtocol(r.ip) == kubeovnv1.ProtocolIPv6 {
+			proto = kubeovnv1.ProtocolIPv6
+		}
+		rulesByProtoOld[proto] = append(rulesByProtoOld[proto], r)
+	}
+
+	rulesByProtoNew := map[string][]portForwardConnLimitRule{
+		kubeovnv1.ProtocolIPv4: nil,
+		kubeovnv1.ProtocolIPv6: nil,
+	}
+	for _, r := range newRules {
+		proto := kubeovnv1.ProtocolIPv4
+		if util.CheckProtocol(r.ip) == kubeovnv1.ProtocolIPv6 {
+			proto = kubeovnv1.ProtocolIPv6
+		}
+		rulesByProtoNew[proto] = append(rulesByProtoNew[proto], r)
+	}
+
+	extIface := c.getExternalInterface()
+
+	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
+		pOld := rulesByProtoOld[proto]
+		pNew := rulesByProtoNew[proto]
+		if len(pOld) == 0 && len(pNew) == 0 {
+			continue
+		}
+
+		if err := c.reconcileProtocolRules(proto, pOld, pNew, extIface); err != nil {
+			klog.Errorf("failed to reconcile port-forward connlimit rules for protocol %s: %v", proto, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules []portForwardConnLimitRule, extIface string) error {
 	oldMap := make(map[portForwardKey]portForwardConnLimitRule, len(oldRules))
 	for _, r := range oldRules {
 		oldMap[r.key()] = r
 	}
-
 	newMap := make(map[portForwardKey]portForwardConnLimitRule, len(newRules))
 	for _, r := range newRules {
 		newMap[r.key()] = r
 	}
 
-	// 1. Collect rules to delete (in old but not in new)
-	var toDelete []portForwardConnLimitRule
+	// Determine deleted and added/updated comments
+	toDeleteComments := make(map[string]bool)
 	for key, oldRule := range oldMap {
 		if _, exists := newMap[key]; !exists {
-			toDelete = append(toDelete, oldRule)
+			toDeleteComments[iptablesRuleComment(oldRule.ip, oldRule.port)] = true
 		}
 	}
 
-	// 2. Collect rules to add or update limit (in new but not in old, or limit changed)
-	var toAddOrUpdate []portForwardConnLimitRule
+	toAddOrUpdate := make(map[portForwardKey]portForwardConnLimitRule)
 	for key, newRule := range newMap {
 		oldRule, exists := oldMap[key]
 		if !exists || oldRule.connLimit != newRule.connLimit {
-			toAddOrUpdate = append(toAddOrUpdate, newRule)
+			toAddOrUpdate[key] = newRule
 		}
 	}
 
-	if len(toDelete) == 0 && len(toAddOrUpdate) == 0 {
+	if len(toDeleteComments) == 0 && len(toAddOrUpdate) == 0 {
 		return nil
 	}
 
-	// Ensure table and chain only when new rules need to be added
-	if len(toAddOrUpdate) > 0 {
-		if err := c.ensureNftTableAndChain(); err != nil {
-			return err
-		}
-	}
-
-	entries, err := c.listNftRules()
-	if err != nil {
-		if isNftTableOrChainNotExist(err) && len(toAddOrUpdate) == 0 {
-			return nil
-		}
-		klog.Errorf("failed to list nft rules for port-forward connlimit: %v", err)
+	if err := c.ensureIptablesChain(protocol); err != nil {
 		return err
 	}
 
-	// 3. Assemble atomic batch: deletes and adds in single transaction
-	var batch []string
-	for _, r := range toDelete {
-		comment := nftRuleComment(r.ip, r.port)
-		for _, m := range findNftRulesByComment(entries, comment) {
-			batch = append(batch, fmt.Sprintf("delete rule inet %s %s handle %s", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, m.handle))
-		}
-	}
+	entries, _ := c.listIptablesRules(protocol)
 
-	for _, r := range toAddOrUpdate {
-		comment := nftRuleComment(r.ip, r.port)
-		matched := findNftRulesByComment(entries, comment)
-		if len(matched) == 1 && matched[0].limit == r.connLimit {
-			klog.V(4).Infof("nft rule for %s:%d with limit %d already exists, preserving accounting match", r.ip, r.port, r.connLimit)
+	// Build new chain contents in atomic buffer
+	var lines []string
+	lines = append(lines, "*mangle")
+	lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
+	lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
+
+	// Re-insert gate rules at chain head
+	lines = append(lines, buildIptablesGateRules(extIface)...)
+
+	// Keep existing rules not belonging to toDeleteComments or toAddOrUpdate
+	for _, e := range entries {
+		if e.comment == "" || e.comment == pfGateComment {
 			continue
 		}
-		for _, m := range matched {
-			batch = append(batch, fmt.Sprintf("delete rule inet %s %s handle %s", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, m.handle))
+		if toDeleteComments[e.comment] {
+			continue
 		}
-		batch = append(batch, buildNftAddRuleCmd(r))
+		// If rule is being updated, don't keep old version
+		isUpdating := false
+		for _, r := range toAddOrUpdate {
+			if e.comment == iptablesRuleComment(r.ip, r.port) {
+				isUpdating = true
+				break
+			}
+		}
+		if !isUpdating {
+			lines = append(lines, e.raw)
+		}
 	}
 
-	if len(batch) == 0 {
-		return nil
+	// Append added/updated rules
+	for _, r := range toAddOrUpdate {
+		lines = append(lines, buildIptablesAddRuleCmd(r))
 	}
 
-	if out, err := execNftScript(strings.Join(batch, "\n") + "\n"); err != nil {
-		if isNftTableOrChainNotExist(err) && len(toAddOrUpdate) == 0 {
-			return nil
-		}
-		klog.Errorf("failed to apply nft port-forward connlimit batch (%d commands): %v, out: %s", len(batch), err, string(out))
+	lines = append(lines, "COMMIT\n")
+
+	script := strings.Join(lines, "\n")
+	if out, err := execIptablesRestore(protocol, script); err != nil {
+		klog.Errorf("failed to apply iptables port-forward connlimit restore script (protocol %s): %v, out: %s", protocol, err, string(out))
 		return err
 	}
-	klog.Infof("applied nft port-forward connlimit batch (%d commands) for service", len(batch))
+
+	klog.Infof("successfully applied iptables port-forward connlimit batch (protocol %s, adds=%d, dels=%d)",
+		protocol, len(toAddOrUpdate), len(toDeleteComments))
 	return nil
 }
 
-// gcPortForwardConnLimitRules scans current nftables rules and cleans up orphan rules
+// gcPortForwardConnLimitRules scans current iptables rules and cleans up orphan rules
 // whose comment starts with "ovn-pf-" but is no longer associated with any active Service.
 func (c *Controller) gcPortForwardConnLimitRules() {
 	if c == nil || c.servicesLister == nil {
@@ -386,37 +405,52 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 	activeComments := make(map[string]bool)
 	for _, svc := range svcs {
 		for _, r := range c.parsePortForwardConnLimitRules(svc) {
-			activeComments[nftRuleComment(r.ip, r.port)] = true
+			activeComments[iptablesRuleComment(r.ip, r.port)] = true
 		}
 	}
 
-	entries, err := c.listNftRules()
-	if err != nil {
-		return
-	}
+	extIface := c.getExternalInterface()
 
-	var toDelete []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != nftGateComment {
-			if !activeComments[e.comment] {
-				toDelete = append(toDelete, e.handle)
-				klog.Infof("found orphan port-forward connlimit rule %q (handle %s), queueing for deletion", e.comment, e.handle)
+	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
+		entries, err := c.listIptablesRules(proto)
+		if err != nil || len(entries) == 0 {
+			continue
+		}
+
+		hasOrphan := false
+		for _, e := range entries {
+			if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != pfGateComment {
+				if !activeComments[e.comment] {
+					hasOrphan = true
+					klog.Infof("found orphan port-forward connlimit rule %q in protocol %s, queueing for gc", e.comment, proto)
+				}
 			}
 		}
-	}
 
-	if len(toDelete) == 0 {
-		return
-	}
+		if !hasOrphan {
+			continue
+		}
 
-	var cmds []string
-	for _, h := range toDelete {
-		cmds = append(cmds, fmt.Sprintf("delete rule inet %s %s handle %s", util.OvnPortForwardNftTable, util.OvnPortForwardNftChain, h))
-	}
+		// Rebuild chain keeping only active rules
+		var lines []string
+		lines = append(lines, "*mangle")
+		lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
+		lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
+		lines = append(lines, buildIptablesGateRules(extIface)...)
 
-	if out, err := execNftScript(strings.Join(cmds, "\n") + "\n"); err != nil {
-		klog.Errorf("failed to garbage collect orphan port-forward connlimit rules (handles %v): %v, out: %s", toDelete, err, string(out))
-		return
+		for _, e := range entries {
+			if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != pfGateComment {
+				if activeComments[e.comment] {
+					lines = append(lines, e.raw)
+				}
+			}
+		}
+		lines = append(lines, "COMMIT\n")
+
+		if out, err := execIptablesRestore(proto, strings.Join(lines, "\n")); err != nil {
+			klog.Errorf("failed to garbage collect orphan port-forward connlimit rules (protocol %s): %v, out: %s", proto, err, string(out))
+			continue
+		}
+		klog.Infof("successfully garbage collected orphan port-forward connlimit rules for protocol %s", proto)
 	}
-	klog.Infof("successfully garbage collected %d orphan port-forward connlimit rules (handles %v)", len(toDelete), toDelete)
 }

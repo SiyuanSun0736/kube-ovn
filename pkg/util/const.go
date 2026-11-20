@@ -340,20 +340,19 @@ const (
 	NatPolicyRuleActionForward = "forward"
 	NatPolicyRuleIDLength      = 12
 
-	NAT                        = "nat"
-	Mangle                     = "mangle"
-	Raw                        = "raw"
-	Prerouting                 = "PREROUTING"
-	Postrouting                = "POSTROUTING"
-	Output                     = "OUTPUT"
-	OvnPrerouting              = "OVN-PREROUTING"
-	OvnPostrouting             = "OVN-POSTROUTING"
-	OvnOutput                  = "OVN-OUTPUT"
-	OvnMasquerade              = "OVN-MASQUERADE"
-	OvnNatOutGoingPolicy       = "OVN-NAT-POLICY"
-	OvnNatOutGoingPolicySubnet = "OVN-NAT-PSUBNET-"
-	OvnPortForwardNftTable     = "kube_ovn_pf"
-	OvnPortForwardNftChain     = "prerouting"
+	NAT                         = "nat"
+	Mangle                      = "mangle"
+	Raw                         = "raw"
+	Prerouting                  = "PREROUTING"
+	Postrouting                 = "POSTROUTING"
+	Output                      = "OUTPUT"
+	OvnPrerouting               = "OVN-PREROUTING"
+	OvnPostrouting              = "OVN-POSTROUTING"
+	OvnOutput                   = "OVN-OUTPUT"
+	OvnMasquerade               = "OVN-MASQUERADE"
+	OvnNatOutGoingPolicy        = "OVN-NAT-POLICY"
+	OvnNatOutGoingPolicySubnet  = "OVN-NAT-PSUBNET-"
+	OvnPortForwardIptablesChain = "KUBE-OVN-PF"
 
 	TProxyListenPort = 8102
 	TProxyRouteTable = 10001
