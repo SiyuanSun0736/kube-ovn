@@ -107,21 +107,25 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 	if err != nil {
 		return err
 	}
+	if len(fips) == 0 {
+		if fips, err = c.iptablesFipsLister.List(labels.Everything()); err != nil {
+			return err
+		}
+	}
 	snats, err := c.iptablesSnatRulesLister.List(gwSelector)
 	if err != nil {
 		return err
+	}
+	if len(snats) == 0 {
+		if snats, err = c.iptablesSnatRulesLister.List(labels.Everything()); err != nil {
+			return err
+		}
 	}
 	dnats, err := c.iptablesDnatRulesLister.List(gwSelector)
 	if err != nil {
 		return err
 	}
-	if len(fips) == 0 && len(snats) == 0 && len(dnats) == 0 {
-		if fips, err = c.iptablesFipsLister.List(labels.Everything()); err != nil {
-			return err
-		}
-		if snats, err = c.iptablesSnatRulesLister.List(labels.Everything()); err != nil {
-			return err
-		}
+	if len(dnats) == 0 {
 		if dnats, err = c.iptablesDnatRulesLister.List(labels.Everything()); err != nil {
 			return err
 		}
