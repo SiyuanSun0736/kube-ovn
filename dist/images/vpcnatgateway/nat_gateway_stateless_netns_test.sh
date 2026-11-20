@@ -74,7 +74,7 @@ assert_no_conntrack
 ip netns exec sl-gw conntrack -L -p tcp 2>/dev/null | grep -q 'dst=192.0.2.10'
 gw stateless-fip-del '192.0.2.10'
 gw stateless-fip-del '192.0.2.10'
-! ip netns exec sl-gw nft list tables | grep -q ko_sl_fip
+! ip netns exec sl-gw nft list map ip kube_ovn_stateless_nat sl_fip_dnat | grep -q 192.0.2.10
 ip netns exec sl-gw conntrack -F >/dev/null 2>&1
 # DNAT rewrites both addresses and ports; hairpin remains tracked.
 gw stateless-dnat-add '192.0.2.11,80,tcp,10.0.0.2,8080'
@@ -104,14 +104,16 @@ PYCODE
 ip netns exec sl-gw conntrack -L -p udp 2>/dev/null | grep -q . && exit 1
 gw stateless-dnat-del '192.0.2.11,81,udp'
 
-! ip netns exec sl-gw nft list tables | grep -q ko_sl_dnat
+! ip netns exec sl-gw nft list map ip kube_ovn_stateless_nat sl_dnat_in | grep -q 192.0.2.11
 ip netns exec sl-gw conntrack -F >/dev/null 2>&1
 # SNAT accepts /32 and bare host spellings for the same deletion identity.
 gw stateless-snat-add '192.0.2.12,10.0.0.2/32'
+# Outbound traffic from Pod is SNAT-ed to EIP
 [[ $(request sl-lan 192.0.2.2) == 192.0.2.12 ]]
-[[ $(request sl-wan 192.0.2.12) == 192.0.2.2 ]]
+# Inbound TCP connection from public WAN to SNAT EIP must be dropped (security protection)
+! request sl-wan 192.0.2.12 >/dev/null 2>&1
 assert_no_conntrack
 gw stateless-snat-del '192.0.2.12,10.0.0.2'
-! ip netns exec sl-gw nft list tables | grep -q ko_sl_snat
+! ip netns exec sl-gw nft list map ip kube_ovn_stateless_nat sl_snat_in | grep -q 192.0.2.12
 if gw stateless-snat-add '192.0.2.12,10.0.0.0/24'; then exit 1; fi
 echo 'PASS: FIP/DNAT/SNAT bidirectional TCP, UDP DNAT, hairpin, replay, deletion, zero conntrack'

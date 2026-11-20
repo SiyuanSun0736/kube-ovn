@@ -2549,34 +2549,9 @@ function eip_egress_qos_del() {
 }
 
 
-# ==============================================================================
-# 无状态 NAT（Stateless NAT / notrack）核心数据面实现
-#
-# 设计架构与原理说明：
-# 1. 独立表隔离设计：
-#    每个无状态映射规则独立拥有一张专属的 nftables 表（命名规范：ko_sl_<kind>_<eip>...）。
-#    将规则细化到专属表不仅杜绝了全局单表修改时的规则遍历与锁竞争，还能保证单条规则增删时以
-#    微秒级粒度执行 flush/delete，避免误伤或中断其他正在转发的网络连接。
-# 2. 绕过连接跟踪（Bypass Conntrack）：
-#    Linux conntrack 会在大量新建连接与高并发网络流时带来严重的 CPU 软中断锁竞争（nf_conntrack lock）
-#    和内存开销。无状态模式通过在 prerouting 链（priority -250）提前打上 notrack 标记，
-#    彻底绕过 conntrack 状态机，实现近乎原生软路由的高吞吐转发。
-# 3. 双向静态改写（Bidirectional Injective Rewriting）：
-#    由于无连接跟踪状态，内核无法自动识别回包并反向还原地址，因此每一个无状态规则必须成对
-#    下发“入向目的地址/端口改写”与“出向源地址/端口改写”。
-# 4. 发卡流量兼容（Hairpin NAT Compatibility）：
-#    对于 VPC 内部 Pod 访问同一网关绑定的 EIP（Hairpin 场景），报文若打上 notrack 会导致同子网
-#    后端直接回包给客户端，引发 TCP 握手被 RST。因此本脚本依然保留底层 iptables 发卡 NAT 链，
-#    由有状态的发卡规则接管 VPC 内部发卡互访流量。
-# ==============================================================================
+# 无状态 NAT（notrack）核心数据面：每个映射规则独立建表，双向地址与端口静态改写绕过 conntrack，发卡流量保留 iptables 处理。
 
-# stateless_ipv4 校验输入字符串是否为合法的标准 IPv4 点分十进制地址。
-# 校验逻辑：
-# 1. 正则匹配 4 段 1~3 位数字；
-# 2. 逐个 octet 拆解，显式拒绝以 '0' 开头但非单字符 '0' 的非法前导零字符串（如 010.x.x.x 会被 bash 误认为八进制）；
-# 3. 校验每个 octet 转为 10 进制整数后处于 0~255 的闭区间内。
-# 入参: $1 - 待校验的 IP 字符串
-# 返回: 0 表示合法 IPv4，1 表示非法
+# stateless_ipv4 校验输入是否为合法的标准 IPv4 点分十进制地址，拒绝非法前导零。
 function stateless_ipv4() {
     local value=$1 octet
     [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
@@ -2587,25 +2562,14 @@ function stateless_ipv4() {
     done
 }
 
-# stateless_port 校验输入字符串是否为合法的 4 层传输层数值端口号。
-# 校验逻辑：
-# 1. 正则匹配 1~5 位纯数字；
-# 2. 转为 10 进制整型后，校验是否落在 1 ~ 65535 范围内。
-# 入参: $1 - 待校验的端口字符串
-# 返回: 0 表示合法端口，1 表示非法
+# stateless_port 校验输入是否为合法的 4 层传输层端口号（1-65535）。
 function stateless_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
-# stateless_init 初始化无状态 NAT 所需的全局基础环境与 TCP MSS 钳制策略。
-# 详细步骤与设计细节：
-# 1. 幂等创建名为 `kube_ovn_stateless_nat` 的全局 IPv4 nftables 表。
-# 2. 在该表内创建 forward 链，挂载点为 hook forward，优先级为 mangle（priority -150）。
-# 3. 对所有标记为 `ct state untracked` 的 TCP SYN / RST 握手报文，强制执行 TCP MSS Clamping，
-#    将其最大报文段大小动态钳制为当前出接口路由的 MTU 大小（tcp option maxseg size set rt mtu）。
-#    这能有效规避 VPC 隧道外层封装（如 Geneve / VXLAN）导致的报文分片与 PMTU 黑洞问题。
+# stateless_init 初始化全局无状态表并针对 untracked 报文配置 TCP MSS 自动钳制。
 function stateless_init() {
-    # 与 HA 模式不同，无状态模式属于单机高性能数据面，不强依赖外部 CNI 或集群成员保活
+    # 与 HA 模式不同，无状态模式不依赖外部 CNI 或集群成员保活
     if ! nft list table ip kube_ovn_stateless_nat >/dev/null 2>&1; then
         nft add table ip kube_ovn_stateless_nat || return 1
     fi
@@ -2618,36 +2582,8 @@ add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn |
 NFT
 }
 
-# stateless_mapping_add 原子化添加单个双向无状态 NAT 映射规则（FIP/DNAT/SNAT）。
-#
-# 核心执行流程与技术细节：
-# 1. 参数解构与安全校验：
-#    - DNAT 格式: $rule = "eip,external_port,protocol,internal_ip,internal_port"
-#      校验协议为 tcp/udp，端口为合法范围，并强制做 10 进制整型转换（规避前导零导致的八进制混淆）。
-#    - SNAT 格式: $rule = "eip,internal_ip"（支持 10.0.0.2 或 10.0.0.2/32，自动剥离 /32）。
-#    - FIP 格式:  $rule = "eip,internal_ip"
-#    校验 EIP 和私网 IP 必须是合法单个 IPv4 主机地址，严禁带有任何多余参数或非法字符。
-# 2. 独立表名命名与规则片段构建：
-#    - 表名格式:
-#      * DNAT: ko_sl_dnat_<eip>_<protocol>_<external_port>（点替换为下划线）
-#      * SNAT: ko_sl_snat_<eip>_<internal_ip>
-#      * FIP:  ko_sl_fip_<eip>
-#    - 规则片段:
-#      * incoming: 入向匹配目的公网 EIP，打上 notrack 并将目的 IP/端口改写为私网目标。
-#      * outgoing: 出向匹配私网源 IP 及源端口。
-#      * reverse:  出向将源 IP 及源端口改写回公网 EIP 与外部端口。
-# 3. 发卡有状态兼容处理：
-#    调用底层 iptables 辅助函数（add_dnat / add_floating_ip）同步配置发卡 NAT 规则。
-#    通过子 shell 执行隔离其退出状态，防止幂等重放时中断整体 nft 流程。
-# 4. 单事务原子提交（Atomic nftables Transaction）：
-#    利用 `nft -f -` 将所有建表、建链、清空旧表及下发规则的命令封装在同一个内核事务中原子提交：
-#    - `hook prerouting priority -250`：必须早于 conntrack（priority -200），在此处将入向包与出向包
-#      打上 notrack 并完成入向 DNAT 改写。出向报文利用 `fib daddr oifname "$EXTERNAL_INTERFACE"`
-#      验证其路由出接口确实是外网卡才打 notrack，杜绝误伤 VPC 内网通信。
-#    - `hook postrouting priority 99`：早于常规源 NAT（priority 100），针对 `ct state untracked`
-#      的数据包执行出向 SNAT 改写（替换源 IP/端口）。
-# 5. 失败回滚机制：
-#    若单事务提交失败，立即在异常分支调用 `nft delete table` 清理残留的局部半状态表并返回 1。
+# stateless_mapping_add 原子添加单个双向无状态 NAT 映射规则（FIP/DNAT/SNAT）。
+# 通过单个 nft 事务同时下发正反向规则，并同步下发 iptables 发卡规则保证同 VPC 互访。
 function stateless_mapping_add() {
     check_inited
     local kind=$1 rule=$2 eip internal_ip external_port protocol internal_port extra
@@ -2668,47 +2604,36 @@ function stateless_mapping_add() {
         echo "Invalid stateless $kind IPv4 mapping: $rule (SNAT requires a host or /32)" >&2
         return 1
     fi
-    # 1. 确定该映射专属的独立 nftables 表名（每条规则一张独立表，互不影响且便于原子增删）
+    # 1. 专属独立表名：每条规则一张独立专属表，保证微秒级独立增删与故障隔离
     table="ko_sl_${kind}_${eip//./_}"
 
-    # 2. 初始基础规则片段构建：
-    # - incoming: 针对外网入向流量的匹配条件（目的 IP 为 EIP）
-    # - outgoing: 针对私网出向流量的匹配条件（源 IP 为内部私网 IP）
-    # - reverse:  针对私网出向流量的改写动作（将源 IP 逆向改写为公网 EIP）
+    # 2. 构造双向匹配与改写规则片段：
+    # - incoming: 外网入向匹配 EIP 打 notrack 并改写目的地址/端口
+    # - outgoing: 私网出向匹配内部源 IP 及源端口
+    # - reverse:  私网出向将源 IP 及源端口逆向改写回公网 EIP
     incoming="ip daddr $eip"
     outgoing="ip saddr $internal_ip"
     reverse="ip saddr set $eip"
     if [[ "$kind" == dnat ]]; then
-        # DNAT 模式：进一步追加传输层协议与端口
         table="${table}_${protocol}_${external_port}"
-        # 入向（外网 -> 私网）：匹配外部目的端口，标记 notrack 绕过 conntrack，同时将目的 IP/端口改写为内部目标
         incoming="$incoming $protocol dport $external_port notrack ip daddr set $internal_ip $protocol dport set $internal_port"
-        # 出向（私网 -> 外网）：匹配内部源端口
         outgoing="$outgoing $protocol sport $internal_port"
-        # 出向逆向改写：源端口改写回外部端口，与 reverse 中的源 IP 改写协同完成逆向还原
         reverse="$reverse $protocol sport set $external_port"
-        # 兼容配置发卡 iptables 规则，使 VPC 内部 Pod 访问公网 EIP 时仍可通过有状态发卡正常通信
+        # 3. 兼容配置发卡 iptables 规则，使同 VPC 互访走有状态路径（隔离退出码避免中断）
         (add_dnat "$rule") || return 1
     else
-        # FIP / SNAT 模式：无状态目的地址改写
-        # 入向（外网 -> 私网）：标记 notrack 绕过 conntrack，并将目的 IP 改写为内部私网 IP
         incoming="$incoming notrack ip daddr set $internal_ip"
         if [[ "$kind" == snat ]]; then
-            # SNAT 追加内部私网 IP 区分同一 EIP 的多条单主机 SNAT 规则
             table="${table}_${internal_ip//./_}"
         else
-            # FIP 模式配置发卡 iptables 规则
             (add_floating_ip "$rule") || return 1
         fi
     fi
 
-    # 3. 单事务原子提交（Atomic Transaction）：通过单个 nft -f 命令一次性下发双向规则，杜绝中间半状态。
-    # 规则说明：
-    # - prerouting 链 (priority -250)：早于内核 conntrack (priority -200)，使 notrack 与目的改写生效；
-    # - postrouting 链 (priority 99)：早于有状态源 NAT (priority 100)，优先处理无状态源改写；
-    # - 规则 1 [反向回包/入向请求改写]：来自外网网卡，匹配 EIP（及端口），打上 notrack 并改写目的 IP/端口为私网目标；
-    # - 规则 2 [正向出向请求匹配]：来自私网网卡，匹配私网源 IP，FIB 路由验证出接口确实是外网卡后打 notrack；
-    # - 规则 3 [正向出向请求改写]：在 postrouting 链对 untracked 报文将源 IP（及源端口）改写为公网 EIP。
+    # 4. 单事务原子提交双向规则（prerouting priority -250 与 postrouting priority 99）：
+    # - prerouting：先于内核 conntrack（priority -200），使 notrack 与目的改写生效
+    # - postrouting：先于有状态源 NAT（priority 100），对 untracked 报文执行出向源改写
+    # - FIB 路由验证：出向流量必须经由外网卡转发才打 notrack，杜绝误伤 VPC 内网通信
     if ! nft -f - <<NFT
 add table ip $table
 flush table ip $table
@@ -2725,23 +2650,9 @@ NFT
     fi
 }
 
-# stateless_mapping_del 安全且幂等地删除无状态 NAT 映射对应的专属 nftables 表及发卡规则。
-#
-# 核心执行流程与技术细节：
-# 1. 依据规则类型精确解析标识符并推导专属表名：
-#    - DNAT: 根据 EIP、协议和外部端口确定表名；
-#    - SNAT: 根据 EIP 和私网 IP 确定表名；
-#    - FIP:  根据 EIP 确定表名。
-# 2. 幂等防护与非严格容错：
-#    若入参格式非法（例如残留的子网段或非数字端口），视为无需清理并安全返回 0，确保垃圾回收流程永不阻塞。
-# 3. 原子删表：
-#    先查询当前系统存在的 nft 表，确认存在后执行 `nft delete table` 原子销毁整张表（瞬间移除该映射的全部双向规则）。
-# 4. 发卡规则同步清理：
-#    调用底层的 `del_floating_ip` 或 `del_dnat` 清理关联的 iptables 发卡 NAT 规则。
+# stateless_mapping_del 幂等删除无状态映射对应的专属 nftables 表及发卡规则。
 function stateless_mapping_del() {
     local kind=$1 rule=$2 eip port protocol internal_ip extra table
-
-    # 1. 解析参数并定位对应的专属 nftables 表名
     if [[ "$kind" == dnat ]]; then
         IFS=, read -r eip port protocol extra <<< "$rule"
         if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$port"; then
@@ -2761,20 +2672,17 @@ function stateless_mapping_del() {
         extra=""
         table="ko_sl_fip_${eip//./_}"
     fi
-
-    # 2. 参数合法性兜底（非法参数安全忽略，保证清理流程幂等不阻塞）
+    # 非法参数直接返回 0，确保垃圾回收流程幂等不阻塞
     if ! stateless_ipv4 "$eip" || [[ -n "$extra" ]]; then
         return 0
     fi
-
-    # 3. 校验 nft 状态并在确认存在后原子销毁整张专属表
+    # 校验 nft 状态并在确认存在后原子销毁整张专属表
     local tables
     tables=$(nft list tables) || return 1
     if grep -Fxq "table ip $table" <<< "$tables"; then
         nft delete table ip "$table" || return 1
     fi
-
-    # 4. 同步清理关联的 iptables 发卡 NAT 规则
+    # 同步清理关联的 iptables 发卡 NAT 规则
     case "$kind" in
         fip) (del_floating_ip "$eip") || return 1 ;;
         dnat) (del_dnat "$rule") || return 1 ;;
@@ -2782,28 +2690,17 @@ function stateless_mapping_del() {
     return 0
 }
 
-# stateless_fip_add 批量添加双向 1:1 无状态 Floating IP 映射规则。
-# 参数: 一个或多个规则字符串，格式为 "EIP,InternalIP"（例如 "192.0.2.1,10.0.0.2"）
+# stateless_fip_add 批量添加双向 1:1 无状态 Floating IP 映射规则
 function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mapping_add fip "$rule" || return 1; done; }
-
-# stateless_fip_del 批量删除双向 1:1 无状态 Floating IP 映射规则。
-# 参数: 一个或多个 EIP 字符串（例如 "192.0.2.1"）
+# stateless_fip_del 批量删除双向 1:1 无状态 Floating IP 映射规则
 function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
-
-# stateless_dnat_add 批量添加双向无状态端口转发（DNAT）映射规则。
-# 参数: 一个或多个规则字符串，格式为 "EIP,ExternalPort,Protocol,InternalIP,InternalPort"（例如 "192.0.2.11,80,tcp,10.0.0.2,8080"）
+# stateless_dnat_add 批量添加双向无状态端口转发（DNAT）映射规则
 function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
-
-# stateless_dnat_del 批量删除双向无状态端口转发（DNAT）映射规则。
-# 参数: 一个或多个三元组标识符，格式为 "EIP,ExternalPort,Protocol"（例如 "192.0.2.11,80,tcp"）
+# stateless_dnat_del 批量删除双向无状态端口转发（DNAT）映射规则
 function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
-
-# stateless_snat_add 批量添加双向无状态单主机 SNAT 映射规则。
-# 参数: 一个或多个规则字符串，格式为 "EIP,InternalIP" 或 "EIP,InternalIP/32"（例如 "192.0.2.2,10.0.0.4/32"）
+# stateless_snat_add 批量添加双向无状态单主机 SNAT 映射规则
 function stateless_snat_add() { local rule; for rule in "$@"; do stateless_mapping_add snat "$rule" || return 1; done; }
-
-# stateless_snat_del 批量删除双向无状态单主机 SNAT 映射规则。
-# 参数: 一个或多个规则字符串，格式为 "EIP,InternalIP"（例如 "192.0.2.2,10.0.0.4"）
+# stateless_snat_del 批量删除双向无状态单主机 SNAT 映射规则
 function stateless_snat_del() { local rule; for rule in "$@"; do stateless_mapping_del snat "$rule" || return 1; done; }
 
 opt=$1

@@ -6,7 +6,6 @@ trap 'rm -rf "$tmp_dir"' EXIT
 export NAT_GW_ENV_FILE="$tmp_dir/env"
 eval "$(sed '/^opt=\$1$/,$d' "$script")"
 # 拦截外部操作：单元测试中不触发特权网络命名空间改动
-# Mock nft 二进制：记录命令调用、模拟表查询并捕获规则批处理
 nft() {
     printf '%s\n' "$*" >> "$tmp_dir/calls"
     if [[ "$*" == 'list tables' ]]; then
@@ -15,7 +14,7 @@ nft() {
     if [[ "$*" == '-f -' ]]; then cat >> "$tmp_dir/batches"; fi
 }
 
-# Mock 发卡 iptables 函数：校验其是否与 nftables 事务协同执行
+# Mock 发卡 iptables 函数
 add_floating_ip() { echo "fip $*" >> "$tmp_dir/hairpin"; }
 del_floating_ip() { echo "del-fip $*" >> "$tmp_dir/hairpin"; }
 add_dnat() { echo "dnat $*" >> "$tmp_dir/hairpin"; }
