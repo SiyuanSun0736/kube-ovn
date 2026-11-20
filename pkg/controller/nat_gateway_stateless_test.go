@@ -164,14 +164,23 @@ func TestStatelessAndShareDnatConflicts(t *testing.T) {
 	}
 	require.NoError(t, dnatIndexer.Add(shareExisting))
 
-	// 1. Another share rule can share the same backend endpoint (multiple Services or snapshot update)
-	shareAnother := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-another"},
+	// 1. Another share rule with same backend endpoint is rejected due to reverse mapping ambiguity
+	shareAnotherConflict := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "share-another-conflict"},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8080", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
-	require.NoError(t, c.validateDnatRule(shareAnother))
+	require.Error(t, c.validateDnatRule(shareAnotherConflict))
+
+	// 1.1 Another share rule with different backend port is permitted
+	shareAnotherOk := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "share-another-ok"},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8081", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	require.NoError(t, c.validateDnatRule(shareAnotherOk))
 
 	// 2. A stateless DNAT rule CANNOT share the same backend with a share rule
 	statelessConflictBackend := &kubeovnv1.IptablesDnatRule{
