@@ -11,6 +11,22 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+// activeNatGatewayDataplaneMode 返回网关权威生效的 dataplaneMode。
+// 一旦网关已初始化（Status.DataplaneMode 非空，或已分配 ExternalSubnets/HairpinSNAT），Status 具备最高权威，
+// 任何未生效或被拒绝的 Spec.DataplaneMode 篡改均被屏蔽，严防数据面误分发。
+func activeNatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) (string, error) {
+	if gw == nil {
+		return "", nil
+	}
+	if gw.Status.DataplaneMode != "" {
+		return gw.Status.DataplaneMode, nil
+	}
+	if len(gw.Status.ExternalSubnets) > 0 || gw.Status.HairpinSNAT != "" {
+		return "", nil
+	}
+	return util.NatGatewayDataplaneMode(gw)
+}
+
 // natGatewayOperation 根据指定 VPC NAT 网关的 dataplaneMode 动态解析底层操作指令，查询失败时重新排队重试且严禁回退有状态。
 func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	if c == nil || c.vpcNatGatewayLister == nil {
@@ -20,12 +36,9 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get gateway %s for %s: %w", dp, operation, err)
 	}
-	mode, err := util.NatGatewayDataplaneMode(gw)
+	mode, err := activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		return "", err
-	}
-	if gw.Status.DataplaneMode != "" {
-		mode = gw.Status.DataplaneMode
 	}
 	if mode != util.NatDataplaneModeStatelessNft {
 		return operation, nil
@@ -63,12 +76,9 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 		}
 		return false, err
 	}
-	mode, err := util.NatGatewayDataplaneMode(gw)
+	mode, err := activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		return false, err
-	}
-	if gw.Status.DataplaneMode != "" {
-		mode = gw.Status.DataplaneMode
 	}
 	return mode == util.NatDataplaneModeStatelessNft, nil
 }
@@ -77,6 +87,7 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 type statelessMapping struct {
 	kind, name, eip, host, protocol, port, externalPort string
 	isShare                                             bool
+	isEstablished                                       bool
 }
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
@@ -134,50 +145,83 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 
 	var mappings []statelessMapping
 	for _, item := range fips {
+		appliedEip := item.Annotations[util.VpcEipAnnotation]
+		if appliedEip == "" {
+			appliedEip = item.Spec.EIP
+		}
+		appliedGw := item.Status.NatGwDp
+		if appliedGw == "" {
+			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
+		}
+		isEst := item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != ""
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
-			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP})
-			if item.Status.InternalIP != "" && item.Status.InternalIP != item.Spec.InternalIP {
-				mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Status.InternalIP})
-			}
+			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP, isEstablished: isEst})
+		}
+		if item.Status.InternalIP != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
+			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: appliedEip, host: item.Status.InternalIP, isEstablished: true})
 		}
 	}
 	for _, item := range snats {
+		appliedEip := item.Annotations[util.VpcEipAnnotation]
+		if appliedEip == "" {
+			appliedEip = item.Spec.EIP
+		}
+		appliedGw := item.Status.NatGwDp
+		if appliedGw == "" {
+			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
+		}
+		isEst := item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != ""
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
-			mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalCIDR})
-			if item.Status.InternalCIDR != "" && item.Status.InternalCIDR != item.Spec.InternalCIDR {
-				mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Status.InternalCIDR})
-			}
+			mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalCIDR, isEstablished: isEst})
+		}
+		if item.Status.InternalCIDR != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
+			mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: appliedEip, host: item.Status.InternalCIDR, isEstablished: true})
 		}
 	}
 	for _, item := range dnats {
+		appliedEip := item.Annotations[util.VpcEipAnnotation]
+		if appliedEip == "" {
+			appliedEip = item.Spec.EIP
+		}
+		appliedGw := item.Status.NatGwDp
+		if appliedGw == "" {
+			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
+		}
+		isEst := item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != ""
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			mappings = append(mappings, statelessMapping{
-				kind:         "DNAT",
-				name:         item.Name,
-				eip:          item.Spec.EIP,
-				host:         item.Spec.InternalIP,
-				protocol:     item.Spec.Protocol,
-				port:         item.Spec.InternalPort,
-				externalPort: item.Spec.ExternalPort,
-				isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+				kind:          "DNAT",
+				name:          item.Name,
+				eip:           item.Spec.EIP,
+				host:          item.Spec.InternalIP,
+				protocol:      item.Spec.Protocol,
+				port:          item.Spec.InternalPort,
+				externalPort:  item.Spec.ExternalPort,
+				isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+				isEstablished: isEst,
 			})
-			if item.Status.InternalIP != "" && (item.Status.InternalIP != item.Spec.InternalIP || item.Status.InternalPort != item.Spec.InternalPort) {
-				mappings = append(mappings, statelessMapping{
-					kind:         "DNAT",
-					name:         item.Name,
-					eip:          item.Spec.EIP,
-					host:         item.Status.InternalIP,
-					protocol:     item.Status.Protocol,
-					port:         item.Status.InternalPort,
-					externalPort: item.Status.ExternalPort,
-					isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
-				})
-			}
+		}
+		if item.Status.InternalIP != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
+			mappings = append(mappings, statelessMapping{
+				kind:          "DNAT",
+				name:          item.Name,
+				eip:           appliedEip,
+				host:          item.Status.InternalIP,
+				protocol:      item.Status.Protocol,
+				port:          item.Status.InternalPort,
+				externalPort:  item.Status.ExternalPort,
+				isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+				isEstablished: true,
+			})
 		}
 	}
 
 	for _, existing := range mappings {
-		if !gatewayEips[existing.eip] || (existing.kind == candidate.kind && existing.name == candidate.name) {
+		if (!gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
+			continue
+		}
+		// 已建立生效的映射在重放恢复时，不受未生效的新建冲突请求阻断
+		if candidate.isEstablished && !existing.isEstablished {
 			continue
 		}
 		// Stateful Share records (LoadBalancer Services) are handled by conntrack and nftable LB;

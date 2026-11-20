@@ -2638,15 +2638,17 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		return err
 	}
 	if dnatUsesEip(&dnat.Spec) {
+		isEstablished := dnat.Status.Ready || dnat.Status.V4ip != "" || dnat.Labels[util.EipUIDLabel] != ""
 		if err = c.validateStatelessMapping(dnat.Spec.EIP, statelessMapping{
-			kind:         "DNAT",
-			name:         dnat.Name,
-			eip:          dnat.Spec.EIP,
-			host:         dnat.Spec.InternalIP,
-			protocol:     dnat.Spec.Protocol,
-			port:         dnat.Spec.InternalPort,
-			externalPort: dnat.Spec.ExternalPort,
-			isShare:      dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			kind:          "DNAT",
+			name:          dnat.Name,
+			eip:           dnat.Spec.EIP,
+			host:          dnat.Spec.InternalIP,
+			protocol:      dnat.Spec.Protocol,
+			port:          dnat.Spec.InternalPort,
+			externalPort:  dnat.Spec.ExternalPort,
+			isShare:       dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			isEstablished: isEstablished,
 		}); err != nil {
 			klog.Errorf("validate stateless dnat rule %s: %v", dnat.Name, err)
 			return err
@@ -2679,7 +2681,14 @@ func (c *Controller) validateFipRule(fip *kubeovnv1.IptablesFIPRule) error {
 		klog.Error(err)
 		return err
 	}
-	if err = c.validateStatelessMapping(fip.Spec.EIP, statelessMapping{kind: "FIP", name: fip.Name, eip: fip.Spec.EIP, host: fip.Spec.InternalIP}); err != nil {
+	isEstablished := fip.Status.Ready || fip.Status.V4ip != "" || fip.Labels[util.EipUIDLabel] != ""
+	if err = c.validateStatelessMapping(fip.Spec.EIP, statelessMapping{
+		kind:          "FIP",
+		name:          fip.Name,
+		eip:           fip.Spec.EIP,
+		host:          fip.Spec.InternalIP,
+		isEstablished: isEstablished,
+	}); err != nil {
 		klog.Errorf("validate stateless fip rule %s: %v", fip.Name, err)
 		return err
 	}
@@ -2724,7 +2733,14 @@ func (c *Controller) validateSnatRule(snat *kubeovnv1.IptablesSnatRule) error {
 		klog.Error(err)
 		return err
 	}
-	if err = c.validateStatelessMapping(snat.Spec.EIP, statelessMapping{kind: "SNAT", name: snat.Name, eip: snat.Spec.EIP, host: snat.Spec.InternalCIDR}); err != nil {
+	isEstablished := snat.Status.Ready || snat.Status.V4ip != "" || snat.Labels[util.EipUIDLabel] != ""
+	if err = c.validateStatelessMapping(snat.Spec.EIP, statelessMapping{
+		kind:          "SNAT",
+		name:          snat.Name,
+		eip:           snat.Spec.EIP,
+		host:          snat.Spec.InternalCIDR,
+		isEstablished: isEstablished,
+	}); err != nil {
 		klog.Errorf("validate stateless snat rule %s: %v", snat.Name, err)
 		return err
 	}

@@ -373,7 +373,7 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 
 // getNatGwDataplaneMode 获取并校验指定 VPC NAT 网关的 DataplaneMode 配置。
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
-	mode, err := util.NatGatewayDataplaneMode(gw)
+	mode, err := activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		klog.Errorf("resolve dataplane mode for gateway %s: %v", gw.Name, err)
 	}
@@ -803,7 +803,7 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
 	}
 
-	dataplaneMode, err := util.NatGatewayDataplaneMode(gw)
+	dataplaneMode, err := activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		klog.Warningf("invalid dataplane mode for vpc nat gateway %s: %v, ignoring and fallback", key, err)
 		dataplaneMode = ""
