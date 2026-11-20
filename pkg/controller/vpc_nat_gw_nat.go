@@ -1077,15 +1077,6 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		err = fmt.Errorf("failed to get snat v4 internal cidr, original cidr is %s", snat.Spec.InternalCIDR)
 		return err
 	}
-	if isStateless, err := c.isStatelessNatGateway(eip.Spec.NatGwDp); err != nil {
-		klog.Errorf("gateway %s stateless SNAT rule %s check mode failed: %v", eip.Spec.NatGwDp, snat.Name, err)
-		return err
-	} else if isStateless {
-		if _, err := util.StatelessNATIPv4Host(v4Cidr); err != nil {
-			klog.Errorf("gateway %s stateless SNAT rule %s has invalid internalCIDR %s: %v", eip.Spec.NatGwDp, snat.Name, v4Cidr, err)
-			return err
-		}
-	}
 	// Add the finalizer **before** creating rules in Pod. If we added it after,
 	// the SNAT could be deleted after createSnatInPod but before the finalizer,
 	// leaving unmanaged iptables rules in the gateway pod.
@@ -2437,7 +2428,7 @@ func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 		klog.Errorf("gateway %s SNAT %s -> %s: %v", dp, internalCIDR, v4ip, err)
 		return err
 	}
-	if operation == "stateless-snat-add" {
+	if operation == natGwStatelessSnatAdd {
 		ip, err := util.StatelessNATIPv4Host(internalCIDR)
 		if err != nil {
 			klog.Errorf("gateway %s SNAT %s -> %s: %v", dp, internalCIDR, v4ip, err)
@@ -2489,7 +2480,7 @@ func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 		klog.Errorf("gateway %s operation %s: %v", dp, natGwSnatDel, err)
 		return err
 	}
-	if operation == "stateless-snat-del" {
+	if operation == natGwStatelessSnatDel {
 		if _, err := util.StatelessNATIPv4Host(internalCIDR); err != nil {
 			klog.Warningf("gateway %s stateless SNAT rule %s has invalid internalCIDR %s, skip pod cleanup", dp, v4ip, internalCIDR)
 			return nil
@@ -2627,13 +2618,14 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 	}
 	if dnatUsesEip(&dnat.Spec) {
 		if err = c.validateStatelessMapping(dnat.Spec.EIP, statelessMapping{
-			kind:     "DNAT",
-			name:     dnat.Name,
-			eip:      dnat.Spec.EIP,
-			host:     dnat.Spec.InternalIP,
-			protocol: dnat.Spec.Protocol,
-			port:     dnat.Spec.InternalPort,
-			isShare:  dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			kind:         "DNAT",
+			name:         dnat.Name,
+			eip:          dnat.Spec.EIP,
+			host:         dnat.Spec.InternalIP,
+			protocol:     dnat.Spec.Protocol,
+			port:         dnat.Spec.InternalPort,
+			externalPort: dnat.Spec.ExternalPort,
+			isShare:      dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
 		}); err != nil {
 			klog.Errorf("validate stateless dnat rule %s: %v", dnat.Name, err)
 			return err

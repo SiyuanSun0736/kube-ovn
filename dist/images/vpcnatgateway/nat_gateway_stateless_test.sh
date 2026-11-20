@@ -22,6 +22,7 @@ stateless_init
 grep -F 'add map ip kube_ovn_stateless_nat sl_fip_dnat' "$tmp_dir/batches"
 grep -F 'add map ip kube_ovn_stateless_nat sl_dnat_in' "$tmp_dir/batches"
 grep -F 'tcp flags & (syn | rst | ack) == syn drop' "$tmp_dir/batches"
+grep -F 'icmp type echo-request drop' "$tmp_dir/batches"
 
 stateless_fip_add '192.0.2.1,10.0.0.2'
 grep -F 'add element ip kube_ovn_stateless_nat sl_fip_dnat { 192.0.2.1 : 10.0.0.2 }' "$tmp_dir/batches"
@@ -45,6 +46,7 @@ grep -F 'add element ip kube_ovn_stateless_nat sl_snat_out { 10.0.0.4 : 192.0.2.
 
 stateless_snat_del '192.0.2.2,10.0.0.4'
 grep -Fx 'delete element ip kube_ovn_stateless_nat sl_snat_out { 10.0.0.4 }' "$tmp_dir/calls"
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_snat_in { 192.0.2.2 }' "$tmp_dir/calls"
 
 # Invalid deletion inputs must succeed as no-op and never block cleanup
 stateless_snat_del '192.0.2.2,10.0.0.0/24'

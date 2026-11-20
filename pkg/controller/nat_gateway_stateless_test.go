@@ -164,23 +164,23 @@ func TestStatelessAndShareDnatConflicts(t *testing.T) {
 	}
 	require.NoError(t, dnatIndexer.Add(shareExisting))
 
-	// 1. Another share rule with same backend endpoint is rejected due to reverse mapping ambiguity
-	shareAnotherConflict := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-another-conflict"},
+	// 1. Two stateful share rules with same backend endpoint are permitted (conntrack tracks individual sessions)
+	shareAnotherOk := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "share-another-ok"},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8080", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
-	require.Error(t, c.validateDnatRule(shareAnotherConflict))
+	require.NoError(t, c.validateDnatRule(shareAnotherOk))
 
 	// 1.1 Another share rule with different backend port is permitted
-	shareAnotherOk := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-another-ok"},
+	shareAnotherPortOk := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "share-another-port-ok"},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8081", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
-	require.NoError(t, c.validateDnatRule(shareAnotherOk))
+	require.NoError(t, c.validateDnatRule(shareAnotherPortOk))
 
 	// 2. A stateless DNAT rule CANNOT share the same backend with a share rule
 	statelessConflictBackend := &kubeovnv1.IptablesDnatRule{
@@ -208,6 +208,25 @@ func TestStatelessAndShareDnatConflicts(t *testing.T) {
 		},
 	}
 	require.NoError(t, c.validateDnatRule(statelessOk))
+
+	// 5. Exclusive DNAT rules on the same EIP CANNOT collide on externalPort
+	require.NoError(t, dnatIndexer.Add(statelessOk))
+	exclusivePortConflict := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "sl-port-conflict"},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip2", InternalIP: "10.0.0.4", Protocol: "tcp", InternalPort: "8082", ExternalPort: "8088",
+		},
+	}
+	require.Error(t, c.validateDnatRule(exclusivePortConflict))
+
+	// 5.1 Exclusive DNAT rules on the same EIP with distinct externalPort are allowed
+	exclusivePortOk := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "sl-port-ok"},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip2", InternalIP: "10.0.0.4", Protocol: "tcp", InternalPort: "8082", ExternalPort: "8089",
+		},
+	}
+	require.NoError(t, c.validateDnatRule(exclusivePortOk))
 }
 
 func TestStatelessGatewayRejectsTCPConnLimit(t *testing.T) {

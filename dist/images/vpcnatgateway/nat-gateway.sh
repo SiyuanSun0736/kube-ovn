@@ -2592,15 +2592,18 @@ flush chain ip kube_ovn_stateless_nat prerouting
 flush chain ip kube_ovn_stateless_nat forward
 flush chain ip kube_ovn_stateless_nat postrouting
 
-add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_snat_in tcp flags & (syn | rst | ack) == syn drop
-add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_fip_dnat notrack ip daddr set ip daddr map @sl_fip_dnat
-add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr map @sl_snat_in notrack ip daddr set ip daddr map @sl_snat_in
-add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" vmap meta l4proto . th dport . ip daddr map @sl_dnat_in
-add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" notrack
+add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr @sl_snat_in tcp flags & (syn | rst | ack) == syn drop
+add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr @sl_snat_in icmp type echo-request drop
+add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr @sl_fip_dnat notrack ip daddr set ip daddr map @sl_fip_dnat
+add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr @sl_snat_in notrack ip daddr set ip daddr map @sl_snat_in
+add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" meta l4proto . th dport . ip daddr vmap @sl_dnat_in
+add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" ip saddr @sl_fip_snat notrack
+add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" ip saddr @sl_snat_out notrack
+add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" meta l4proto . th sport . ip saddr @sl_dnat_out notrack
 add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
-add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr map @sl_fip_snat ip saddr set ip saddr map @sl_fip_snat
-add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr map @sl_snat_out ip saddr set ip saddr map @sl_snat_out
-add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked vmap meta l4proto . th sport . ip saddr map @sl_dnat_out
+add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr @sl_fip_snat ip saddr set ip saddr map @sl_fip_snat
+add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr @sl_snat_out ip saddr set ip saddr map @sl_snat_out
+add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked meta l4proto . th sport . ip saddr vmap @sl_dnat_out
 NFT
 }
 
@@ -2704,21 +2707,24 @@ function stateless_mapping_del() {
         (del_dnat "$rule") || return 1
     elif [[ "$kind" == fip ]]; then
         local int_ip
-        int_ip=$(nft list map ip kube_ovn_stateless_nat sl_fip_dnat 2>/dev/null | grep -F "$eip :" | awk '{print $3}')
+        int_ip=$(nft list map ip kube_ovn_stateless_nat sl_fip_dnat 2>/dev/null | awk -v eip="$eip" '{
+            for (i=1; i<=NF; i++) {
+                if ($i == eip && $(i+1) == ":") {
+                    val = $(i+2)
+                    gsub(/[,{} ]/, "", val)
+                    print val
+                    exit
+                }
+            }
+        }')
         nft "delete element ip kube_ovn_stateless_nat sl_fip_dnat { $eip }" >/dev/null 2>&1
         if [[ -n "$int_ip" ]]; then
             nft "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" >/dev/null 2>&1
         fi
         (del_floating_ip "$eip") || return 1
     elif [[ "$kind" == snat ]]; then
-        local eip_in
-        eip_in=$(nft list map ip kube_ovn_stateless_nat sl_snat_out 2>/dev/null | grep -F "$internal_ip :" | awk '{print $3}')
         nft "delete element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip }" >/dev/null 2>&1
-        if [[ -n "$eip_in" ]]; then
-            nft "delete element ip kube_ovn_stateless_nat sl_snat_in { $eip_in }" >/dev/null 2>&1
-        elif [[ -n "$eip" ]]; then
-            nft "delete element ip kube_ovn_stateless_nat sl_snat_in { $eip }" >/dev/null 2>&1
-        fi
+        nft "delete element ip kube_ovn_stateless_nat sl_snat_in { $eip }" >/dev/null 2>&1
     fi
     return 0
 }

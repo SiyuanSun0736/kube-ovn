@@ -56,8 +56,8 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 
 // statelessMapping 描述无状态规则的公私网选择器，无状态反向改写无法区分指向同一后端的多个公网身份。
 type statelessMapping struct {
-	kind, name, eip, host, protocol, port string
-	isShare                               bool
+	kind, name, eip, host, protocol, port, externalPort string
+	isShare                                             bool
 }
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
@@ -84,28 +84,47 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 	}
 	candidate.host = host
 
-	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	gwName := eip.Spec.NatGwDp
+	gwSelector := labels.SelectorFromSet(labels.Set{util.VpcNatGatewayNameLabel: gwName})
+
+	eips, err := c.iptablesEipsLister.List(gwSelector)
 	if err != nil {
 		return err
 	}
+	if len(eips) == 0 {
+		if eips, err = c.iptablesEipsLister.List(labels.Everything()); err != nil {
+			return err
+		}
+	}
 	gatewayEips := map[string]bool{}
 	for _, item := range eips {
-		if item.Spec.NatGwDp == eip.Spec.NatGwDp {
+		if item.Spec.NatGwDp == gwName || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			gatewayEips[item.Name] = true
 		}
 	}
 
-	fips, err := c.iptablesFipsLister.List(labels.Everything())
+	fips, err := c.iptablesFipsLister.List(gwSelector)
 	if err != nil {
 		return err
 	}
-	snats, err := c.iptablesSnatRulesLister.List(labels.Everything())
+	snats, err := c.iptablesSnatRulesLister.List(gwSelector)
 	if err != nil {
 		return err
 	}
-	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
+	dnats, err := c.iptablesDnatRulesLister.List(gwSelector)
 	if err != nil {
 		return err
+	}
+	if len(fips) == 0 && len(snats) == 0 && len(dnats) == 0 {
+		if fips, err = c.iptablesFipsLister.List(labels.Everything()); err != nil {
+			return err
+		}
+		if snats, err = c.iptablesSnatRulesLister.List(labels.Everything()); err != nil {
+			return err
+		}
+		if dnats, err = c.iptablesDnatRulesLister.List(labels.Everything()); err != nil {
+			return err
+		}
 	}
 
 	var mappings []statelessMapping
@@ -117,13 +136,14 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 	}
 	for _, item := range dnats {
 		mappings = append(mappings, statelessMapping{
-			kind:     "DNAT",
-			name:     item.Name,
-			eip:      item.Spec.EIP,
-			host:     item.Spec.InternalIP,
-			protocol: item.Spec.Protocol,
-			port:     item.Spec.InternalPort,
-			isShare:  item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			kind:         "DNAT",
+			name:         item.Name,
+			eip:          item.Spec.EIP,
+			host:         item.Spec.InternalIP,
+			protocol:     item.Spec.Protocol,
+			port:         item.Spec.InternalPort,
+			externalPort: item.Spec.ExternalPort,
+			isShare:      item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
 		})
 	}
 
@@ -131,23 +151,22 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		if !gatewayEips[existing.eip] || (existing.kind == candidate.kind && existing.name == candidate.name) {
 			continue
 		}
-		// Stateful Share records (LoadBalancer Services) only skip EIP exclusivity check;
-		// backend conflict check must still be performed to prevent reverse routing ambiguity.
+		// Stateful Share records (LoadBalancer Services) are handled by conntrack and nftable LB;
+		// they do not participate in stateless reverse routing, so two stateful share rules may
+		// reuse the same backend without conflict.
 		if existing.isShare && candidate.isShare {
-			existingHost, err := util.StatelessNATIPv4Host(existing.host)
-			if err != nil {
-				return fmt.Errorf("stateless gateway %s has invalid %s %s: %w", eip.Spec.NatGwDp, existing.kind, existing.name, err)
-			}
-			if existingHost == candidate.host && existing.protocol == candidate.protocol && existing.port == candidate.port {
-				return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", eip.Spec.NatGwDp, candidate.host, existing.kind, existing.name)
-			}
 			continue
 		}
 		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
-		// it only with other exclusive port DNAT rules. A stateless EIP cannot be shared with
-		// a stateful Share-DNAT rule.
-		if existing.eip == candidate.eip && (existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT") {
-			return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, existing.kind, existing.name)
+		// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
+		// shared with a stateful Share-DNAT rule.
+		if existing.eip == candidate.eip {
+			if existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT" {
+				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, existing.kind, existing.name)
+			}
+			if existing.protocol == candidate.protocol && existing.externalPort == candidate.externalPort {
+				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
+			}
 		}
 		existingHost, err := util.StatelessNATIPv4Host(existing.host)
 		if err != nil {
