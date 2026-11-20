@@ -7,6 +7,7 @@ ut:
 	bash dist/images/vpcnatgateway/nat_gateway_vip_test.sh
 	bash dist/images/vpcnatgateway/nat_gateway_lanvip_test.sh
 	bash dist/images/vpcnatgateway/nat_gateway_limiter_test.sh
+	bash dist/images/vpcnatgateway/nat_gateway_stateless_test.sh
 
 .PHONY: ovs-sandbox
 ovs-sandbox: clean-ovs-sandbox
