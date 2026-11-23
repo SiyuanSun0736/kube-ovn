@@ -237,7 +237,7 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 	}
 
 	for _, existing := range mappings {
-		if (!gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
+		if (existing.eip != "" && !gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
 			continue
 		}
 		// 已建立生效的映射在重放恢复时，不受未生效的新建冲突请求阻断
@@ -253,7 +253,7 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
 		// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
 		// shared with a stateful Share-DNAT rule.
-		if existing.eip == candidate.eip {
+		if existing.eip != "" && existing.eip == candidate.eip {
 			if existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT" {
 				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, existing.kind, existing.name)
 			}

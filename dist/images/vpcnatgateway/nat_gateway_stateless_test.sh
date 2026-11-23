@@ -126,4 +126,13 @@ if grep -qE "handle (5|6|7)" "$tmp_dir/del_calls"; then
     exit 1
 fi
 
+# 孤儿反向链 map key 端口提取测试（防将 '.' 误判为端口）
+test_elem_key="tcp . 8080 . 10.0.0.3"
+test_ip=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i}' <<< "$test_elem_key")
+test_port=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) print $i}' <<< "$test_elem_key")
+if [[ "$test_ip" != "10.0.0.3" || "$test_port" != "8080" ]]; then
+    echo "orphan map key parsing failed: got ip=$test_ip port=$test_port" >&2
+    exit 1
+fi
+
 echo 'stateless shell tests passed'

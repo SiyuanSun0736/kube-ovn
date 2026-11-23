@@ -2860,9 +2860,10 @@ function stateless_mapping_del() {
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $elem_key }" || return 1
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $elem_key }" || true
                 local orphan_int_ip orphan_int_port
-                orphan_int_ip=$(awk '{print $NF}' <<< "$elem_key")
-                orphan_int_port=$(awk '{print $(NF-1)}' <<< "$elem_key")
-                if [[ -n "$orphan_int_ip" && -n "$orphan_int_port" ]]; then
+                orphan_int_ip=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i}' <<< "$elem_key")
+                orphan_int_port=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) print $i}' <<< "$elem_key")
+                if [[ -n "$orphan_int_ip" && -n "$orphan_int_port" ]] && stateless_ipv4 "$orphan_int_ip" && stateless_port "$orphan_int_port"; then
+                    orphan_int_port=$((10#$orphan_int_port))
                     local orphan_out_icmp="sl_docmp_${orphan_int_ip//./_}"
                     nft_del_dnat_icmp_rules "$orphan_out_icmp" "$proto_num" "$orphan_int_port" 240
                     if ! nft list map ip kube_ovn_stateless_nat sl_dnat_out 2>/dev/null | grep -q "$orphan_int_ip"; then
