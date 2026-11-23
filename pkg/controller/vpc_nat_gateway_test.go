@@ -936,13 +936,16 @@ func TestSyncNatGwTCPConnLimit(t *testing.T) {
 
 	// 5. Stateless mode: pass dataplane mode to script and publish effective limit 0
 	calls = nil
-	gw.Status.TCPConnLimit = ptr.To(int32(0))
-	gw.Spec.TCPConnLimit = ptr.To(int32(15000))
-	gw.Spec.DataplaneMode = "stateless-nft"
-	require.NoError(t, fc.fakeInformers.vpcNatGwInformer.Informer().GetIndexer().Update(gw))
-	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, pod, false))
+	slGw := fakeGw("sl-gw")
+	slGw.Spec.TCPConnLimit = ptr.To(int32(15000))
+	slGw.Spec.DataplaneMode = "stateless-nft"
+	slPod := fakeNatGwPod("sl-gw", false)
+	_, err = ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Create(t.Context(), slGw, metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, fc.fakeInformers.vpcNatGwInformer.Informer().GetIndexer().Add(slGw))
+	require.NoError(t, ctrl.syncNatGwTCPConnLimit(slGw, slPod, true))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "0", "stateless-nft"}}, calls)
-	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), gw.Name, metav1.GetOptions{})
+	patchedGw, getErr := ctrl.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), slGw.Name, metav1.GetOptions{})
 	require.NoError(t, getErr)
 	require.Equal(t, ptr.To(int32(0)), patchedGw.Status.TCPConnLimit)
 	require.Equal(t, "stateless-nft", patchedGw.Status.DataplaneMode)
@@ -986,6 +989,7 @@ func TestSyncNatGwTCPConnLimit_ReplacedPodAndSkew(t *testing.T) {
 	// Case 2: Dataplane mode change triggers convergence
 	calls = nil
 	gw.Spec.DataplaneMode = "stateless-nft"
+	gw.Status.DataplaneMode = "stateless-nft"
 	require.NoError(t, fc.fakeInformers.vpcNatGwInformer.Informer().GetIndexer().Update(gw))
 	require.NoError(t, ctrl.syncNatGwTCPConnLimit(gw, newPod, false))
 	require.Equal(t, [][]string{{natGwTCPConnLimitSet, "0", "stateless-nft"}}, calls)
