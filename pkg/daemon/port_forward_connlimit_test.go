@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -40,24 +41,6 @@ func TestParseIptablesChainRules(t *testing.T) {
 
 	matchedNone := findIptablesRulesByComment(entries, "non-existent")
 	require.Empty(t, matchedNone)
-}
-
-func TestBuildIptablesAddRuleCmd(t *testing.T) {
-	ruleV4 := portForwardConnLimitRule{
-		ip:        "1.1.1.1",
-		port:      80,
-		connLimit: 100,
-	}
-	expectedV4 := `-A KUBE-OVN-PF -d 1.1.1.1/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 100 --connlimit-mask 0 -m comment --comment "ovn-pf-1.1.1.1-80" -j DROP`
-	require.Equal(t, expectedV4, buildIptablesAddRuleCmd(ruleV4))
-
-	ruleV6 := portForwardConnLimitRule{
-		ip:        "2001:db8::1",
-		port:      443,
-		connLimit: 500,
-	}
-	expectedV6 := `-A KUBE-OVN-PF -d 2001:db8::1/128 -p tcp -m tcp --dport 443 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 500 --connlimit-mask 0 -m comment --comment "ovn-pf-2001:db8::1-443" -j DROP`
-	require.Equal(t, expectedV6, buildIptablesAddRuleCmd(ruleV6))
 }
 
 func TestParsePortForwardConnLimitRules(t *testing.T) {
@@ -282,4 +265,20 @@ func TestBuildIptablesRuleSpec(t *testing.T) {
 		"-j", "DROP",
 	}
 	require.Equal(t, expectedV6, specV6)
+}
+
+func TestEnabledProtocols(t *testing.T) {
+	c := &Controller{}
+
+	c.protocol = kubeovnv1.ProtocolDual
+	require.Equal(t, []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6}, c.enabledProtocols())
+
+	c.protocol = kubeovnv1.ProtocolIPv4
+	require.Equal(t, []string{kubeovnv1.ProtocolIPv4}, c.enabledProtocols())
+
+	c.protocol = kubeovnv1.ProtocolIPv6
+	require.Equal(t, []string{kubeovnv1.ProtocolIPv6}, c.enabledProtocols())
+
+	var nilCtrl *Controller
+	require.Equal(t, []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6}, nilCtrl.enabledProtocols())
 }
