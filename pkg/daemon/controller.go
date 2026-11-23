@@ -202,8 +202,6 @@ func NewController(config *Configuration,
 		util.LogFatalAndExit(nil, "failed to wait for caches to sync")
 	}
 
-	controller.gcPortForwardConnLimitRules()
-
 	if _, err = providerNetworkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.enqueueAddProviderNetwork,
 		UpdateFunc: controller.enqueueUpdateProviderNetwork,
@@ -229,6 +227,13 @@ func NewController(config *Configuration,
 		UpdateFunc: controller.enqueueUpdateService,
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add service event handler")
+	}
+
+	for i := 0; i < 3; i++ {
+		if gcErr := controller.gcPortForwardConnLimitRules(); gcErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
 	}
 
 	if _, err = podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -1047,6 +1052,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	go wait.Until(c.loopTunnelCheck, 5*time.Second, stopCh)
 	go wait.Until(c.runAddOrUpdateProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runAddOrUpdateServicekWorker, time.Second, stopCh)
+	go wait.Until(c.gcPortForwardConnLimitRulesWorker, 3*time.Minute, stopCh)
 	go wait.Until(c.runDeleteProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runSubnetWorker, time.Second, stopCh)
 	go wait.Until(c.runUpdatePodWorker, time.Second, stopCh)

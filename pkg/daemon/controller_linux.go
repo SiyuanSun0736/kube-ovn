@@ -583,6 +583,7 @@ func (c *Controller) reconcileServices(event *serviceEvent) error {
 			svcName = oldService.Namespace + "/" + oldService.Name
 		}
 		klog.Errorf("failed to reconcile port-forward connlimit for service %s: %v", svcName, err)
+		return err
 	}
 
 	return nil

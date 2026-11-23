@@ -239,3 +239,47 @@ func TestExtractServicePublicIPs(t *testing.T) {
 	ips := extractServicePublicIPs(svc)
 	require.Equal(t, []string{"198.51.100.10", "198.51.100.20", "198.51.100.5"}, ips)
 }
+
+func TestBuildIptablesRuleSpec(t *testing.T) {
+	ruleV4 := portForwardConnLimitRule{
+		ip:        "1.2.3.4",
+		port:      80,
+		connLimit: 100,
+	}
+	specV4 := buildIptablesRuleSpec(ruleV4)
+	expectedV4 := []string{
+		"-d", "1.2.3.4/32",
+		"-p", "tcp",
+		"-m", "tcp",
+		"--dport", "80",
+		"--tcp-flags", "FIN,SYN,RST,ACK", "SYN",
+		"-m", "connlimit",
+		"--connlimit-above", "100",
+		"--connlimit-mask", "0",
+		"-m", "comment",
+		"--comment", "ovn-pf-1.2.3.4-80",
+		"-j", "DROP",
+	}
+	require.Equal(t, expectedV4, specV4)
+
+	ruleV6 := portForwardConnLimitRule{
+		ip:        "2001:db8::1",
+		port:      443,
+		connLimit: 500,
+	}
+	specV6 := buildIptablesRuleSpec(ruleV6)
+	expectedV6 := []string{
+		"-d", "2001:db8::1/128",
+		"-p", "tcp",
+		"-m", "tcp",
+		"--dport", "443",
+		"--tcp-flags", "FIN,SYN,RST,ACK", "SYN",
+		"-m", "connlimit",
+		"--connlimit-above", "500",
+		"--connlimit-mask", "0",
+		"-m", "comment",
+		"--comment", "ovn-pf-2001:db8::1-443",
+		"-j", "DROP",
+	}
+	require.Equal(t, expectedV6, specV6)
+}

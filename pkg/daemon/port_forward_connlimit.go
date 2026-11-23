@@ -64,6 +64,27 @@ func execIptablesRestore(protocol, script string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+func buildIptablesRuleSpec(rule portForwardConnLimitRule) []string {
+	cidr := "/32"
+	if util.CheckProtocol(rule.ip) == kubeovnv1.ProtocolIPv6 {
+		cidr = "/128"
+	}
+	comment := iptablesRuleComment(rule.ip, rule.port)
+	return []string{
+		"-d", fmt.Sprintf("%s%s", rule.ip, cidr),
+		"-p", "tcp",
+		"-m", "tcp",
+		"--dport", strconv.Itoa(int(rule.port)),
+		"--tcp-flags", "FIN,SYN,RST,ACK", "SYN",
+		"-m", "connlimit",
+		"--connlimit-above", strconv.Itoa(rule.connLimit),
+		"--connlimit-mask", "0",
+		"-m", "comment",
+		"--comment", comment,
+		"-j", "DROP",
+	}
+}
+
 func buildIptablesAddRuleCmd(rule portForwardConnLimitRule) string {
 	cidr := "/32"
 	if util.CheckProtocol(rule.ip) == kubeovnv1.ProtocolIPv6 {
@@ -72,6 +93,34 @@ func buildIptablesAddRuleCmd(rule portForwardConnLimitRule) string {
 	comment := iptablesRuleComment(rule.ip, rule.port)
 	return fmt.Sprintf("-A %s -d %s%s -p tcp -m tcp --dport %d --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above %d --connlimit-mask 0 -m comment --comment %q -j DROP",
 		util.OvnPortForwardIptablesChain, rule.ip, cidr, rule.port, rule.connLimit, comment)
+}
+
+func (c *Controller) deleteIptablesRule(protocol string, rule portForwardConnLimitRule) error {
+	spec := buildIptablesRuleSpec(rule)
+	args := append([]string{"-w", "5", "-t", "mangle", "-D", util.OvnPortForwardIptablesChain}, spec...)
+	out, err := execIptables(protocol, args...)
+	if err != nil {
+		outStr := string(out)
+		if strings.Contains(outStr, "does a matching rule exist") || strings.Contains(outStr, "No chain/target/match by that name") {
+			return nil
+		}
+		klog.Errorf("failed to delete port-forward connlimit rule %s:%d (protocol %s): %v, out: %s",
+			rule.ip, rule.port, protocol, err, outStr)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) addIptablesRule(protocol string, rule portForwardConnLimitRule) error {
+	spec := buildIptablesRuleSpec(rule)
+	args := append([]string{"-w", "5", "-t", "mangle", "-A", util.OvnPortForwardIptablesChain}, spec...)
+	out, err := execIptables(protocol, args...)
+	if err != nil {
+		klog.Errorf("failed to add port-forward connlimit rule %s:%d (protocol %s): %v, out: %s",
+			rule.ip, rule.port, protocol, err, string(out))
+		return err
+	}
+	return nil
 }
 
 func parseIptablesChainRules(output string) []iptablesRuleEntry {
@@ -136,7 +185,7 @@ func findIptablesRulesByComment(entries []iptablesRuleEntry, targetComment strin
 }
 
 func (c *Controller) listIptablesRules(protocol string) ([]iptablesRuleEntry, error) {
-	out, err := execIptables(protocol, "-t", "mangle", "-S", util.OvnPortForwardIptablesChain)
+	out, err := execIptables(protocol, "-w", "5", "-t", "mangle", "-S", util.OvnPortForwardIptablesChain)
 	if err != nil {
 		outStr := string(out)
 		if strings.Contains(outStr, "No chain/target/match by that name") || strings.Contains(outStr, "does a matching rule exist") {
@@ -233,6 +282,14 @@ func extractServicePublicIPs(svc *corev1.Service) []string {
 }
 
 func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev1.Service) error {
+	if oldService != nil && newService == nil && c != nil && c.servicesLister != nil {
+		// Distinguish subnet flow-removal events from true Service deletion
+		currentSvc, err := c.servicesLister.Services(oldService.Namespace).Get(oldService.Name)
+		if err == nil && currentSvc != nil {
+			newService = currentSvc
+		}
+	}
+
 	oldRules := c.parsePortForwardConnLimitRules(oldService)
 	newRules := c.parsePortForwardConnLimitRules(newService)
 
@@ -291,11 +348,11 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 		newMap[r.key()] = r
 	}
 
-	// Determine deleted and added/updated comments
-	toDeleteComments := make(map[string]bool)
+	// Determine deleted and added/updated rules
+	toDeleteRules := make(map[portForwardKey]portForwardConnLimitRule)
 	for key, oldRule := range oldMap {
 		if _, exists := newMap[key]; !exists {
-			toDeleteComments[iptablesRuleComment(oldRule.ip, oldRule.port)] = true
+			toDeleteRules[key] = oldRule
 		}
 	}
 
@@ -307,7 +364,7 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 		}
 	}
 
-	if len(toDeleteComments) == 0 && len(toAddOrUpdate) == 0 {
+	if len(toDeleteRules) == 0 && len(toAddOrUpdate) == 0 {
 		return nil
 	}
 
@@ -315,64 +372,57 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 		return err
 	}
 
-	entries, _ := c.listIptablesRules(protocol)
-
-	// Build new chain contents in atomic buffer
-	var lines []string
-	lines = append(lines, "*mangle")
-	lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
-	lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
-
-	// Keep existing rules not belonging to toDeleteComments or toAddOrUpdate
-	for _, e := range entries {
-		if e.comment == "" {
-			continue
-		}
-		if toDeleteComments[e.comment] {
-			continue
-		}
-		// If rule is being updated, don't keep old version
-		isUpdating := false
-		for _, r := range toAddOrUpdate {
-			if e.comment == iptablesRuleComment(r.ip, r.port) {
-				isUpdating = true
-				break
-			}
-		}
-		if !isUpdating {
-			lines = append(lines, e.raw)
-		}
-	}
-
-	// Append added/updated rules
-	for _, r := range toAddOrUpdate {
-		lines = append(lines, buildIptablesAddRuleCmd(r))
-	}
-
-	lines = append(lines, "COMMIT\n")
-
-	script := strings.Join(lines, "\n")
-	if out, err := execIptablesRestore(protocol, script); err != nil {
-		klog.Errorf("failed to apply iptables port-forward connlimit restore script (protocol %s): %v, out: %s", protocol, err, string(out))
+	entries, err := c.listIptablesRules(protocol)
+	if err != nil && !strings.Contains(err.Error(), "chain does not exist") {
+		klog.Errorf("failed to list iptables rules for protocol %s: %v", protocol, err)
 		return err
 	}
 
-	klog.Infof("successfully applied iptables port-forward connlimit batch (protocol %s, adds=%d, dels=%d)",
-		protocol, len(toAddOrUpdate), len(toDeleteComments))
+	// 1. Delete removed rules (incremental delete, preserving other services' rules and accounting)
+	for _, r := range toDeleteRules {
+		targetComment := iptablesRuleComment(r.ip, r.port)
+		for _, e := range entries {
+			if e.comment == targetComment {
+				delRule := portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit}
+				if delErr := c.deleteIptablesRule(protocol, delRule); delErr != nil {
+					return delErr
+				}
+			}
+		}
+	}
+
+	// 2. Add or update rules
+	for _, r := range toAddOrUpdate {
+		targetComment := iptablesRuleComment(r.ip, r.port)
+		for _, e := range entries {
+			if e.comment == targetComment {
+				delRule := portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit}
+				if delErr := c.deleteIptablesRule(protocol, delRule); delErr != nil {
+					return delErr
+				}
+			}
+		}
+		if addErr := c.addIptablesRule(protocol, r); addErr != nil {
+			return addErr
+		}
+	}
+
+	klog.Infof("successfully reconciled iptables port-forward connlimit rules (protocol %s, adds=%d, dels=%d)",
+		protocol, len(toAddOrUpdate), len(toDeleteRules))
 	return nil
 }
 
 // gcPortForwardConnLimitRules scans current iptables rules and cleans up orphan rules
 // whose comment starts with "ovn-pf-" but is no longer associated with any active Service.
-func (c *Controller) gcPortForwardConnLimitRules() {
+func (c *Controller) gcPortForwardConnLimitRules() error {
 	if c == nil || c.servicesLister == nil {
-		return
+		return nil
 	}
 
 	svcs, err := c.servicesLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list services for port-forward connlimit gc: %v", err)
-		return
+		return err
 	}
 
 	activeComments := make(map[string]bool)
@@ -384,43 +434,41 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 
 	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
 		entries, err := c.listIptablesRules(proto)
-		if err != nil || len(entries) == 0 {
-			continue
+		if err != nil {
+			if strings.Contains(err.Error(), "chain does not exist") {
+				continue
+			}
+			klog.Errorf("failed to list iptables rules for protocol %s during gc: %v", proto, err)
+			return err
 		}
 
-		hasOrphan := false
 		for _, e := range entries {
-			if strings.HasPrefix(e.comment, "ovn-pf-") {
-				if !activeComments[e.comment] {
-					hasOrphan = true
-					klog.Infof("found orphan port-forward connlimit rule %q in protocol %s, queueing for gc", e.comment, proto)
+			if strings.HasPrefix(e.comment, "ovn-pf-") && !activeComments[e.comment] {
+				commentBody := strings.TrimPrefix(e.comment, "ovn-pf-")
+				lastHyphen := strings.LastIndex(commentBody, "-")
+				if lastHyphen <= 0 {
+					continue
+				}
+				ip := commentBody[:lastHyphen]
+				portStr := commentBody[lastHyphen+1:]
+				port, parseErr := strconv.ParseInt(portStr, 10, 32)
+				if parseErr != nil {
+					continue
+				}
+				orphanRule := portForwardConnLimitRule{ip: ip, port: int32(port), connLimit: e.limit}
+				klog.Infof("found orphan port-forward connlimit rule %q in protocol %s, deleting", e.comment, proto)
+				if delErr := c.deleteIptablesRule(proto, orphanRule); delErr != nil {
+					klog.Errorf("failed to delete orphan rule %q (protocol %s): %v", e.comment, proto, delErr)
+					return delErr
 				}
 			}
 		}
+	}
+	return nil
+}
 
-		if !hasOrphan {
-			continue
-		}
-
-		// Rebuild chain keeping only active rules
-		var lines []string
-		lines = append(lines, "*mangle")
-		lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
-		lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
-
-		for _, e := range entries {
-			if strings.HasPrefix(e.comment, "ovn-pf-") {
-				if activeComments[e.comment] {
-					lines = append(lines, e.raw)
-				}
-			}
-		}
-		lines = append(lines, "COMMIT\n")
-
-		if out, err := execIptablesRestore(proto, strings.Join(lines, "\n")); err != nil {
-			klog.Errorf("failed to garbage collect orphan port-forward connlimit rules (protocol %s): %v, out: %s", proto, err, string(out))
-			continue
-		}
-		klog.Infof("successfully garbage collected orphan port-forward connlimit rules for protocol %s", proto)
+func (c *Controller) gcPortForwardConnLimitRulesWorker() {
+	if err := c.gcPortForwardConnLimitRules(); err != nil {
+		klog.Errorf("failed to garbage collect orphan port-forward connlimit rules: %v", err)
 	}
 }
