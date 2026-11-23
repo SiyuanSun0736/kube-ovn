@@ -2764,7 +2764,7 @@ function stateless_mapping_del() {
                 out_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$out_chain" 2>/dev/null)
                 if [[ -z "$out_rules" ]] || grep -qE "ip saddr set ${eip//./\\.}(\$|[ ;])" <<< "$out_rules"; then
                     nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" || return 1
-                    if ! nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | grep -qE "sl_fip_snat.*elements = .*([ .]|^)${int_ip//./\\.}[ :;]"; then
+                    if ! nft get element ip kube_ovn_stateless_nat sl_fip_snat "{ $int_ip }" >/dev/null 2>&1; then
                         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
                     fi
                     nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
@@ -2781,7 +2781,7 @@ function stateless_mapping_del() {
             elem_key=$(nft_find_map_key_by_target sl_fip_snat "$orphan_fout")
             if [[ -n "$elem_key" ]]; then
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $elem_key }" || return 1
-                if ! nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | grep -qE "sl_fip_snat.*elements = .*([ .]|^)${elem_key//./\\.}[ :;]"; then
+                if ! nft get element ip kube_ovn_stateless_nat sl_fip_snat "{ $elem_key }" >/dev/null 2>&1; then
                     nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $elem_key }" || true
                 fi
             fi

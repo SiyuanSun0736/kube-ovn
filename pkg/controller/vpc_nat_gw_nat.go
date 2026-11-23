@@ -2370,6 +2370,7 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 
 // createDnatInPod 向指定的 VPC NAT 网关 Pod 下发创建 DNAT 规则指令（无状态模式下规整端口并路由至 stateless-dnat-add）。
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
+	protocol = strings.ToLower(protocol)
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
 		klog.Errorf("failed to get nat gw pod, %v", err)
@@ -2393,6 +2394,7 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 
 // deleteDnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 DNAT 规则指令（无状态模式下规整端口并路由至 stateless-dnat-del）。
 func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string, internal ...string) error {
+	protocol = strings.ToLower(protocol)
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.

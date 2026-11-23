@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -97,6 +98,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		return fmt.Errorf("stateless gateway %s %s %s: %w", gwName, candidate.kind, candidate.name, err)
 	}
 	candidate.host = host
+	candidate.protocol = strings.ToLower(candidate.protocol)
 
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
@@ -160,7 +162,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 				name:          item.Name,
 				eip:           item.Spec.EIP,
 				host:          item.Spec.InternalIP,
-				protocol:      item.Spec.Protocol,
+				protocol:      strings.ToLower(item.Spec.Protocol),
 				port:          item.Spec.InternalPort,
 				externalPort:  item.Spec.ExternalPort,
 				isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
@@ -174,7 +176,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 					name:          item.Name,
 					eip:           appliedEip,
 					host:          item.Status.InternalIP,
-					protocol:      item.Status.Protocol,
+					protocol:      strings.ToLower(item.Status.Protocol),
 					port:          item.Status.InternalPort,
 					externalPort:  item.Status.ExternalPort,
 					isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,

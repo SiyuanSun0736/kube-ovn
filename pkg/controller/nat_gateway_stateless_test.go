@@ -209,6 +209,18 @@ func TestStatelessAndShareDnatConflicts(t *testing.T) {
 		},
 	}
 	require.NoError(t, c.validateDnatRule(exclusivePortOk))
+
+	// 5.2 Case-insensitive protocol matching detects conflict even if protocol is uppercase
+	candidateUpperProtocol := statelessMapping{
+		kind:         "DNAT",
+		name:         "sl-port-upper-conflict",
+		eip:          "eip2",
+		host:         "10.0.0.4",
+		protocol:     "TCP",
+		port:         "8082",
+		externalPort: "8088",
+	}
+	require.Error(t, c.validateStatelessMapping("gw", candidateUpperProtocol))
 }
 
 func TestStatelessGatewayRejectsTCPConnLimit(t *testing.T) {
