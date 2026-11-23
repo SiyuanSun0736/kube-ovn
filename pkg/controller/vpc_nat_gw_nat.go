@@ -2432,7 +2432,7 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string, in
 	return nil
 }
 
-// createSnatInPod 向指定的 VPC NAT 网关 Pod 下发创建 SNAT 规则指令（无状态模式下校验单主机 IP 并路由至 stateless-snat-add）。
+// createSnatInPod 向指定的 VPC NAT 网关 Pod 下发创建 SNAT 规则指令。
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2442,37 +2442,24 @@ func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	var rules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
 
-	operation, err := c.natGatewayOperation(dp, natGwSnatAdd)
+	version, err := c.getIptablesVersion(gwPod)
 	if err != nil {
-		klog.Errorf("gateway %s SNAT %s -> %s: %v", dp, internalCIDR, v4ip, err)
-		return err
+		version = "1.0.0"
+		klog.Warningf("failed to checking iptables version, assuming version at least %s: %v", version, err)
 	}
-	if operation == natGwStatelessSnatAdd {
-		ip, err := util.StatelessNATIPv4Host(internalCIDR)
-		if err != nil {
-			klog.Errorf("gateway %s SNAT %s -> %s: %v", dp, internalCIDR, v4ip, err)
-			return err
-		}
-		rule = fmt.Sprintf("%s,%s", v4ip, ip)
-	} else {
-		version, err := c.getIptablesVersion(gwPod)
-		if err != nil {
-			version = "1.0.0"
-			klog.Warningf("failed to checking iptables version, assuming version at least %s: %v", version, err)
-		}
-		if util.CompareVersion(version, "1.6.2") >= 1 {
-			rule = fmt.Sprintf("%s,%s", rule, "--random-fully")
-		}
+	if util.CompareVersion(version, "1.6.2") >= 1 {
+		rule = fmt.Sprintf("%s,%s", rule, "--random-fully")
 	}
+
 	rules = append(rules, rule)
-	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, rules); err != nil {
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, natGwSnatAdd, rules); err != nil {
 		klog.Errorf("failed to apply gateway %s EIP %s internalCIDR %s: %v", dp, v4ip, internalCIDR, err)
 		return err
 	}
 	return nil
 }
 
-// deleteSnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 SNAT 规则指令（无状态模式下路由至 stateless-snat-del）。
+// deleteSnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 SNAT 规则指令。
 func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2494,24 +2481,11 @@ func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 		}
 		return err
 	}
-	operation, err := c.natGatewayOperation(dp, natGwSnatDel)
-	if err != nil {
-		klog.Errorf("gateway %s operation %s: %v", dp, natGwSnatDel, err)
-		return err
-	}
-	if operation == natGwStatelessSnatDel {
-		ip, err := util.StatelessNATIPv4Host(internalCIDR)
-		if err != nil {
-			klog.Warningf("gateway %s stateless SNAT rule %s has invalid internalCIDR %s, skip pod cleanup", dp, v4ip, internalCIDR)
-			return nil
-		}
-		internalCIDR = ip
-	}
 	// del nat
 	var delRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
 	delRules = append(delRules, rule)
-	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, delRules); err != nil {
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, natGwSnatDel, delRules); err != nil {
 		klog.Errorf("failed to apply gateway %s EIP %s internalCIDR %s: %v", dp, v4ip, internalCIDR, err)
 		return err
 	}
@@ -2637,17 +2611,16 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		klog.Error(err)
 		return err
 	}
-	if dnatUsesEip(&dnat.Spec) {
-		eip, err := c.iptablesEipsLister.Get(dnat.Spec.EIP)
-		if err != nil {
-			if k8serrors.IsNotFound(err) {
-				return nil
-			}
-			return err
+	targetGw := dnat.Labels[util.VpcNatGatewayNameLabel]
+	if targetGw == "" {
+		targetGw = dnat.Status.NatGwDp
+	}
+	if targetGw == "" && dnatUsesEip(&dnat.Spec) {
+		if eip, err := c.iptablesEipsLister.Get(dnat.Spec.EIP); err == nil && eip != nil && eip.DeletionTimestamp.IsZero() {
+			targetGw = eip.Spec.NatGwDp
 		}
-		if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
-			return nil
-		}
+	}
+	if targetGw != "" {
 		appliedEip := dnat.Annotations[util.VpcEipAnnotation]
 		if appliedEip == "" {
 			appliedEip = dnat.Spec.EIP
@@ -2658,7 +2631,7 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 			dnat.Spec.ExternalPort == dnat.Status.ExternalPort &&
 			dnat.Spec.Protocol == dnat.Status.Protocol &&
 			dnat.Spec.EIP == appliedEip
-		if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
+		if err = c.validateStatelessMapping(targetGw, statelessMapping{
 			kind:          "DNAT",
 			name:          dnat.Name,
 			eip:           dnat.Spec.EIP,
@@ -2765,32 +2738,6 @@ func (c *Controller) validateSnatRule(snat *kubeovnv1.IptablesSnatRule) error {
 	if util.CheckProtocol(internalCIDR) != kubeovnv1.ProtocolIPv4 {
 		err = fmt.Errorf("%s: internalCIDR %q must be IPv4, IPv6 is not supported", snat.Name, internalCIDR)
 		klog.Error(err)
-		return err
-	}
-	eip, err := c.iptablesEipsLister.Get(snat.Spec.EIP)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
-		return nil
-	}
-	appliedEip := snat.Annotations[util.VpcEipAnnotation]
-	if appliedEip == "" {
-		appliedEip = snat.Spec.EIP
-	}
-	isEstablished := (snat.Status.Ready || snat.Status.V4ip != "" || snat.Labels[util.EipUIDLabel] != "") &&
-		snat.Spec.InternalCIDR == snat.Status.InternalCIDR && snat.Spec.EIP == appliedEip
-	if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
-		kind:          "SNAT",
-		name:          snat.Name,
-		eip:           snat.Spec.EIP,
-		host:          snat.Spec.InternalCIDR,
-		isEstablished: isEstablished,
-	}); err != nil {
-		klog.Errorf("validate stateless snat rule %s: %v", snat.Name, err)
 		return err
 	}
 	return nil

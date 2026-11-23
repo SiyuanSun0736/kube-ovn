@@ -93,7 +93,6 @@ function show_help() {
     echo "  stateless-init           - Initialize stateless IPv4 forwarding and TCP MSS clamping"
     echo "  stateless-fip-add/del    - Add/delete a bidirectional IPv4 FIP mapping"
     echo "  stateless-dnat-add/del   - Add/delete a bidirectional TCP/UDP port mapping"
-    echo "  stateless-snat-add/del   - Add/delete a bidirectional host-only SNAT mapping (drops WAN TCP SYN/Ping; UDP/other traffic is 1:1 bidirectional)"
     echo "  qos-add                  - Add QoS rule"
     echo "  qos-del                  - Delete QoS rule"
     echo "  eip-ingress-qos-add      - Add EIP ingress QoS"
@@ -2600,11 +2599,10 @@ function nft_find_map_key_by_target() {
 }
 
 # stateless_init 初始化全局无状态表、Map 容器及基础 Hook 链，开销恒定为 1 对 Hook。
-# - 入向防外网主动针对 SNAT EIP 发起 TCP SYN 探测 Pod 端口
-# - 入向 FIP/SNAT 查 map 改写目的 IP 并打 notrack，DNAT vmap 分发至子链改写端口与 IP
-# - 出向严格仅对已建立无状态映射（FIP/SNAT/DNAT）的报文打 notrack，避免破坏有状态 Service 回包
+# - 入向 FIP 查 map 改写目的 IP 并打 notrack，DNAT vmap 分发至子链改写端口与 IP
+# - 出向严格仅对已建立无状态映射（FIP/DNAT）的报文打 notrack，避免破坏有状态 Service/SNAT 回包
 # - Forward 链执行 TCP MSS 自动钳制
-# - 出向 FIP/SNAT 查 map 改写源 IP，DNAT vmap 分发至子链反向改写端口与源 IP
+# - 出向 FIP 查 map 改写源 IP，DNAT vmap 分发至子链反向改写端口与源 IP
 function stateless_init() {
     check_inited
     nft -f - <<NFT
@@ -2618,8 +2616,6 @@ add set ip kube_ovn_stateless_nat sl_notrack_tuples { type inet_proto . inet_ser
 
 add map ip kube_ovn_stateless_nat sl_fip_dnat { type ipv4_addr : verdict; }
 add map ip kube_ovn_stateless_nat sl_fip_snat { type ipv4_addr : verdict; }
-add map ip kube_ovn_stateless_nat sl_snat_in  { type ipv4_addr : verdict; }
-add map ip kube_ovn_stateless_nat sl_snat_out { type ipv4_addr : verdict; }
 add map ip kube_ovn_stateless_nat sl_dnat_in  { type inet_proto . inet_service . ipv4_addr : verdict; }
 add map ip kube_ovn_stateless_nat sl_dnat_out { type inet_proto . inet_service . ipv4_addr : verdict; }
 
@@ -2628,18 +2624,16 @@ flush chain ip kube_ovn_stateless_nat forward
 flush chain ip kube_ovn_stateless_nat postrouting
 
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr vmap @sl_fip_dnat
-add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" ip daddr vmap @sl_snat_in
 add rule ip kube_ovn_stateless_nat prerouting iifname "$EXTERNAL_INTERFACE" meta l4proto . th dport . ip daddr vmap @sl_dnat_in
 add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" ip saddr @sl_notrack_ips notrack
 add rule ip kube_ovn_stateless_nat prerouting iifname "$VPC_INTERFACE" fib daddr oifname "$EXTERNAL_INTERFACE" meta l4proto . th sport . ip saddr @sl_notrack_tuples notrack
 add rule ip kube_ovn_stateless_nat forward ct state untracked tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
 add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr vmap @sl_fip_snat
-add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked ip saddr vmap @sl_snat_out
 add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname "$EXTERNAL_INTERFACE" ct state untracked meta l4proto . th sport . ip saddr vmap @sl_dnat_out
 NFT
 }
 
-# stateless_mapping_add 原子添加单个双向无状态 NAT 映射规则（FIP/DNAT/SNAT）。
+# stateless_mapping_add 原子添加单个双向无状态 NAT 映射规则（FIP/DNAT）。
 # 通过单表内向对应 map/vmap 注入元素并下发 iptables 发卡规则保证同 VPC 互访。
 function stateless_mapping_add() {
     check_inited
@@ -2654,10 +2648,9 @@ function stateless_mapping_add() {
         internal_port=$((10#$internal_port))
     else
         IFS=, read -r eip internal_ip extra <<< "$rule"
-        if [[ "$kind" == snat ]]; then internal_ip=${internal_ip%/32}; fi
     fi
     if [[ -n "$extra" ]] || ! stateless_ipv4 "$eip" || ! stateless_ipv4 "$internal_ip"; then
-        echo "Invalid stateless $kind IPv4 mapping: $rule (SNAT requires a host or /32)" >&2
+        echo "Invalid stateless $kind IPv4 mapping: $rule" >&2
         return 1
     fi
 
@@ -2699,29 +2692,6 @@ NFT
             return 1
         fi
         (add_floating_ip "$rule") || return 1
-    elif [[ "$kind" == snat ]]; then
-        # 无状态 SNAT 安全语义说明：
-        # 在 notrack 无状态转发下无连接跟踪状态，入向通过主动 drop 外部发起的 TCP SYN 与 Ping (echo-request)
-        # 阻断外部恶意主动建联；非 SYN 的 TCP 回包及 UDP 等无状态报文出入向为 1:1 双向映射。
-        local in_chain="sl_sin_${eip//./_}"
-        local out_chain="sl_sout_${internal_ip//./_}"
-        if ! nft -f - <<NFT
-add table ip kube_ovn_stateless_nat
-add chain ip kube_ovn_stateless_nat $in_chain
-flush chain ip kube_ovn_stateless_nat $in_chain
-add rule ip kube_ovn_stateless_nat $in_chain tcp flags & (syn | rst | ack) == syn drop
-add rule ip kube_ovn_stateless_nat $in_chain icmp type echo-request drop
-add rule ip kube_ovn_stateless_nat $in_chain notrack ip daddr set $internal_ip
-add chain ip kube_ovn_stateless_nat $out_chain
-flush chain ip kube_ovn_stateless_nat $out_chain
-add rule ip kube_ovn_stateless_nat $out_chain ip saddr set $eip
-add element ip kube_ovn_stateless_nat sl_snat_in { $eip : jump $in_chain }
-add element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip : jump $out_chain }
-add element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }
-NFT
-        then
-            return 1
-        fi
     fi
 }
 
@@ -2734,12 +2704,6 @@ function stateless_mapping_del() {
             return 0
         fi
         port=$((10#$port))
-    elif [[ "$kind" == snat ]]; then
-        IFS=, read -r eip internal_ip extra <<< "$rule"
-        internal_ip=${internal_ip%/32}
-        if ! stateless_ipv4 "$internal_ip"; then
-            return 0
-        fi
     else
         eip=$rule
         extra=""
@@ -2772,7 +2736,7 @@ function stateless_mapping_del() {
         fi
         # 兜底：若 in_chain 已先被删除或提取失败，根据反向规则特征扫描并清理残留的 sl_dout_* 链与 map 元素（严格匹配协议、EIP与端口，防跨协议或前缀误删）
         local orphan_chain
-        for orphan_chain in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v proto="$protocol" -v e="$eip" -v p="$port" '
+        for orphan_chain in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v proto="$protocol" -v e="${eip//./\\.}" -v p="$port" '
           $1 == "chain" && $2 ~ ("^sl_dout_" proto "_") { cur = $2 }
           cur && $0 ~ ("ip saddr set " e " " proto " sport set " p "($|[ ;])") { print cur; cur = "" }
         '); do
@@ -2800,14 +2764,16 @@ function stateless_mapping_del() {
                 out_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$out_chain" 2>/dev/null)
                 if [[ -z "$out_rules" ]] || grep -qE "ip saddr set ${eip//./\\.}(\$|[ ;])" <<< "$out_rules"; then
                     nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" || return 1
-                    nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
+                    if ! nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | grep -qE "sl_fip_snat.*elements = .*([ .]|^)${int_ip//./\\.}[ :;]"; then
+                        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
+                    fi
                     nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
                 fi
             fi
         fi
         # 兜底：若 in_chain 已先被删除或提取失败，根据反向规则特征扫描并清理残留的 sl_fout_* 链与 map 元素（严格精确匹配 EIP 地址）
         local orphan_fout
-        for orphan_fout in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v e="$eip" '
+        for orphan_fout in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v e="${eip//./\\.}" '
           $1 == "chain" && $2 ~ /^sl_fout_/ { cur = $2 }
           cur && $0 ~ ("ip saddr set " e "($|[ ;])") { print cur; cur = "" }
         '); do
@@ -2815,28 +2781,15 @@ function stateless_mapping_del() {
             elem_key=$(nft_find_map_key_by_target sl_fip_snat "$orphan_fout")
             if [[ -n "$elem_key" ]]; then
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $elem_key }" || return 1
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $elem_key }" || true
+                if ! nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | grep -qE "sl_fip_snat.*elements = .*([ .]|^)${elem_key//./\\.}[ :;]"; then
+                    nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $elem_key }" || true
+                fi
             fi
             nft_del_safe "delete chain ip kube_ovn_stateless_nat $orphan_fout" || return 1
         done
         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_dnat { $eip }" || return 1
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
         (del_floating_ip "$eip") || return 1
-    elif [[ "$kind" == snat ]]; then
-        # 无状态 SNAT 安全语义说明：
-        # 在 notrack 无状态转发下无连接跟踪状态，入向通过主动 drop 外部发起的 TCP SYN 与 Ping (echo-request)
-        # 阻断外部恶意主动建联；非 SYN 的 TCP 回包及 UDP 等无状态报文出入向为 1:1 双向映射。
-        local in_chain="sl_sin_${eip//./_}"
-        local out_chain="sl_sout_${internal_ip//./_}"
-        local out_rules
-        out_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$out_chain" 2>/dev/null)
-        if [[ -z "$out_rules" ]] || grep -qE "ip saddr set $eip(\$|[ ;])" <<< "$out_rules"; then
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_snat_out { $internal_ip }" || return 1
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }" || true
-            nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
-        fi
-        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_snat_in { $eip }" || return 1
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
     fi
     return 0
 }
@@ -2845,8 +2798,6 @@ function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mappin
 function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
 function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
 function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
-function stateless_snat_add() { local rule; for rule in "$@"; do stateless_mapping_add snat "$rule" || return 1; done; }
-function stateless_snat_del() { local rule; for rule in "$@"; do stateless_mapping_del snat "$rule" || return 1; done; }
 
 opt=$1
 shift
@@ -2856,8 +2807,6 @@ case $opt in
     stateless-fip-del) stateless_fip_del "$@" ;;
     stateless-dnat-add) stateless_dnat_add "$@" ;;
     stateless-dnat-del) stateless_dnat_del "$@" ;;
-    stateless-snat-add) stateless_snat_add "$@" ;;
-    stateless-snat-del) stateless_snat_del "$@" ;;
     init)
         # get user interfaces if provided from input
         # Use "$*" so manual invocations like `init net1, net2` (with whitespace

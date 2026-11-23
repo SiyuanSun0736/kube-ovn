@@ -88,8 +88,8 @@ type VpcNatGatewaySpec struct {
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
 	// DataplaneMode specifies whether the NAT gateway operates in stateless data plane mode.
 	// Valid value is "stateless-nft". Unset or empty indicates default stateful mode.
-	// In stateless mode, SNAT mappings operate statelessly without conntrack: WAN-initiated TCP SYN and
-	// ICMP Echo-Request packets are dropped, but UDP and other non-SYN traffic operate bidirectionally.
+	// In stateless mode, FIP and exclusive DNAT mappings operate statelessly without conntrack,
+	// while SNAT and hairpin traffic retain stateful conntrack handling.
 	// Once initialized, dataplaneMode is immutable; delete and recreate the gateway to switch mode.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Enum="";stateless-nft

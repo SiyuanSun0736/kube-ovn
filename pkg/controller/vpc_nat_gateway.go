@@ -63,8 +63,6 @@ const (
 	natGwStatelessFipDel  = "stateless-fip-del"
 	natGwStatelessDnatAdd = "stateless-dnat-add"
 	natGwStatelessDnatDel = "stateless-dnat-del"
-	natGwStatelessSnatAdd = "stateless-snat-add"
-	natGwStatelessSnatDel = "stateless-snat-del"
 
 	// The two states of the lanIP fallback the gateway script accepts, also the values recorded
 	// in VpcNatGatewayStatus.HairpinSNAT.
@@ -529,14 +527,16 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
-	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft {
-		pod, podErr := c.getNatGwPod(key, c.natGwNamespace(gw))
-		isEstablished := (podErr == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "")
-		if isEstablished {
-			err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
-			klog.Error(err)
-			return err
+	isEstablished := gw.Status.HairpinSNAT != ""
+	if !isEstablished && c.podsLister != nil {
+		if pod, podErr := c.getNatGwPod(key, c.natGwNamespace(gw)); podErr == nil && pod != nil {
+			isEstablished = pod.Annotations[util.VpcNatGatewayInitAnnotation] != ""
 		}
+	}
+	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft && isEstablished {
+		err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
+		klog.Error(err)
+		return err
 	}
 	// 无状态模式（notrack）绕过 conntrack，不支持配置 tcpConnLimit
 	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {

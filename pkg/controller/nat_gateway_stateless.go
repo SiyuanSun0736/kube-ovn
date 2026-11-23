@@ -12,21 +12,13 @@ import (
 )
 
 // activeNatGatewayDataplaneMode 返回网关权威生效的 dataplaneMode。
-// 一旦网关已通过 handleInitVpcNatGw 完成数据面初始化，其模式具有绝对权威，屏蔽任何未生效的 Spec 篡改；
-// 若网关仍在初始化前（新建网关），则以 Spec 期望的模式为准。
+// 若 Status 已记录模式则以 Status 为准；未同步或初始化前直接以 Spec 期望模式为准。
 func (c *Controller) activeNatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) (string, error) {
 	if gw == nil {
 		return "", nil
 	}
 	if gw.Status.DataplaneMode != "" {
 		return gw.Status.DataplaneMode, nil
-	}
-	if c != nil && c.podsLister != nil {
-		pod, err := c.getNatGwPod(gw.Name, c.natGwNamespace(gw))
-		if err == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "" {
-			// Pod 已经完成了初始化流程，且 Status.DataplaneMode 为空，表明其为已初始化的默认 stateful 网关
-			return "", nil
-		}
 	}
 	return util.NatGatewayDataplaneMode(gw)
 }
@@ -56,10 +48,6 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 		return natGwStatelessDnatAdd, nil
 	case natGwDnatDel:
 		return natGwStatelessDnatDel, nil
-	case natGwSnatAdd:
-		return natGwStatelessSnatAdd, nil
-	case natGwSnatDel:
-		return natGwStatelessSnatDel, nil
 	default:
 		return operation, nil
 	}
@@ -125,10 +113,6 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 	if err != nil {
 		return err
 	}
-	snats, err := c.iptablesSnatRulesLister.List(labels.Everything())
-	if err != nil {
-		return err
-	}
 	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
 	if err != nil {
 		return err
@@ -152,26 +136,6 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if item.Status.InternalIP != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
 			if !specEstablished {
 				mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: appliedEip, host: item.Status.InternalIP, isEstablished: true})
-			}
-		}
-	}
-	for _, item := range snats {
-		appliedEip := item.Annotations[util.VpcEipAnnotation]
-		if appliedEip == "" {
-			appliedEip = item.Spec.EIP
-		}
-		appliedGw := item.Status.NatGwDp
-		if appliedGw == "" {
-			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
-		}
-		specEstablished := (item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != "") &&
-			item.Spec.InternalCIDR == item.Status.InternalCIDR && item.Spec.EIP == appliedEip
-		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
-			mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalCIDR, isEstablished: specEstablished})
-		}
-		if item.Status.InternalCIDR != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
-			if !specEstablished {
-				mappings = append(mappings, statelessMapping{kind: "SNAT", name: item.Name, eip: appliedEip, host: item.Status.InternalCIDR, isEstablished: true})
 			}
 		}
 	}
@@ -234,7 +198,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if existing.isShare && candidate.isShare {
 			continue
 		}
-		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
+		// FIP consumes the entire public address; exclusive port DNAT may share
 		// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
 		// shared with a stateful Share-DNAT rule.
 		if existing.eip != "" && existing.eip == candidate.eip {

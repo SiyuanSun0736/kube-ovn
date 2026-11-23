@@ -29,7 +29,11 @@ func TestNatGatewayOperation(t *testing.T) {
 	gw = gw.DeepCopy()
 	gw.Spec.DataplaneMode = util.NatDataplaneModeStatelessNft
 	require.NoError(t, indexer.Update(gw))
-	for op, want := range map[string]string{natGwSubnetFipAdd: "stateless-fip-add", natGwSubnetFipDel: "stateless-fip-del", natGwDnatAdd: "stateless-dnat-add", natGwDnatDel: "stateless-dnat-del", natGwSnatAdd: "stateless-snat-add", natGwSnatDel: "stateless-snat-del"} {
+	for op, want := range map[string]string{
+		natGwSubnetFipAdd: "stateless-fip-add", natGwSubnetFipDel: "stateless-fip-del",
+		natGwDnatAdd: "stateless-dnat-add", natGwDnatDel: "stateless-dnat-del",
+		natGwSnatAdd: natGwSnatAdd, natGwSnatDel: natGwSnatDel,
+	} {
 		got, err := c.natGatewayOperation("gw", op)
 		require.NoError(t, err)
 		require.Equal(t, want, got)
@@ -75,51 +79,14 @@ func TestInitVpcNatGwFailsOnInvalidDataplaneMode(t *testing.T) {
 	require.Contains(t, err.Error(), "unsupported dataplaneMode")
 }
 
-func TestStatelessSnatRequiresSingleHost(t *testing.T) {
-	gwIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	snatIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	c := &Controller{
-		vpcNatGatewayLister:     listers.NewVpcNatGatewayLister(gwIndexer),
-		iptablesEipsLister:      listers.NewIptablesEIPLister(eipIndexer),
-		iptablesSnatRulesLister: listers.NewIptablesSnatRuleLister(snatIndexer),
-		iptablesFipsLister:      listers.NewIptablesFIPRuleLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
-		iptablesDnatRulesLister: listers.NewIptablesDnatRuleLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
-	}
-	gw := &kubeovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: "gw"}, Spec: kubeovnv1.VpcNatGatewaySpec{DataplaneMode: util.NatDataplaneModeStatelessNft}}
-	require.NoError(t, gwIndexer.Add(gw))
-	eip := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip"}, Spec: kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"}}
-	require.NoError(t, eipIndexer.Add(eip))
-
-	for _, tt := range []struct {
-		cidr    string
-		invalid bool
-	}{
-		{"10.0.0.2", false},
-		{"10.0.0.2/32", false},
-		{"10.0.0.0/24", true},
-		{"2001:db8::1/128", true},
-	} {
-		snat := &kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "snat"}, Spec: kubeovnv1.IptablesSnatRuleSpec{EIP: "eip", InternalCIDR: tt.cidr}}
-		err := c.validateSnatRule(snat)
-		if tt.invalid {
-			require.Error(t, err)
-		} else {
-			require.NoError(t, err)
-		}
-	}
-}
-
 func TestStatelessMappingConflicts(t *testing.T) {
 	gwIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	snatIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	fipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	dnatIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	c := &Controller{
 		vpcNatGatewayLister:     listers.NewVpcNatGatewayLister(gwIndexer),
 		iptablesEipsLister:      listers.NewIptablesEIPLister(eipIndexer),
-		iptablesSnatRulesLister: listers.NewIptablesSnatRuleLister(snatIndexer),
 		iptablesFipsLister:      listers.NewIptablesFIPRuleLister(fipIndexer),
 		iptablesDnatRulesLister: listers.NewIptablesDnatRuleLister(dnatIndexer),
 	}
@@ -130,8 +97,8 @@ func TestStatelessMappingConflicts(t *testing.T) {
 	other := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "other"}, Spec: kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"}}
 	require.NoError(t, eipIndexer.Add(other))
 
-	existing := &kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "existing"}, Spec: kubeovnv1.IptablesSnatRuleSpec{EIP: "eip", InternalCIDR: "10.0.0.2/32"}}
-	require.NoError(t, snatIndexer.Add(existing))
+	existing := &kubeovnv1.IptablesFIPRule{ObjectMeta: metav1.ObjectMeta{Name: "existing"}, Spec: kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.2"}}
+	require.NoError(t, fipIndexer.Add(existing))
 
 	for _, tt := range []struct {
 		name, eip, host string
@@ -142,8 +109,8 @@ func TestStatelessMappingConflicts(t *testing.T) {
 		{"new", "other", "10.0.0.3", false},
 		{"existing", "eip", "10.0.0.2", false},
 	} {
-		rule := &kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: tt.name}, Spec: kubeovnv1.IptablesSnatRuleSpec{EIP: tt.eip, InternalCIDR: tt.host}}
-		err := c.validateSnatRule(rule)
+		rule := &kubeovnv1.IptablesFIPRule{ObjectMeta: metav1.ObjectMeta{Name: tt.name}, Spec: kubeovnv1.IptablesFIPRuleSpec{EIP: tt.eip, InternalIP: tt.host}}
+		err := c.validateFipRule(rule)
 		if tt.invalid {
 			require.Error(t, err)
 		} else {
