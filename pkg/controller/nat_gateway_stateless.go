@@ -21,6 +21,9 @@ func (c *Controller) activeNatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) 
 	if gw.Status.DataplaneMode != "" {
 		return gw.Status.DataplaneMode, nil
 	}
+	if gw.Status.TCPConnLimit != nil || gw.Status.HairpinSNAT != "" {
+		return "", nil
+	}
 	if c != nil && c.podsLister != nil {
 		pod, err := c.getNatGwPod(gw.Name, c.natGwNamespace(gw))
 		if err == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "" {

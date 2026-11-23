@@ -93,7 +93,7 @@ function show_help() {
     echo "  stateless-init           - Initialize stateless IPv4 forwarding and TCP MSS clamping"
     echo "  stateless-fip-add/del    - Add/delete a bidirectional IPv4 FIP mapping"
     echo "  stateless-dnat-add/del   - Add/delete a bidirectional TCP/UDP port mapping"
-    echo "  stateless-snat-add/del   - Add/delete a bidirectional host-only SNAT mapping"
+    echo "  stateless-snat-add/del   - Add/delete a bidirectional host-only SNAT mapping (drops WAN TCP SYN/Ping; UDP/other traffic is 1:1 bidirectional)"
     echo "  qos-add                  - Add QoS rule"
     echo "  qos-del                  - Delete QoS rule"
     echo "  eip-ingress-qos-add      - Add EIP ingress QoS"
@@ -2765,6 +2765,9 @@ NFT
         fi
         (add_floating_ip "$rule") || return 1
     elif [[ "$kind" == snat ]]; then
+        # 无状态 SNAT 安全语义说明：
+        # 在 notrack 无状态转发下无连接跟踪状态，入向通过主动 drop 外部发起的 TCP SYN 与 Ping (echo-request)
+        # 阻断外部恶意主动建联；非 SYN 的 TCP 回包及 UDP 等无状态报文出入向为 1:1 双向映射。
         local in_chain="sl_sin_${eip//./_}"
         local out_chain="sl_sout_${internal_ip//./_}"
         local int_hex eip_hex
@@ -2915,6 +2918,9 @@ function stateless_mapping_del() {
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
         (del_floating_ip "$eip") || return 1
     elif [[ "$kind" == snat ]]; then
+        # 无状态 SNAT 安全语义说明：
+        # 在 notrack 无状态转发下无连接跟踪状态，入向通过主动 drop 外部发起的 TCP SYN 与 Ping (echo-request)
+        # 阻断外部恶意主动建联；非 SYN 的 TCP 回包及 UDP 等无状态报文出入向为 1:1 双向映射。
         local in_chain="sl_sin_${eip//./_}"
         local out_chain="sl_sout_${internal_ip//./_}"
         local out_rules
