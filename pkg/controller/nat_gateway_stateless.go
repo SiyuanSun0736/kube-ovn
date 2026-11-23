@@ -21,9 +21,6 @@ func (c *Controller) activeNatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) 
 	if gw.Status.DataplaneMode != "" {
 		return gw.Status.DataplaneMode, nil
 	}
-	if gw.Status.TCPConnLimit != nil || gw.Status.HairpinSNAT != "" {
-		return "", nil
-	}
 	if c != nil && c.podsLister != nil {
 		pod, err := c.getNatGwPod(gw.Name, c.natGwNamespace(gw))
 		if err == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "" {
@@ -98,33 +95,20 @@ type statelessMapping struct {
 }
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
-func (c *Controller) validateStatelessMapping(eipName string, candidate statelessMapping) error {
-	if c == nil || c.iptablesEipsLister == nil || c.vpcNatGatewayLister == nil {
+func (c *Controller) validateStatelessMapping(gwName string, candidate statelessMapping) error {
+	if c == nil || c.iptablesEipsLister == nil || c.vpcNatGatewayLister == nil || gwName == "" {
 		return nil
 	}
-	eip, err := c.iptablesEipsLister.Get(eipName)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			// EIP not found or not bound yet; let EIP resolution handle it
-			return nil
-		}
-		return err
-	}
-	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
-		return nil
-	}
-	enabled, err := c.isStatelessNatGateway(eip.Spec.NatGwDp)
+	enabled, err := c.isStatelessNatGateway(gwName)
 	if err != nil || !enabled {
 		return err
 	}
 
 	host, err := util.StatelessNATIPv4Host(candidate.host)
 	if err != nil {
-		return fmt.Errorf("stateless gateway %s %s %s: %w", eip.Spec.NatGwDp, candidate.kind, candidate.name, err)
+		return fmt.Errorf("stateless gateway %s %s %s: %w", gwName, candidate.kind, candidate.name, err)
 	}
 	candidate.host = host
-
-	gwName := eip.Spec.NatGwDp
 
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
@@ -255,12 +239,12 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		// shared with a stateful Share-DNAT rule.
 		if existing.eip != "" && existing.eip == candidate.eip {
 			if existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT" {
-				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, existing.kind, existing.name)
+				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", gwName, candidate.eip, existing.kind, existing.name)
 			}
 			existingExtPort, _ := strconv.Atoi(existing.externalPort)
 			candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
 			if existing.protocol == candidate.protocol && (existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)) {
-				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", eip.Spec.NatGwDp, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
+				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
 			}
 		}
 		existingHost, err := util.StatelessNATIPv4Host(existing.host)
@@ -273,7 +257,7 @@ func (c *Controller) validateStatelessMapping(eipName string, candidate stateles
 		// Stateless backends must have unambiguous reverse routing and cannot overlap with
 		// stateful Service backends.
 		if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
-			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", eip.Spec.NatGwDp, candidate.host, existing.kind, existing.name)
+			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
 		}
 	}
 	return nil

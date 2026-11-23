@@ -379,30 +379,28 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		existingMap[rule.Name] = rule
 	}
 	for _, record := range desired {
-		if dnatUsesEip(&record.Spec) {
-			isEstablished := false
-			if cur, ok := existingMap[record.Name]; ok && cur != nil {
-				isEstablished = (cur.Status.Ready || cur.Status.V4ip != "" || cur.Labels[util.EipUIDLabel] != "") &&
-					cur.Spec.InternalIP == record.Spec.InternalIP &&
-					cur.Spec.InternalPort == record.Spec.InternalPort &&
-					cur.Spec.ExternalPort == record.Spec.ExternalPort &&
-					cur.Spec.Protocol == record.Spec.Protocol &&
-					cur.Spec.EIP == record.Spec.EIP
-			}
-			if err = c.validateStatelessMapping(record.Spec.EIP, statelessMapping{
-				kind:          "DNAT",
-				name:          record.Name,
-				eip:           record.Spec.EIP,
-				host:          record.Spec.InternalIP,
-				protocol:      record.Spec.Protocol,
-				port:          record.Spec.InternalPort,
-				externalPort:  record.Spec.ExternalPort,
-				isShare:       true,
-				isEstablished: isEstablished,
-			}); err != nil {
-				c.recorder.Event(cachedSvc, v1.EventTypeWarning, "StatelessConflict", err.Error())
-				return err
-			}
+		isEstablished := false
+		if cur, ok := existingMap[record.Name]; ok && cur != nil {
+			isEstablished = (cur.Status.Ready || cur.Status.V4ip != "" || cur.Labels[util.EipUIDLabel] != "") &&
+				cur.Spec.InternalIP == record.Spec.InternalIP &&
+				cur.Spec.InternalPort == record.Spec.InternalPort &&
+				cur.Spec.ExternalPort == record.Spec.ExternalPort &&
+				cur.Spec.Protocol == record.Spec.Protocol &&
+				cur.Spec.EIP == record.Spec.EIP
+		}
+		if err = c.validateStatelessMapping(gwName, statelessMapping{
+			kind:          "DNAT",
+			name:          record.Name,
+			eip:           record.Spec.EIP,
+			host:          record.Spec.InternalIP,
+			protocol:      record.Spec.Protocol,
+			port:          record.Spec.InternalPort,
+			externalPort:  record.Spec.ExternalPort,
+			isShare:       true,
+			isEstablished: isEstablished,
+		}); err != nil {
+			c.recorder.Event(cachedSvc, v1.EventTypeWarning, "StatelessConflict", err.Error())
+			return err
 		}
 	}
 	// The Service is the authoritative writer; record events never trigger NAT changes. Write the

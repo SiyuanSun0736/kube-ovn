@@ -2638,6 +2638,16 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		return err
 	}
 	if dnatUsesEip(&dnat.Spec) {
+		eip, err := c.iptablesEipsLister.Get(dnat.Spec.EIP)
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
+			return nil
+		}
 		appliedEip := dnat.Annotations[util.VpcEipAnnotation]
 		if appliedEip == "" {
 			appliedEip = dnat.Spec.EIP
@@ -2648,7 +2658,7 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 			dnat.Spec.ExternalPort == dnat.Status.ExternalPort &&
 			dnat.Spec.Protocol == dnat.Status.Protocol &&
 			dnat.Spec.EIP == appliedEip
-		if err = c.validateStatelessMapping(dnat.Spec.EIP, statelessMapping{
+		if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
 			kind:          "DNAT",
 			name:          dnat.Name,
 			eip:           dnat.Spec.EIP,
@@ -2690,13 +2700,23 @@ func (c *Controller) validateFipRule(fip *kubeovnv1.IptablesFIPRule) error {
 		klog.Error(err)
 		return err
 	}
+	eip, err := c.iptablesEipsLister.Get(fip.Spec.EIP)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
+		return nil
+	}
 	appliedEip := fip.Annotations[util.VpcEipAnnotation]
 	if appliedEip == "" {
 		appliedEip = fip.Spec.EIP
 	}
 	isEstablished := (fip.Status.Ready || fip.Status.V4ip != "" || fip.Labels[util.EipUIDLabel] != "") &&
 		fip.Spec.InternalIP == fip.Status.InternalIP && fip.Spec.EIP == appliedEip
-	if err = c.validateStatelessMapping(fip.Spec.EIP, statelessMapping{
+	if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
 		kind:          "FIP",
 		name:          fip.Name,
 		eip:           fip.Spec.EIP,
@@ -2747,13 +2767,23 @@ func (c *Controller) validateSnatRule(snat *kubeovnv1.IptablesSnatRule) error {
 		klog.Error(err)
 		return err
 	}
+	eip, err := c.iptablesEipsLister.Get(snat.Spec.EIP)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
+		return nil
+	}
 	appliedEip := snat.Annotations[util.VpcEipAnnotation]
 	if appliedEip == "" {
 		appliedEip = snat.Spec.EIP
 	}
 	isEstablished := (snat.Status.Ready || snat.Status.V4ip != "" || snat.Labels[util.EipUIDLabel] != "") &&
 		snat.Spec.InternalCIDR == snat.Status.InternalCIDR && snat.Spec.EIP == appliedEip
-	if err = c.validateStatelessMapping(snat.Spec.EIP, statelessMapping{
+	if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
 		kind:          "SNAT",
 		name:          snat.Name,
 		eip:           snat.Spec.EIP,

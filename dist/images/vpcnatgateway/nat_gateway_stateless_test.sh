@@ -135,4 +135,17 @@ if [[ "$test_ip" != "10.0.0.3" || "$test_port" != "8080" ]]; then
     exit 1
 fi
 
+# 验证精确 IP 边界匹配（防 10.0.0.1 误匹配 10.0.0.10 导致链泄漏）
+map_content="elements = { tcp . 8080 . 10.0.0.10 : jump sl_dout_tcp_10_0_0_10_8080 }"
+target_ip="10.0.0.1"
+if grep -qE "[ .]${target_ip//./\\.}[ :;]" <<< "$map_content"; then
+    echo "regex falsely matched prefix IP $target_ip in $map_content" >&2
+    exit 1
+fi
+matching_ip="10.0.0.10"
+if ! grep -qE "[ .]${matching_ip//./\\.}[ :;]" <<< "$map_content"; then
+    echo "regex failed to match exact IP $matching_ip in $map_content" >&2
+    exit 1
+fi
+
 echo 'stateless shell tests passed'

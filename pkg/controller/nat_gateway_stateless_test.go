@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	listers "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
@@ -238,4 +239,90 @@ func TestStatelessGatewayRejectsTCPConnLimit(t *testing.T) {
 	require.NoError(t, err)
 	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
 	require.ErrorContains(t, err, "stateless dataplane mode does not support tcpConnLimit")
+}
+
+func TestStatelessConflictWithLanIPService(t *testing.T) {
+	gwIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	dnatIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	c := &Controller{
+		vpcNatGatewayLister:     listers.NewVpcNatGatewayLister(gwIndexer),
+		iptablesEipsLister:      listers.NewIptablesEIPLister(eipIndexer),
+		iptablesDnatRulesLister: listers.NewIptablesDnatRuleLister(dnatIndexer),
+		iptablesFipsLister:      listers.NewIptablesFIPRuleLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		iptablesSnatRulesLister: listers.NewIptablesSnatRuleLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+	}
+	gw := &kubeovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: "gw"}, Spec: kubeovnv1.VpcNatGatewaySpec{DataplaneMode: util.NatDataplaneModeStatelessNft}}
+	require.NoError(t, gwIndexer.Add(gw))
+	eip := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip"}, Spec: kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"}}
+	require.NoError(t, eipIndexer.Add(eip))
+
+	// Existing exclusive stateless DNAT rule
+	exclusiveDnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "sl-dnat"},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8080", ExternalPort: "80",
+		},
+	}
+	require.NoError(t, dnatIndexer.Add(exclusiveDnat))
+
+	// LanIP Service VIP (EIP is empty) pointing to same backend should be rejected
+	candidate := statelessMapping{
+		kind:         "DNAT",
+		name:         "lanip-svc",
+		eip:          "",
+		host:         "10.0.0.2",
+		protocol:     "tcp",
+		port:         "8080",
+		externalPort: "80",
+		isShare:      true,
+	}
+	err := c.validateStatelessMapping("gw", candidate)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "reverse mapping must be unique")
+}
+
+func TestStatelessRetryPreservesMode(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	gw := fakeGw("gw")
+	gw.Spec.DataplaneMode = util.NatDataplaneModeStatelessNft
+	gw.Status.HairpinSNAT = "enable" // simulate partial init from a previous attempt
+	pod := fakeNatGwPod("gw", false)
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+
+	for _, q := range []*workqueue.TypedRateLimitingInterface[string]{
+		&fc.fakeController.updateVpcFloatingIPQueue, &fc.fakeController.updateVpcDnatQueue, &fc.fakeController.updateVpcSnatQueue,
+		&fc.fakeController.updateVpcSubnetQueue, &fc.fakeController.updateVpcEipQueue,
+	} {
+		*q = newTypedRateLimitingQueue[string]("test", nil)
+		t.Cleanup((*q).ShutDown)
+	}
+
+	var calls [][]string
+	fc.fakeController.execRulesInPod = func(_ *corev1.Pod, operation string, rules []string) error {
+		calls = append(calls, append([]string{operation}, rules...))
+		return nil
+	}
+
+	require.NoError(t, fc.fakeController.handleInitVpcNatGw("gw"))
+	// Must still execute stateless-init and not degrade to stateful
+	foundStatelessInit := false
+	for _, call := range calls {
+		if len(call) > 0 && call[0] == "stateless-init" {
+			foundStatelessInit = true
+			break
+		}
+	}
+	require.True(t, foundStatelessInit, "stateless-init must be called even when HairpinSNAT is already populated")
+
+	patched, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "gw", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, util.NatDataplaneModeStatelessNft, patched.Status.DataplaneMode)
 }

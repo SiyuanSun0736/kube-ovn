@@ -531,7 +531,7 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft {
 		pod, podErr := c.getNatGwPod(key, c.natGwNamespace(gw))
-		isEstablished := gw.Status.TCPConnLimit != nil || gw.Status.HairpinSNAT != "" || (podErr == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "")
+		isEstablished := (podErr == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "")
 		if isEstablished {
 			err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
 			klog.Error(err)
@@ -825,6 +825,10 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 			klog.Errorf("initialize stateless gateway %s: %v", key, err)
 			return err
 		}
+	}
+	if err = c.patchNatGwDataplaneModeStatus(key, dataplaneMode); err != nil {
+		klog.Errorf("failed to patch dataplane mode %s for nat gw %s: %v", dataplaneMode, key, err)
+		return err
 	}
 
 	mode := hairpinSNATMode(gw)
@@ -1923,6 +1927,34 @@ func (c *Controller) patchNatGwQoSStatus(key, qos string) error {
 			klog.Errorf("failed to patch gw %s, %v", gw.Name, err)
 			return err
 		}
+	}
+	return nil
+}
+
+func (c *Controller) patchNatGwDataplaneModeStatus(key, mode string) error {
+	oriGw, err := c.vpcNatGatewayLister.Get(key)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc nat gw %s, %v", key, err)
+		return err
+	}
+	if oriGw.Status.DataplaneMode == mode {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"status": map[string]string{"dataplaneMode": mode}})
+	if err != nil {
+		klog.Errorf("failed to marshal vpc nat gw %s status, %v", key, err)
+		return err
+	}
+	if _, err = c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), key, types.MergePatchType,
+		patch, metav1.PatchOptions{}, "status"); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to patch gw %s dataplane mode status, %v", key, err)
+		return err
 	}
 	return nil
 }
