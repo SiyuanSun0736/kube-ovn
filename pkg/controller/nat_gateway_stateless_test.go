@@ -61,6 +61,20 @@ func TestStatelessInitFailureLeavesPodUninitialized(t *testing.T) {
 	require.Empty(t, current.Annotations[util.VpcNatGatewayInitAnnotation])
 }
 
+func TestInitVpcNatGwFailsOnInvalidDataplaneMode(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+	gw := fakeGw("gw")
+	gw.Spec.DataplaneMode = "unsupported-mode"
+	pod := fakeNatGwPod("gw", false)
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw}, Pods: []*corev1.Pod{pod}})
+	require.NoError(t, err)
+	err = fc.fakeController.handleInitVpcNatGw("gw")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported dataplaneMode")
+}
+
 func TestStatelessSnatRequiresSingleHost(t *testing.T) {
 	gwIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})

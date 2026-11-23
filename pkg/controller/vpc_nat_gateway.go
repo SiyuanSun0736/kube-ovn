@@ -816,8 +816,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 
 	dataplaneMode, err := c.activeNatGatewayDataplaneMode(gw)
 	if err != nil {
-		klog.Warningf("invalid dataplane mode for vpc nat gateway %s: %v, ignoring and fallback", key, err)
-		dataplaneMode = ""
+		klog.Errorf("failed to get active dataplane mode for gateway %s: %v", key, err)
+		return err
 	}
 	// 无状态网关在 Pod 内初始化基础 nft 表及 TCP MSS 自动钳制
 	if dataplaneMode == util.NatDataplaneModeStatelessNft {
