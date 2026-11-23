@@ -230,11 +230,15 @@ func NewController(config *Configuration,
 		util.LogFatalAndExit(err, "failed to add service event handler")
 	}
 
+	var gcErr error
 	for i := 0; i < 3; i++ {
-		if gcErr := controller.gcPortForwardConnLimitRules(); gcErr == nil {
+		if gcErr = controller.gcPortForwardConnLimitRules(); gcErr == nil {
 			break
 		}
 		time.Sleep(time.Second)
+	}
+	if gcErr != nil {
+		klog.Errorf("failed to run startup gc for port-forward connlimit rules after 3 attempts: %v", gcErr)
 	}
 
 	if _, err = podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{

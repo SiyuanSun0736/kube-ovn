@@ -332,7 +332,7 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 		svcName = oldService.Namespace + "/" + oldService.Name
 	}
 
-	for _, proto := range []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6} {
+	for _, proto := range c.enabledProtocols() {
 		pOld := rulesByProtoOld[proto]
 		pNew := rulesByProtoNew[proto]
 		if len(pOld) == 0 && len(pNew) == 0 {
