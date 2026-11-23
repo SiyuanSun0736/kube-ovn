@@ -53,17 +53,6 @@ func execIptables(protocol string, args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-func execIptablesRestore(protocol, script string) ([]byte, error) {
-	binary := "iptables-restore"
-	if protocol == kubeovnv1.ProtocolIPv6 {
-		binary = "ip6tables-restore"
-	}
-	cmd := exec.Command(binary, "--noflush") // #nosec G204
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	cmd.Stdin = strings.NewReader(script)
-	return cmd.CombinedOutput()
-}
-
 func buildIptablesRuleSpec(rule portForwardConnLimitRule) []string {
 	cidr := "/32"
 	if util.CheckProtocol(rule.ip) == kubeovnv1.ProtocolIPv6 {
@@ -282,11 +271,25 @@ func extractServicePublicIPs(svc *corev1.Service) []string {
 }
 
 func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev1.Service) error {
-	if oldService != nil && newService == nil && c != nil && c.servicesLister != nil {
-		// Distinguish subnet flow-removal events from true Service deletion
-		currentSvc, err := c.servicesLister.Services(oldService.Namespace).Get(oldService.Name)
-		if err == nil && currentSvc != nil {
-			newService = currentSvc
+	if c != nil {
+		c.pfConnLimitMutex.Lock()
+		defer c.pfConnLimitMutex.Unlock()
+	}
+
+	// Re-read current Service from Lister to avoid applying stale event snapshot on retry
+	if c != nil && c.servicesLister != nil {
+		svcToLookup := newService
+		if svcToLookup == nil {
+			svcToLookup = oldService
+		}
+		if svcToLookup != nil {
+			currentSvc, err := c.servicesLister.Services(svcToLookup.Namespace).Get(svcToLookup.Name)
+			if err == nil && currentSvc != nil {
+				newService = currentSvc
+			} else if newService != nil {
+				// Service was deleted from K8s while stale event was queued
+				newService = nil
+			}
 		}
 	}
 
@@ -394,13 +397,22 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 	// 2. Add or update rules
 	for _, r := range toAddOrUpdate {
 		targetComment := iptablesRuleComment(r.ip, r.port)
+		alreadyMatched := false
 		for _, e := range entries {
 			if e.comment == targetComment {
+				if e.limit == r.connLimit {
+					// Rule with exact same limit already exists in kernel; preserve it to avoid resetting connlimit accounting
+					alreadyMatched = true
+					break
+				}
 				delRule := portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit}
 				if delErr := c.deleteIptablesRule(protocol, delRule); delErr != nil {
 					return delErr
 				}
 			}
+		}
+		if alreadyMatched {
+			continue
 		}
 		if addErr := c.addIptablesRule(protocol, r); addErr != nil {
 			return addErr
@@ -418,6 +430,9 @@ func (c *Controller) gcPortForwardConnLimitRules() error {
 	if c == nil || c.servicesLister == nil {
 		return nil
 	}
+
+	c.pfConnLimitMutex.Lock()
+	defer c.pfConnLimitMutex.Unlock()
 
 	svcs, err := c.servicesLister.List(labels.Everything())
 	if err != nil {

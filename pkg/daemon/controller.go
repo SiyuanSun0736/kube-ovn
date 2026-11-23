@@ -97,9 +97,10 @@ type Controller struct {
 	k8sExec k8sexec.Interface
 
 	// channel used for fdb sync
-	fdbSyncChan   chan struct{}
-	fdbSyncMutex  sync.Mutex
-	vswitchClient ovs.Vswitch
+	fdbSyncChan      chan struct{}
+	fdbSyncMutex     sync.Mutex
+	pfConnLimitMutex sync.Mutex
+	vswitchClient    ovs.Vswitch
 }
 
 func newTypedRateLimitingQueue[T comparable](name string, rateLimiter workqueue.TypedRateLimiter[T]) workqueue.TypedRateLimitingInterface[T] {

@@ -1333,6 +1333,16 @@ func (c *Controller) cleanObsoleteIptablesRules(protocol string, rules []util.IP
 		return err
 	}
 
+	exists, err := ipt.ChainExists(MANGLE, util.OvnPortForwardIptablesChain)
+	if err == nil && exists {
+		for _, parent := range []string{Prerouting, "OUTPUT"} {
+			_ = ipt.DeleteIfExists(MANGLE, parent, "-j", util.OvnPortForwardIptablesChain)
+		}
+		if err = ipt.ClearAndDeleteChain(MANGLE, util.OvnPortForwardIptablesChain); err != nil {
+			klog.Errorf("failed to delete obsolete iptables chain %q in table %s: %v", util.OvnPortForwardIptablesChain, MANGLE, err)
+		}
+	}
+
 	delete(c.iptablesObsolete, protocol)
 	if len(c.iptablesObsolete) == 0 {
 		c.iptablesObsolete = nil
