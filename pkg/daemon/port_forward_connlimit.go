@@ -18,8 +18,6 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-const pfGateComment = "ovn-pf-gate"
-
 type portForwardKey struct {
 	ip   string
 	port int32
@@ -64,17 +62,6 @@ func execIptablesRestore(protocol, script string) ([]byte, error) {
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	cmd.Stdin = strings.NewReader(script)
 	return cmd.CombinedOutput()
-}
-
-func buildIptablesGateRules(protocol string) []string {
-	if protocol == kubeovnv1.ProtocolIPv6 {
-		return []string{
-			fmt.Sprintf("-A %s -s ::1/128 -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
-		}
-	}
-	return []string{
-		fmt.Sprintf("-A %s -s 127.0.0.0/8 -m comment --comment %q -j RETURN", util.OvnPortForwardIptablesChain, pfGateComment),
-	}
 }
 
 func buildIptablesAddRuleCmd(rule portForwardConnLimitRule) string {
@@ -336,12 +323,9 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 	lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
 	lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
 
-	// Re-insert gate rules at chain head
-	lines = append(lines, buildIptablesGateRules(protocol)...)
-
 	// Keep existing rules not belonging to toDeleteComments or toAddOrUpdate
 	for _, e := range entries {
-		if e.comment == "" || e.comment == pfGateComment {
+		if e.comment == "" {
 			continue
 		}
 		if toDeleteComments[e.comment] {
@@ -406,7 +390,7 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 
 		hasOrphan := false
 		for _, e := range entries {
-			if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != pfGateComment {
+			if strings.HasPrefix(e.comment, "ovn-pf-") {
 				if !activeComments[e.comment] {
 					hasOrphan = true
 					klog.Infof("found orphan port-forward connlimit rule %q in protocol %s, queueing for gc", e.comment, proto)
@@ -423,10 +407,9 @@ func (c *Controller) gcPortForwardConnLimitRules() {
 		lines = append(lines, "*mangle")
 		lines = append(lines, fmt.Sprintf(":%s - [0:0]", util.OvnPortForwardIptablesChain))
 		lines = append(lines, fmt.Sprintf("-F %s", util.OvnPortForwardIptablesChain))
-		lines = append(lines, buildIptablesGateRules(proto)...)
 
 		for _, e := range entries {
-			if strings.HasPrefix(e.comment, "ovn-pf-") && e.comment != pfGateComment {
+			if strings.HasPrefix(e.comment, "ovn-pf-") {
 				if activeComments[e.comment] {
 					lines = append(lines, e.raw)
 				}

@@ -7,65 +7,39 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 func TestParseIptablesChainRules(t *testing.T) {
 	rawOutput := `-N KUBE-OVN-PF
--A KUBE-OVN-PF -i lo -m comment --comment ovn-pf-gate -j RETURN
--A KUBE-OVN-PF ! -i eth0 -m comment --comment ovn-pf-gate -j RETURN
 -A KUBE-OVN-PF -d 1.2.3.4/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 100 --connlimit-mask 0 --connlimit-saddr -m comment --comment "ovn-pf-1.2.3.4-80" -j DROP
 -A KUBE-OVN-PF -d 2001:db8::1/128 -p tcp -m tcp --dport 443 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 200 --connlimit-mask 0 --connlimit-saddr -m comment --comment 'ovn-pf-2001:db8::1-443' -j DROP
 -A KUBE-OVN-PF -p tcp -m tcp --dport 22 -j ACCEPT
 `
 
 	entries := parseIptablesChainRules(rawOutput)
-	require.Len(t, entries, 5)
-
-	// Gate rule 1
-	require.Equal(t, "ovn-pf-gate", entries[0].comment)
-	require.Equal(t, 0, entries[0].limit)
-	require.Contains(t, entries[0].raw, "-i lo")
-
-	// Gate rule 2
-	require.Equal(t, "ovn-pf-gate", entries[1].comment)
-	require.Equal(t, 0, entries[1].limit)
-	require.Contains(t, entries[1].raw, "! -i eth0")
+	require.Len(t, entries, 3)
 
 	// IPv4 rule
-	require.Equal(t, "ovn-pf-1.2.3.4-80", entries[2].comment)
-	require.Equal(t, 100, entries[2].limit)
-	require.Contains(t, entries[2].raw, "--connlimit-above 100")
+	require.Equal(t, "ovn-pf-1.2.3.4-80", entries[0].comment)
+	require.Equal(t, 100, entries[0].limit)
+	require.Contains(t, entries[0].raw, "--connlimit-above 100")
 
 	// IPv6 rule with single quote
-	require.Equal(t, "ovn-pf-2001:db8::1-443", entries[3].comment)
-	require.Equal(t, 200, entries[3].limit)
+	require.Equal(t, "ovn-pf-2001:db8::1-443", entries[1].comment)
+	require.Equal(t, 200, entries[1].limit)
 
 	// Rule without comment
-	require.Equal(t, "", entries[4].comment)
-	require.Equal(t, 0, entries[4].limit)
+	require.Equal(t, "", entries[2].comment)
+	require.Equal(t, 0, entries[2].limit)
 
 	// Find by comment
 	matched := findIptablesRulesByComment(entries, "ovn-pf-1.2.3.4-80")
 	require.Len(t, matched, 1)
 	require.Equal(t, 100, matched[0].limit)
 
-	matchedGate := findIptablesRulesByComment(entries, "ovn-pf-gate")
-	require.Len(t, matchedGate, 2)
-
 	matchedNone := findIptablesRulesByComment(entries, "non-existent")
 	require.Empty(t, matchedNone)
-}
-
-func TestBuildIptablesGateRules(t *testing.T) {
-	rulesV4 := buildIptablesGateRules(kubeovnv1.ProtocolIPv4)
-	require.Len(t, rulesV4, 1)
-	require.Equal(t, `-A KUBE-OVN-PF -s 127.0.0.0/8 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesV4[0])
-
-	rulesV6 := buildIptablesGateRules(kubeovnv1.ProtocolIPv6)
-	require.Len(t, rulesV6, 1)
-	require.Equal(t, `-A KUBE-OVN-PF -s ::1/128 -m comment --comment "ovn-pf-gate" -j RETURN`, rulesV6[0])
 }
 
 func TestBuildIptablesAddRuleCmd(t *testing.T) {
