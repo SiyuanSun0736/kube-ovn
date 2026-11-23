@@ -348,27 +348,26 @@ func (c *Controller) reconcilePortForwardConnLimit(oldService, newService *corev
 	return nil
 }
 
-func (c *Controller) isPortForwardClaimedByOtherService(ip string, port int32, excludeSvc string) bool {
+func (c *Controller) getOtherServicesClaimedPortForwards(excludeSvc string) (map[portForwardKey]struct{}, error) {
 	if c == nil || c.servicesLister == nil {
-		return false
+		return nil, nil
 	}
 	svcs, err := c.servicesLister.List(labels.Everything())
 	if err != nil {
-		klog.Errorf("failed to list services to check claimed port-forward %s:%d: %v", ip, port, err)
-		return false
+		klog.Errorf("failed to list services to check claimed port-forwards: %v", err)
+		return nil, err
 	}
+	claimed := make(map[portForwardKey]struct{})
 	for _, svc := range svcs {
 		fullName := svc.Namespace + "/" + svc.Name
 		if fullName == excludeSvc {
 			continue
 		}
 		for _, r := range c.parsePortForwardConnLimitRules(svc) {
-			if r.ip == ip && r.port == port {
-				return true
-			}
+			claimed[r.key()] = struct{}{}
 		}
 	}
-	return false
+	return claimed, nil
 }
 
 func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules []portForwardConnLimitRule, currentSvcName string) error {
@@ -411,9 +410,15 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 		return err
 	}
 
+	claimedByOthers, err := c.getOtherServicesClaimedPortForwards(currentSvcName)
+	if err != nil {
+		klog.Errorf("failed to get claimed port-forwards for service %s: %v", currentSvcName, err)
+		return err
+	}
+
 	// 1. Delete removed rules (incremental delete, preserving other services' rules and accounting)
 	for _, r := range toDeleteRules {
-		if c.isPortForwardClaimedByOtherService(r.ip, r.port, currentSvcName) {
+		if _, claimed := claimedByOthers[r.key()]; claimed {
 			klog.Infof("port-forward %s:%d is still claimed by another service, skip deleting rule", r.ip, r.port)
 			continue
 		}
@@ -431,25 +436,24 @@ func (c *Controller) reconcileProtocolRules(protocol string, oldRules, newRules 
 	// 2. Add or update rules (add new rule first, then delete old rule to prevent unmetered window)
 	for _, r := range toAddOrUpdate {
 		targetComment := iptablesRuleComment(r.ip, r.port)
-		alreadyMatched := false
+		matchedRuleFound := false
 		var oldRulesToDelete []portForwardConnLimitRule
 		for _, e := range entries {
 			if e.comment == targetComment {
-				if e.limit == r.connLimit {
+				if e.limit == r.connLimit && !matchedRuleFound {
 					// Rule with exact same limit already exists in kernel; preserve it to avoid resetting connlimit accounting
-					alreadyMatched = true
-					break
+					matchedRuleFound = true
+				} else {
+					oldRulesToDelete = append(oldRulesToDelete, portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit})
 				}
-				oldRulesToDelete = append(oldRulesToDelete, portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit})
 			}
 		}
-		if alreadyMatched {
-			continue
-		}
-		if addErr := c.addIptablesRule(protocol, r); addErr != nil {
-			klog.Errorf("failed to add port-forward connlimit rule %s:%d (limit=%d, protocol %s): %v",
-				r.ip, r.port, r.connLimit, protocol, addErr)
-			return addErr
+		if !matchedRuleFound {
+			if addErr := c.addIptablesRule(protocol, r); addErr != nil {
+				klog.Errorf("failed to add port-forward connlimit rule %s:%d (limit=%d, protocol %s): %v",
+					r.ip, r.port, r.connLimit, protocol, addErr)
+				return addErr
+			}
 		}
 		for _, delRule := range oldRulesToDelete {
 			if delErr := c.deleteIptablesRule(protocol, delRule); delErr != nil {
@@ -538,25 +542,24 @@ func (c *Controller) gcPortForwardConnLimitRules() error {
 		activeRules := activeRulesByProto[proto]
 		for _, r := range activeRules {
 			targetComment := iptablesRuleComment(r.ip, r.port)
-			found := false
+			matchedRuleFound := false
 			var oldRulesToDelete []portForwardConnLimitRule
 			for _, e := range entries {
 				if e.comment == targetComment {
-					if e.limit == r.connLimit {
-						found = true
-						break
+					if e.limit == r.connLimit && !matchedRuleFound {
+						matchedRuleFound = true
+					} else {
+						oldRulesToDelete = append(oldRulesToDelete, portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit})
 					}
-					oldRulesToDelete = append(oldRulesToDelete, portForwardConnLimitRule{ip: r.ip, port: r.port, connLimit: e.limit})
 				}
 			}
-			if found {
-				continue
-			}
-			klog.Infof("restoring missing port-forward connlimit rule %s:%d (limit=%d, protocol %s)",
-				r.ip, r.port, r.connLimit, proto)
-			if addErr := c.addIptablesRule(proto, r); addErr != nil {
-				klog.Errorf("failed to add missing rule %s:%d (protocol %s): %v", r.ip, r.port, proto, addErr)
-				continue
+			if !matchedRuleFound {
+				klog.Infof("restoring missing port-forward connlimit rule %s:%d (limit=%d, protocol %s)",
+					r.ip, r.port, r.connLimit, proto)
+				if addErr := c.addIptablesRule(proto, r); addErr != nil {
+					klog.Errorf("failed to add missing rule %s:%d (protocol %s): %v", r.ip, r.port, proto, addErr)
+					continue
+				}
 			}
 			for _, delRule := range oldRulesToDelete {
 				if delErr := c.deleteIptablesRule(proto, delRule); delErr != nil {

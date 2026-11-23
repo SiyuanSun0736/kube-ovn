@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -41,6 +43,19 @@ func TestParseIptablesChainRules(t *testing.T) {
 
 	matchedNone := findIptablesRulesByComment(entries, "non-existent")
 	require.Empty(t, matchedNone)
+}
+
+func TestParseIptablesChainRules_DuplicateOrGhost(t *testing.T) {
+	rawOutput := `-N KUBE-OVN-PF
+-A KUBE-OVN-PF -d 1.2.3.4/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 100 --connlimit-mask 0 -m comment --comment "ovn-pf-1.2.3.4-80" -j DROP
+-A KUBE-OVN-PF -d 1.2.3.4/32 -p tcp -m tcp --dport 80 --tcp-flags FIN,SYN,RST,ACK SYN -m connlimit --connlimit-above 200 --connlimit-mask 0 -m comment --comment "ovn-pf-1.2.3.4-80" -j DROP
+`
+	entries := parseIptablesChainRules(rawOutput)
+	require.Len(t, entries, 2)
+	require.Equal(t, 100, entries[0].limit)
+	require.Equal(t, 200, entries[1].limit)
+	matched := findIptablesRulesByComment(entries, "ovn-pf-1.2.3.4-80")
+	require.Len(t, matched, 2)
 }
 
 func TestParsePortForwardConnLimitRules(t *testing.T) {
@@ -281,4 +296,59 @@ func TestEnabledProtocols(t *testing.T) {
 
 	var nilCtrl *Controller
 	require.Equal(t, []string{kubeovnv1.ProtocolIPv4, kubeovnv1.ProtocolIPv6}, nilCtrl.enabledProtocols())
+}
+
+func TestGetOtherServicesClaimedPortForwards(t *testing.T) {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	c := &Controller{
+		servicesLister: corelisters.NewServiceLister(indexer),
+	}
+
+	svc1 := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "svc1",
+			Namespace:   "default",
+			Annotations: map[string]string{util.PortForwardConnLimitAnnotation: "100"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{
+				{Protocol: corev1.ProtocolTCP, Port: 80},
+			},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}},
+			},
+		},
+	}
+	svc2 := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "svc2",
+			Namespace:   "default",
+			Annotations: map[string]string{util.PortForwardConnLimitAnnotation: "200"},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{
+				{Protocol: corev1.ProtocolTCP, Port: 443},
+			},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}},
+			},
+		},
+	}
+
+	require.NoError(t, indexer.Add(svc1))
+	require.NoError(t, indexer.Add(svc2))
+
+	claimed, err := c.getOtherServicesClaimedPortForwards("default/svc1")
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	_, exists := claimed[portForwardKey{ip: "1.2.3.4", port: 443}]
+	require.True(t, exists)
+	_, exists = claimed[portForwardKey{ip: "1.2.3.4", port: 80}]
+	require.False(t, exists)
 }
