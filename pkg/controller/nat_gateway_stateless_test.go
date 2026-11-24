@@ -31,7 +31,7 @@ func TestNatGatewayOperation(t *testing.T) {
 	require.NoError(t, indexer.Update(gw))
 	for op, want := range map[string]string{
 		natGwSubnetFipAdd: "stateless-fip-add", natGwSubnetFipDel: "stateless-fip-del",
-		natGwDnatAdd: "stateless-dnat-add", natGwDnatDel: "stateless-dnat-del",
+		natGwDnatAdd: natGwDnatAdd, natGwDnatDel: natGwDnatDel,
 		natGwSnatAdd: natGwSnatAdd, natGwSnatDel: natGwSnatDel,
 	} {
 		got, err := c.natGatewayOperation("gw", op)
