@@ -102,12 +102,12 @@ add chain ip kube_ovn_stateless_nat sl_fin_192_0_2_10
 add rule ip kube_ovn_stateless_nat sl_fin_192_0_2_10 notrack ip daddr set 10.0.1.20
 
 # 出向子链
-add chain ip kube_ovn_stateless_nat sl_fout_10_0_1_20
-add rule ip kube_ovn_stateless_nat sl_fout_10_0_1_20 ip saddr set 192.0.2.10
+add chain ip kube_ovn_stateless_nat sl_fout_192_0_2_10
+add rule ip kube_ovn_stateless_nat sl_fout_192_0_2_10 ip saddr set 192.0.2.10
 
 # 关联元素
 add element ip kube_ovn_stateless_nat sl_fip_dnat    { 192.0.2.10 : jump sl_fin_192_0_2_10 }
-add element ip kube_ovn_stateless_nat sl_fip_snat    { 10.0.1.20 : jump sl_fout_10_0_1_20 }
+add element ip kube_ovn_stateless_nat sl_fip_snat    { 10.0.1.20 : jump sl_fout_192_0_2_10 }
 add element ip kube_ovn_stateless_nat sl_notrack_ips { 10.0.1.20 }
 ```
 
@@ -119,12 +119,12 @@ add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80
 add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80 notrack ip daddr set 10.0.1.20 tcp dport set 8080
 
 # 出向子链
-add chain ip kube_ovn_stateless_nat sl_dout_tcp_10_0_1_20_8080
-add rule ip kube_ovn_stateless_nat sl_dout_tcp_10_0_1_20_8080 ip saddr set 192.0.2.10 tcp sport set 80
+add chain ip kube_ovn_stateless_nat sl_dout_tcp_192_0_2_10_80
+add rule ip kube_ovn_stateless_nat sl_dout_tcp_192_0_2_10_80 ip saddr set 192.0.2.10 tcp sport set 80
 
 # 关联元素
 add element ip kube_ovn_stateless_nat sl_dnat_in         { tcp . 80 . 192.0.2.10 : jump sl_din_tcp_192_0_2_10_80 }
-add element ip kube_ovn_stateless_nat sl_dnat_out        { tcp . 8080 . 10.0.1.20 : jump sl_dout_tcp_10_0_1_20_8080 }
+add element ip kube_ovn_stateless_nat sl_dnat_out        { tcp . 8080 . 10.0.1.20 : jump sl_dout_tcp_192_0_2_10_80 }
 add element ip kube_ovn_stateless_nat sl_notrack_tuples  { tcp . 8080 . 10.0.1.20 }
 ```
 
