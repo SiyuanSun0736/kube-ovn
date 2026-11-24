@@ -142,9 +142,9 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 	var mappings []statelessMapping
 	switch candidate.kind {
 	case "FIP":
-		mappings, err = c.collectStatelessFipMappings(gwName, gatewayEips)
+		mappings, err = c.getGatewayFipRules(gwName, gatewayEips)
 	case "DNAT":
-		mappings, err = c.collectStatelessDnatMappings(gwName, gatewayEips)
+		mappings, err = c.getGatewayDnatRules(gwName, gatewayEips)
 	default:
 		return nil
 	}
@@ -174,7 +174,7 @@ func (c *Controller) getGatewayEIPs(gwName string) (map[string]bool, error) {
 	return gatewayEips, nil
 }
 
-func (c *Controller) collectStatelessFipMappings(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
+func (c *Controller) getGatewayFipRules(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
 	fips, err := c.iptablesFipsLister.List(labels.Everything())
 	if err != nil {
 		return nil, err
@@ -198,7 +198,7 @@ func (c *Controller) collectStatelessFipMappings(gwName string, gatewayEips map[
 	return mappings, nil
 }
 
-func (c *Controller) collectStatelessDnatMappings(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
+func (c *Controller) getGatewayDnatRules(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
 	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
 	if err != nil {
 		return nil, err
