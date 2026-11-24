@@ -379,7 +379,17 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	for _, rule := range existing {
 		existingMap[rule.Name] = rule
 	}
+	identities := buildNftableLbIdentities(desired, eipIP)
 	for _, record := range desired {
+		if record.Spec.EIP == "" {
+			continue
+		}
+		idKey := eipIP + "/" + record.Spec.ExternalPort + "/" + strings.ToLower(record.Spec.Protocol)
+		id := identities[idKey]
+		if id == nil || len(id.backends) != 1 {
+			// Multi-backend or empty backends fall back to stateful nftables LB, not subject to stateless 1:1 constraints.
+			continue
+		}
 		isEstablished := dnatMatchesDesired(existingMap[record.Name], record)
 		if err = c.validateStatelessMapping(gwName, statelessMapping{
 			kind:          "DNAT",
