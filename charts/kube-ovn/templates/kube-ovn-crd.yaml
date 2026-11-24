@@ -597,7 +597,7 @@ spec:
                     - ""
                     - stateless-nft
                   x-kubernetes-validations:
-                    - rule: "!has(oldSelf) || self == oldSelf"
+                    - rule: "self == oldSelf"
                       message: "dataplaneMode is immutable; delete and recreate the gateway to switch mode"
                   description: Data plane mode of the NAT gateway. Set to "stateless-nft" for stateless mode (FIP and exclusive DNAT operate statelessly without conntrack, SNAT and hairpin retain stateful conntrack; immutable), or empty/unset for default mode.
                 tcpConnLimit:
