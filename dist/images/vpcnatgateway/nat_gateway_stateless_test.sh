@@ -49,6 +49,12 @@ stateless_dnat_del '192.0.2.11,80,tcp,10.0.0.2,8080'
 grep -Fx 'delete element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.2 }' "$tmp_dir/calls"
 grep -Fx 'delete chain ip kube_ovn_stateless_nat sl_dout_tcp_10_0_0_2_8080' "$tmp_dir/calls"
 
+# 大写协议标准化处理断言
+stateless_dnat_add '192.0.2.12,80,TCP,10.0.0.3,8080'
+grep -F 'add element ip kube_ovn_stateless_nat sl_dnat_in { tcp . 80 . 192.0.2.12 : jump sl_din_tcp_192_0_2_12_80 }' "$tmp_dir/batches"
+stateless_dnat_del '192.0.2.12,80,TCP'
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_dnat_in { tcp . 80 . 192.0.2.12 }' "$tmp_dir/calls"
+
 # Invalid deletion inputs must succeed as no-op and never block cleanup
 stateless_dnat_del '192.0.2.11,080,tcp'
 for invalid in '192.0.2.2,::1' '999.1.1.1,10.0.0.1'; do

@@ -606,7 +606,8 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 		rule := nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort)
 		delRules = append(delRules, rule)
 		if isStateless && eipIP != "" && identity.vip == eipIP {
-			statelessUnwantedDel = append(statelessUnwantedDel, rule)
+			statelessUnwantedDel = append(statelessUnwantedDel, fmt.Sprintf("%s,%s,%s",
+				identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
 		}
 	}
 	if len(delRules) != 0 {
@@ -1214,6 +1215,7 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 		}
 		if isStateless {
 			var statelessDelRules []string
+			statelessSeen := make(map[string]struct{})
 			for _, r := range ledger {
 				vip := r.Labels[util.EipV4IpLabel]
 				if vip == "" {
@@ -1224,15 +1226,19 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 						vip = eip.Spec.V4ip
 					}
 				}
-				if vip == "" || r.Spec.InternalIP == "" || r.Spec.InternalPort == "" {
+				if vip == "" || r.Spec.ExternalPort == "" || r.Spec.Protocol == "" {
 					continue
 				}
 				key := vip + "/" + r.Spec.ExternalPort + "/" + strings.ToLower(r.Spec.Protocol)
 				if _, ok := claimed[key]; ok {
 					continue
 				}
-				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s,%s,%s",
-					vip, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol), r.Spec.InternalIP, r.Spec.InternalPort))
+				if _, ok := statelessSeen[key]; ok {
+					continue
+				}
+				statelessSeen[key] = struct{}{}
+				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
+					vip, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol)))
 			}
 			if len(statelessDelRules) != 0 {
 				if err = c.execNatGwRulesInPods(pods, natGwStatelessDnatDel, statelessDelRules); err != nil {
