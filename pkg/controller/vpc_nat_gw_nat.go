@@ -2116,9 +2116,13 @@ func (c *Controller) finalDeleteFipInPod(key string, cachedFip *kubeovnv1.Iptabl
 			statusNatGwDp = eip.Spec.NatGwDp
 		}
 	}
+	statusInternalIP := cachedFip.Status.InternalIP
+	if statusInternalIP == "" {
+		statusInternalIP = cachedFip.Spec.InternalIP
+	}
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("fip %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
-	} else if err := c.deleteFipInPod(statusNatGwDp, statusV4ip); err != nil {
+	} else if err := c.deleteFipInPod(statusNatGwDp, statusV4ip, statusInternalIP); err != nil {
 		klog.Errorf("failed to delete fip %s, %v", key, err)
 		firstErr = err
 	}
@@ -2140,8 +2144,8 @@ func (c *Controller) finalDeleteFipInPod(key string, cachedFip *kubeovnv1.Iptabl
 			klog.Warningf("fip %s not ready: skip spec-based cleanup due to incomplete spec identity (v4ip=%q, natGwDp=%q)", key, specV4ip, specNatGwDp)
 			return firstErr
 		}
-		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp {
-			if err = c.deleteFipInPod(specNatGwDp, specV4ip); err != nil {
+		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || (cachedFip.Spec.InternalIP != "" && cachedFip.Spec.InternalIP != statusInternalIP) {
+			if err = c.deleteFipInPod(specNatGwDp, specV4ip, cachedFip.Spec.InternalIP); err != nil {
 				klog.Errorf("failed spec-based cleanup for fip %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2327,7 +2331,7 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 }
 
 // deleteFipInPod 向指定的 VPC NAT 网关 Pod 下发删除 FIP 规则指令（无状态模式下路由至 stateless-fip-del）。
-func (c *Controller) deleteFipInPod(dp, v4ip string) error {
+func (c *Controller) deleteFipInPod(dp, v4ip, internalIP string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.
@@ -2348,13 +2352,18 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 		}
 		return err
 	}
-	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP)
+	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP).
+	// In stateless mode, providing internalIP enables precise O(1) element deletion without rule inspection.
 	operation, err := c.natGatewayOperation(dp, natGwSubnetFipDel)
 	if err != nil {
 		klog.Errorf("gateway %s operation %s: %v", dp, natGwSubnetFipDel, err)
 		return err
 	}
-	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, []string{v4ip}); err != nil {
+	rule := v4ip
+	if internalIP != "" {
+		rule = fmt.Sprintf("%s,%s", v4ip, internalIP)
+	}
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, []string{rule}); err != nil {
 		klog.Errorf("failed to apply gateway %s EIP %s: %v", dp, v4ip, err)
 		return err
 	}

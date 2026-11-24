@@ -508,7 +508,7 @@ func TestDeleteFipInPod_NatGwGone(t *testing.T) {
 	t.Parallel()
 	fc, err := newFakeControllerWithOptions(t, nil)
 	require.NoError(t, err)
-	err = fc.fakeController.deleteFipInPod("missing-gw", "10.0.0.1")
+	err = fc.fakeController.deleteFipInPod("missing-gw", "10.0.0.1", "")
 	require.NoError(t, err, "should skip cleanup when gateway CRD is gone")
 }
 
@@ -520,7 +520,7 @@ func TestDeleteFipInPod_NatGwExistsPodMissing(t *testing.T) {
 		VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("test-gw")},
 	})
 	require.NoError(t, err)
-	err = fc.fakeController.deleteFipInPod("test-gw", "10.0.0.1")
+	err = fc.fakeController.deleteFipInPod("test-gw", "10.0.0.1", "")
 	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 

@@ -910,6 +910,7 @@ function del_floating_ip() {
     # NAT chains yet, in which case there is no FIP rule to remove.
     for eip in "$@"
     do
+        eip="${eip%%,*}"
         # delete DNAT rule: match "-d <eip>/32" (/32 suffix prevents prefix match)
         # head -1: FIP is 1:1, at most one rule per EIP; guard against unexpected duplicates
         dnatRule=$($iptables_save_cmd | grep EXCLUSIVE_DNAT | grep -w -- "-d $eip/32" | head -1)

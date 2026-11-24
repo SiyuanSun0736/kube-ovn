@@ -36,6 +36,11 @@ grep -Fx 'delete element ip kube_ovn_stateless_nat sl_fip_dnat { 192.0.2.1 }' "$
 grep -Fx 'delete chain ip kube_ovn_stateless_nat sl_fin_192_0_2_1' "$tmp_dir/calls"
 grep -Fx 'delete chain ip kube_ovn_stateless_nat sl_fout_192_0_2_1' "$tmp_dir/calls"
 
+stateless_fip_add '192.0.2.1,10.0.0.2'
+stateless_fip_del '192.0.2.1,10.0.0.2'
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_fip_snat { 10.0.0.2 }' "$tmp_dir/calls"
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_notrack_ips { 10.0.0.2 }' "$tmp_dir/calls"
+
 stateless_dnat_add '192.0.2.11,80,tcp,10.0.0.2,8080'
 grep -F 'add element ip kube_ovn_stateless_nat sl_dnat_in { tcp . 80 . 192.0.2.11 : jump sl_din_tcp_192_0_2_11_80 }' "$tmp_dir/batches"
 grep -F 'add element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.2 : jump sl_dout_tcp_192_0_2_11_80 }' "$tmp_dir/batches"
