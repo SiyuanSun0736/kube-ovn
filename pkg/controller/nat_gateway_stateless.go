@@ -139,17 +139,19 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		return err
 	}
 
-	fipMappings, err := c.collectStatelessFipMappings(gwName, gatewayEips)
+	var mappings []statelessMapping
+	switch candidate.kind {
+	case "FIP":
+		mappings, err = c.collectStatelessFipMappings(gwName, gatewayEips)
+	case "DNAT":
+		mappings, err = c.collectStatelessDnatMappings(gwName, gatewayEips)
+	default:
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 
-	dnatMappings, err := c.collectStatelessDnatMappings(gwName, gatewayEips)
-	if err != nil {
-		return err
-	}
-
-	mappings := append(fipMappings, dnatMappings...)
 	for _, existing := range mappings {
 		if err := checkStatelessMappingConflict(gwName, candidate, existing, gatewayEips); err != nil {
 			return err
@@ -180,22 +182,17 @@ func (c *Controller) collectStatelessFipMappings(gwName string, gatewayEips map[
 
 	var mappings []statelessMapping
 	for _, item := range fips {
-		appliedEip := item.Annotations[util.VpcEipAnnotation]
-		if appliedEip == "" {
-			appliedEip = item.Spec.EIP
+		if item.DeletionTimestamp != nil || item.Spec.InternalIP == "" {
+			continue
 		}
-		appliedGw := item.Status.NatGwDp
-		if appliedGw == "" {
-			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
-		}
-		specEstablished := fipMappingEstablished(item)
-		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
-			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP, isEstablished: specEstablished})
-		}
-		if item.Status.InternalIP != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
-			if !specEstablished {
-				mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: appliedEip, host: item.Status.InternalIP, isEstablished: true})
-			}
+		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName || item.Status.NatGwDp == gwName {
+			mappings = append(mappings, statelessMapping{
+				kind:          "FIP",
+				name:          item.Name,
+				eip:           item.Spec.EIP,
+				host:          item.Spec.InternalIP,
+				isEstablished: fipMappingEstablished(item),
+			})
 		}
 	}
 	return mappings, nil
@@ -209,20 +206,14 @@ func (c *Controller) collectStatelessDnatMappings(gwName string, gatewayEips map
 
 	var mappings []statelessMapping
 	for _, item := range dnats {
-		appliedEip := item.Annotations[util.VpcEipAnnotation]
-		if appliedEip == "" {
-			appliedEip = item.Spec.EIP
+		if item.DeletionTimestamp != nil || item.Spec.InternalIP == "" {
+			continue
 		}
-		appliedGw := item.Status.NatGwDp
-		if appliedGw == "" {
-			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
-		}
-		owner := ""
-		if item.Labels[util.NftableLbSvcNsLabel] != "" && item.Labels[util.NftableLbSvcNameLabel] != "" {
-			owner = item.Labels[util.NftableLbSvcNsLabel] + "/" + item.Labels[util.NftableLbSvcNameLabel]
-		}
-		specEstablished := dnatMappingEstablished(item)
-		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
+		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName || item.Status.NatGwDp == gwName {
+			owner := ""
+			if item.Labels[util.NftableLbSvcNsLabel] != "" && item.Labels[util.NftableLbSvcNameLabel] != "" {
+				owner = item.Labels[util.NftableLbSvcNsLabel] + "/" + item.Labels[util.NftableLbSvcNameLabel]
+			}
 			mappings = append(mappings, statelessMapping{
 				kind:          "DNAT",
 				name:          item.Name,
@@ -233,65 +224,60 @@ func (c *Controller) collectStatelessDnatMappings(gwName string, gatewayEips map
 				externalPort:  item.Spec.ExternalPort,
 				owner:         owner,
 				isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
-				isEstablished: specEstablished,
+				isEstablished: dnatMappingEstablished(item),
 			})
-		}
-		if item.Status.InternalIP != "" && (appliedGw == gwName || gatewayEips[appliedEip]) {
-			if !specEstablished {
-				mappings = append(mappings, statelessMapping{
-					kind:          "DNAT",
-					name:          item.Name,
-					eip:           appliedEip,
-					host:          item.Status.InternalIP,
-					protocol:      strings.ToLower(item.Status.Protocol),
-					port:          item.Status.InternalPort,
-					externalPort:  item.Status.ExternalPort,
-					owner:         owner,
-					isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
-					isEstablished: true,
-				})
-			}
 		}
 	}
 	return mappings, nil
 }
 
 func checkStatelessMappingConflict(gwName string, candidate, existing statelessMapping, gatewayEips map[string]bool) error {
-	if (existing.eip != "" && !gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
+	if (existing.eip != "" && !gatewayEips[existing.eip] && existing.eip != candidate.eip) || existing.name == candidate.name {
 		return nil
 	}
 	// 已建立生效的映射在重放恢复时，不受未生效的新建冲突请求阻断
 	if candidate.isEstablished && !existing.isEstablished {
 		return nil
 	}
-	// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
-	// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
-	// shared between exclusive and Share-DNAT rules.
+
+	// 1. 同 EIP 独占性与端口冲突检查
 	if existing.eip != "" && existing.eip == candidate.eip {
-		if existing.kind != "DNAT" || candidate.kind != "DNAT" || existing.isShare != candidate.isShare {
-			return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", gwName, candidate.eip, existing.kind, existing.name)
+		if candidate.kind == "FIP" {
+			return fmt.Errorf("stateless gateway %s: EIP %s is already used by FIP %s", gwName, candidate.eip, existing.name)
+		}
+		// DNAT: 独占模式与共享模式互斥
+		if existing.isShare != candidate.isShare {
+			return fmt.Errorf("stateless gateway %s: EIP %s is already used by DNAT %s", gwName, candidate.eip, existing.name)
 		}
 		existingExtPort, _ := strconv.Atoi(existing.externalPort)
 		candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
 		sameExtPort := existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)
 		if existing.protocol == candidate.protocol && sameExtPort {
 			if !existing.isShare || existing.owner == "" || candidate.owner == "" || existing.owner != candidate.owner {
-				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
+				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by DNAT %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.name)
 			}
 		}
 	}
+
+	// 2. 后端反向唯一性检查（同一个后端不可指向不同公网身份）
 	existingHost, err := util.StatelessNATIPv4Host(existing.host)
 	if err != nil {
 		return nil
 	}
+	if candidate.kind == "FIP" {
+		if existingHost == candidate.host && existing.eip != candidate.eip {
+			return fmt.Errorf("stateless gateway %s: backend %s conflicts with FIP %s; reverse mapping must be unique", gwName, candidate.host, existing.name)
+		}
+		return nil
+	}
+
+	// DNAT: 协议 + 端口 + 内网 IP 三元组唯一
 	existingPort, _ := strconv.Atoi(existing.port)
 	candidatePort, _ := strconv.Atoi(candidate.port)
 	samePort := existing.port == candidate.port || (existingPort != 0 && existingPort == candidatePort)
-	// Stateless backends must have unambiguous reverse routing and cannot overlap with
-	// another public identity.
-	if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
+	if existingHost == candidate.host && existing.protocol == candidate.protocol && samePort {
 		if existing.eip != candidate.eip || existing.externalPort != candidate.externalPort {
-			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
+			return fmt.Errorf("stateless gateway %s: backend %s conflicts with DNAT %s; reverse mapping must be unique", gwName, candidate.host, existing.name)
 		}
 	}
 	return nil
