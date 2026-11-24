@@ -528,11 +528,16 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 
 	for _, identity := range identities {
 		wanted[identity.vip+"/"+identity.externalPort+"/"+identity.protocol] = struct{}{}
+		isEipIdentity := isStateless && eipIP != "" && identity.vip == eipIP
 		if len(identity.backends) == 0 {
+			statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+			if isEipIdentity {
+				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
+					identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
+			}
 			continue
 		}
 
-		isEipIdentity := isStateless && eipIP != "" && identity.vip == eipIP
 		if isEipIdentity && len(identity.backends) == 1 {
 			host, port, err := net.SplitHostPort(identity.backends[0])
 			if err != nil {
@@ -1196,35 +1201,43 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 			}
 			delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
 		}
+		isStateless, err := c.isStatelessNatGateway(gw)
+		if err != nil {
+			klog.Errorf("failed to check dataplane mode for gateway %s: %v", gw, err)
+			return err
+		}
 		if len(delRules) != 0 {
-			isStateless, err := c.isStatelessNatGateway(gw)
-			if err != nil {
-				klog.Errorf("failed to check dataplane mode for gateway %s: %v", gw, err)
-				return err
-			}
 			if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
 				klog.Errorf("failed to remove stateful identities of service %s/%s on gateway %s: %v", namespace, name, gw, err)
 				return fmt.Errorf("failed to remove identities of service %s/%s: %w", namespace, name, err)
 			}
-			if isStateless {
-				var statelessDelRules []string
-				for _, r := range ledger {
-					if r.Spec.EIP != "" || r.Labels[util.EipV4IpLabel] != "" {
-						vip := r.Labels[util.EipV4IpLabel]
-						if vip == "" {
-							vip = r.Status.V4ip
-						}
-						if vip != "" {
-							statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s,%s,%s",
-								vip, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol), r.Spec.InternalIP, r.Spec.InternalPort))
-						}
+		}
+		if isStateless {
+			var statelessDelRules []string
+			for _, r := range ledger {
+				vip := r.Labels[util.EipV4IpLabel]
+				if vip == "" {
+					vip = r.Status.V4ip
+				}
+				if vip == "" && r.Spec.EIP != "" {
+					if eip, err := c.iptablesEipsLister.Get(r.Spec.EIP); err == nil && eip != nil {
+						vip = eip.Spec.V4ip
 					}
 				}
-				if len(statelessDelRules) != 0 {
-					if err = c.execNatGwRulesInPods(pods, natGwStatelessDnatDel, statelessDelRules); err != nil {
-						klog.Errorf("failed to remove stateless identities of service %s/%s on gateway %s: %v", namespace, name, gw, err)
-						return fmt.Errorf("failed to remove stateless identities of service %s/%s: %w", namespace, name, err)
-					}
+				if vip == "" || r.Spec.InternalIP == "" || r.Spec.InternalPort == "" {
+					continue
+				}
+				key := vip + "/" + r.Spec.ExternalPort + "/" + strings.ToLower(r.Spec.Protocol)
+				if _, ok := claimed[key]; ok {
+					continue
+				}
+				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s,%s,%s",
+					vip, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol), r.Spec.InternalIP, r.Spec.InternalPort))
+			}
+			if len(statelessDelRules) != 0 {
+				if err = c.execNatGwRulesInPods(pods, natGwStatelessDnatDel, statelessDelRules); err != nil {
+					klog.Errorf("failed to remove stateless identities of service %s/%s on gateway %s: %v", namespace, name, gw, err)
+					return fmt.Errorf("failed to remove stateless identities of service %s/%s: %w", namespace, name, err)
 				}
 			}
 		}

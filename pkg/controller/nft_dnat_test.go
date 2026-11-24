@@ -171,7 +171,7 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.Equal(t, []string{"1.1.1.1,80,tcp,10.0.0.5,8080"}, programmed[natGwStatelessDnatAdd])
 	require.Equal(t, []string{"10.96.0.10,80,tcp,none,0,10.0.0.5:8080"}, programmed[natGwNftDnatMapAdd])
 
-	// 5. Zero-backend identity does not fail
+	// 5. Zero-backend identity does not fail and triggers rule cleanup
 	programmed = map[string][]string{}
 	zeroBackendIdentities := []*nftableLbIdentity{
 		{
@@ -183,6 +183,8 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	}
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, zeroBackendIdentities, nil, nil))
 	require.Empty(t, programmed[natGwStatelessDnatAdd])
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
 }
 
 // TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile

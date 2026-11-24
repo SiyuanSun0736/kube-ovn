@@ -2648,8 +2648,29 @@ function stateless_mapping_add() {
         fi
         external_port=$((10#$external_port))
         internal_port=$((10#$internal_port))
+        local in_chain="sl_din_${protocol}_${eip//./_}_${external_port}"
+        local prev_in_rules
+        prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+        if [[ -n "$prev_in_rules" ]]; then
+            local prev_ip prev_port
+            prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+            prev_port=$(grep -oE "$protocol dport set [0-9]+" <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+            if [[ -n "$prev_ip" && -n "$prev_port" ]] && [[ "$prev_ip" != "$internal_ip" || "$prev_port" != "$internal_port" ]]; then
+                stateless_mapping_del dnat "$eip,$external_port,$protocol,$prev_ip,$prev_port"
+            fi
+        fi
     else
         IFS=, read -r eip internal_ip extra <<< "$rule"
+        local in_chain="sl_fin_${eip//./_}"
+        local prev_in_rules
+        prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+        if [[ -n "$prev_in_rules" ]]; then
+            local prev_ip
+            prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+            if [[ -n "$prev_ip" && "$prev_ip" != "$internal_ip" ]]; then
+                stateless_mapping_del fip "$eip"
+            fi
+        fi
     fi
     if [[ -n "$extra" ]] || ! stateless_ipv4 "$eip" || ! stateless_ipv4 "$internal_ip"; then
         echo "Invalid stateless $kind IPv4 mapping: $rule" >&2
@@ -2739,7 +2760,7 @@ function stateless_mapping_del() {
             # 兜底：若 in_chain 已先被删除或提取失败，根据反向规则特征扫描并清理残留的 sl_dout_* 链与 map 元素
             local orphan_dout
             for orphan_dout in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v e="${eip//./\\.}" -v p="$protocol" -v pt="$port" '
-              $1 == "chain" && $2 ~ ("^sl_dout_" p "_") { cur = $2 }
+              $1 == "chain" { cur = ($2 ~ ("^sl_dout_" p "_")) ? $2 : "" }
               cur && $0 ~ ("ip saddr set " e " " p " sport set " pt "($|[ ;])") { print cur; cur = "" }
             '); do
                 local elem_key
