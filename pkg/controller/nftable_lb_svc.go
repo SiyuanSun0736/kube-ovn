@@ -1217,19 +1217,19 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 			var statelessDelRules []string
 			statelessSeen := make(map[string]struct{})
 			for _, r := range ledger {
-				vip := r.Labels[util.EipV4IpLabel]
-				if vip == "" {
-					vip = r.Status.V4ip
+				eipV4 := r.Labels[util.EipV4IpLabel]
+				if eipV4 == "" {
+					eipV4 = r.Status.V4ip
 				}
-				if vip == "" && r.Spec.EIP != "" {
+				if eipV4 == "" && r.Spec.EIP != "" {
 					if eip, err := c.iptablesEipsLister.Get(r.Spec.EIP); err == nil && eip != nil {
-						vip = eip.Spec.V4ip
+						eipV4 = eip.Spec.V4ip
 					}
 				}
-				if vip == "" || r.Spec.ExternalPort == "" || r.Spec.Protocol == "" {
+				if eipV4 == "" || r.Spec.ExternalPort == "" || r.Spec.Protocol == "" {
 					continue
 				}
-				key := vip + "/" + r.Spec.ExternalPort + "/" + strings.ToLower(r.Spec.Protocol)
+				key := eipV4 + "/" + r.Spec.ExternalPort + "/" + strings.ToLower(r.Spec.Protocol)
 				if _, ok := claimed[key]; ok {
 					continue
 				}
@@ -1238,7 +1238,7 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 				}
 				statelessSeen[key] = struct{}{}
 				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
-					vip, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol)))
+					eipV4, r.Spec.ExternalPort, strings.ToLower(r.Spec.Protocol)))
 			}
 			if len(statelessDelRules) != 0 {
 				if err = c.execNatGwRulesInPods(pods, natGwStatelessDnatDel, statelessDelRules); err != nil {
