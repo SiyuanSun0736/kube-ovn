@@ -26,7 +26,7 @@ func (c *Controller) activeNatGatewayDataplaneMode(gw *kubeovnv1.VpcNatGateway) 
 
 // natGatewayOperation 根据指定 VPC NAT 网关的 dataplaneMode 动态解析底层操作指令，查询失败时重新排队重试且严禁回退有状态。
 func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
-	if c == nil || c.vpcNatGatewayLister == nil {
+	if dp == "" {
 		return operation, nil
 	}
 	gw, err := c.vpcNatGatewayLister.Get(dp)
@@ -59,9 +59,6 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	if name == "" {
 		return false, nil
 	}
-	if c == nil || c.vpcNatGatewayLister == nil {
-		return false, nil
-	}
 	gw, err := c.vpcNatGatewayLister.Get(name)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -76,6 +73,47 @@ func (c *Controller) isStatelessNatGateway(name string) (bool, error) {
 	return mode == util.NatDataplaneModeStatelessNft, nil
 }
 
+func fipMappingEstablished(fip *kubeovnv1.IptablesFIPRule) bool {
+	if fip == nil {
+		return false
+	}
+	appliedEip := fip.Annotations[util.VpcEipAnnotation]
+	if appliedEip == "" {
+		appliedEip = fip.Spec.EIP
+	}
+	return (fip.Status.Ready || fip.Status.V4ip != "" || fip.Labels[util.EipUIDLabel] != "") &&
+		fip.Spec.InternalIP == fip.Status.InternalIP &&
+		fip.Spec.EIP == appliedEip
+}
+
+func dnatMappingEstablished(dnat *kubeovnv1.IptablesDnatRule) bool {
+	if dnat == nil {
+		return false
+	}
+	appliedEip := dnat.Annotations[util.VpcEipAnnotation]
+	if appliedEip == "" {
+		appliedEip = dnat.Spec.EIP
+	}
+	return (dnat.Status.Ready || dnat.Status.V4ip != "" || dnat.Labels[util.EipUIDLabel] != "") &&
+		dnat.Spec.InternalIP == dnat.Status.InternalIP &&
+		dnat.Spec.InternalPort == dnat.Status.InternalPort &&
+		dnat.Spec.ExternalPort == dnat.Status.ExternalPort &&
+		strings.EqualFold(dnat.Spec.Protocol, dnat.Status.Protocol) &&
+		dnat.Spec.EIP == appliedEip
+}
+
+func dnatMatchesDesired(existing, desired *kubeovnv1.IptablesDnatRule) bool {
+	if existing == nil || desired == nil {
+		return false
+	}
+	return (existing.Status.Ready || existing.Status.V4ip != "" || existing.Labels[util.EipUIDLabel] != "") &&
+		existing.Spec.InternalIP == desired.Spec.InternalIP &&
+		existing.Spec.InternalPort == desired.Spec.InternalPort &&
+		existing.Spec.ExternalPort == desired.Spec.ExternalPort &&
+		strings.EqualFold(existing.Spec.Protocol, desired.Spec.Protocol) &&
+		existing.Spec.EIP == desired.Spec.EIP
+}
+
 // statelessMapping 描述无状态规则的公私网选择器，无状态反向改写无法区分指向同一后端的多个公网身份。
 type statelessMapping struct {
 	kind, name, eip, host, protocol, port, externalPort string
@@ -85,7 +123,7 @@ type statelessMapping struct {
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
 func (c *Controller) validateStatelessMapping(gwName string, candidate statelessMapping) error {
-	if c == nil || c.iptablesEipsLister == nil || c.vpcNatGatewayLister == nil || gwName == "" {
+	if gwName == "" {
 		return nil
 	}
 	enabled, err := c.isStatelessNatGateway(gwName)
@@ -130,8 +168,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if appliedGw == "" {
 			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
 		}
-		specEstablished := (item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != "") &&
-			item.Spec.InternalIP == item.Status.InternalIP && item.Spec.EIP == appliedEip
+		specEstablished := fipMappingEstablished(item)
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			mappings = append(mappings, statelessMapping{kind: "FIP", name: item.Name, eip: item.Spec.EIP, host: item.Spec.InternalIP, isEstablished: specEstablished})
 		}
@@ -150,12 +187,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if appliedGw == "" {
 			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
 		}
-		specEstablished := (item.Status.Ready || item.Status.V4ip != "" || item.Labels[util.EipUIDLabel] != "") &&
-			item.Spec.InternalIP == item.Status.InternalIP &&
-			item.Spec.InternalPort == item.Status.InternalPort &&
-			item.Spec.ExternalPort == item.Status.ExternalPort &&
-			item.Spec.Protocol == item.Status.Protocol &&
-			item.Spec.EIP == appliedEip
+		specEstablished := dnatMappingEstablished(item)
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			mappings = append(mappings, statelessMapping{
 				kind:          "DNAT",

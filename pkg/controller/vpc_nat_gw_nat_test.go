@@ -6,14 +6,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	listers "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+func newEmptyFakeNatGwController() *Controller {
+	gwIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	fipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	dnatIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	return &Controller{
+		vpcNatGatewayLister:     listers.NewVpcNatGatewayLister(gwIndexer),
+		iptablesEipsLister:      listers.NewIptablesEIPLister(eipIndexer),
+		iptablesFipsLister:      listers.NewIptablesFIPRuleLister(fipIndexer),
+		iptablesDnatRulesLister: listers.NewIptablesDnatRuleLister(dnatIndexer),
+	}
+}
+
 func TestValidateDnat(t *testing.T) {
-	c := &Controller{}
+	c := newEmptyFakeNatGwController()
 
 	tests := []struct {
 		name    string
@@ -275,7 +290,7 @@ func TestValidateDnat(t *testing.T) {
 }
 
 func TestValidateFip(t *testing.T) {
-	c := &Controller{}
+	c := newEmptyFakeNatGwController()
 
 	tests := []struct {
 		name    string
@@ -358,7 +373,7 @@ func TestValidateFip(t *testing.T) {
 }
 
 func TestValidateSnat(t *testing.T) {
-	c := &Controller{}
+	c := newEmptyFakeNatGwController()
 
 	tests := []struct {
 		name    string
@@ -515,7 +530,7 @@ func TestDeleteDnatInPod_NatGwGone(t *testing.T) {
 	t.Parallel()
 	fc, err := newFakeControllerWithOptions(t, nil)
 	require.NoError(t, err)
-	err = fc.fakeController.deleteDnatInPod("missing-gw", "tcp", "10.0.0.1", "80")
+	err = fc.fakeController.deleteDnatInPod("missing-gw", "tcp", "10.0.0.1", "80", "", "")
 	require.NoError(t, err, "should skip cleanup when gateway CRD is gone")
 }
 
@@ -527,7 +542,7 @@ func TestDeleteDnatInPod_NatGwExistsPodMissing(t *testing.T) {
 		VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("test-gw")},
 	})
 	require.NoError(t, err)
-	err = fc.fakeController.deleteDnatInPod("test-gw", "tcp", "10.0.0.1", "80")
+	err = fc.fakeController.deleteDnatInPod("test-gw", "tcp", "10.0.0.1", "80", "", "")
 	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 

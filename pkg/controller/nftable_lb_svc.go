@@ -379,15 +379,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		existingMap[rule.Name] = rule
 	}
 	for _, record := range desired {
-		isEstablished := false
-		if cur, ok := existingMap[record.Name]; ok && cur != nil {
-			isEstablished = (cur.Status.Ready || cur.Status.V4ip != "" || cur.Labels[util.EipUIDLabel] != "") &&
-				cur.Spec.InternalIP == record.Spec.InternalIP &&
-				cur.Spec.InternalPort == record.Spec.InternalPort &&
-				cur.Spec.ExternalPort == record.Spec.ExternalPort &&
-				cur.Spec.Protocol == record.Spec.Protocol &&
-				cur.Spec.EIP == record.Spec.EIP
-		}
+		isEstablished := dnatMatchesDesired(existingMap[record.Name], record)
 		if err = c.validateStatelessMapping(gwName, statelessMapping{
 			kind:          "DNAT",
 			name:          record.Name,

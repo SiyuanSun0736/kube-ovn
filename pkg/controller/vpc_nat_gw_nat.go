@@ -1164,16 +1164,8 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 	}
 	klog.V(3).Infof("handle update snat %s", key)
 
-	// add or update should make sure vpc nat enabled
-	if vpcNatEnabled != "true" {
-		if released, releaseErr := c.releaseDeletedEipRef(
-			key, util.SnatUsingEip, cachedSnat.Spec.EIP, cachedSnat.Labels, cachedSnat.Annotations,
-			func() error { return c.finalDeleteSnatInPod(key, cachedSnat) },
-			func() error { return c.patchSnatStatus(key, "", "", "", "", false) },
-		); released || releaseErr != nil {
-			return releaseErr
-		}
-		return errors.New("iptables nat gw not enable")
+	if err := c.validateSnatRule(cachedSnat); err != nil {
+		return err
 	}
 
 	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
@@ -1194,8 +1186,9 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		return err
 	}
 
-	if err := c.validateSnatRule(cachedSnat); err != nil {
-		return err
+	// add or update should make sure vpc nat enabled
+	if vpcNatEnabled != "true" {
+		return errors.New("iptables nat gw not enable")
 	}
 
 	if eip.Spec.NatGwDp == "" {
@@ -2393,7 +2386,7 @@ func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPor
 }
 
 // deleteDnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 DNAT 规则指令（无状态模式下规整端口并路由至 stateless-dnat-del）。
-func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string, internal ...string) error {
+func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort, internalIP, internalPort string) error {
 	protocol = strings.ToLower(protocol)
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2424,8 +2417,8 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string, in
 	// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only.
 	// In stateless mode, providing internalIP and internalPort enables precise O(1) element deletion without rule inspection.
 	rule := fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)
-	if len(internal) >= 2 && internal[0] != "" && internal[1] != "" {
-		rule = fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internal[0], internal[1])
+	if internalIP != "" && internalPort != "" {
+		rule = fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
 	}
 	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, []string{rule}); err != nil {
 		klog.Errorf("failed to apply gateway %s EIP %s:%s protocol %s: %v", dp, v4ip, externalPort, protocol, err)
@@ -2623,16 +2616,6 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		}
 	}
 	if targetGw != "" {
-		appliedEip := dnat.Annotations[util.VpcEipAnnotation]
-		if appliedEip == "" {
-			appliedEip = dnat.Spec.EIP
-		}
-		isEstablished := (dnat.Status.Ready || dnat.Status.V4ip != "" || dnat.Labels[util.EipUIDLabel] != "") &&
-			dnat.Spec.InternalIP == dnat.Status.InternalIP &&
-			dnat.Spec.InternalPort == dnat.Status.InternalPort &&
-			dnat.Spec.ExternalPort == dnat.Status.ExternalPort &&
-			dnat.Spec.Protocol == dnat.Status.Protocol &&
-			dnat.Spec.EIP == appliedEip
 		if err = c.validateStatelessMapping(targetGw, statelessMapping{
 			kind:          "DNAT",
 			name:          dnat.Name,
@@ -2642,7 +2625,7 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 			port:          dnat.Spec.InternalPort,
 			externalPort:  dnat.Spec.ExternalPort,
 			isShare:       dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
-			isEstablished: isEstablished,
+			isEstablished: dnatMappingEstablished(dnat),
 		}); err != nil {
 			klog.Errorf("validate stateless dnat rule %s: %v", dnat.Name, err)
 			return err
@@ -2685,18 +2668,12 @@ func (c *Controller) validateFipRule(fip *kubeovnv1.IptablesFIPRule) error {
 	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
 		return nil
 	}
-	appliedEip := fip.Annotations[util.VpcEipAnnotation]
-	if appliedEip == "" {
-		appliedEip = fip.Spec.EIP
-	}
-	isEstablished := (fip.Status.Ready || fip.Status.V4ip != "" || fip.Labels[util.EipUIDLabel] != "") &&
-		fip.Spec.InternalIP == fip.Status.InternalIP && fip.Spec.EIP == appliedEip
 	if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
 		kind:          "FIP",
 		name:          fip.Name,
 		eip:           fip.Spec.EIP,
 		host:          fip.Spec.InternalIP,
-		isEstablished: isEstablished,
+		isEstablished: fipMappingEstablished(fip),
 	}); err != nil {
 		klog.Errorf("validate stateless fip rule %s: %v", fip.Name, err)
 		return err

@@ -377,10 +377,7 @@ func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
 	mode, err := c.activeNatGatewayDataplaneMode(gw)
 	if err != nil {
 		klog.Errorf("resolve dataplane mode for gateway %s: %v", gw.Name, err)
-		if gw.Status.DataplaneMode != "" {
-			return gw.Status.DataplaneMode
-		}
-		return strings.TrimSpace(gw.Spec.DataplaneMode)
+		return ""
 	}
 	return mode
 }
@@ -741,6 +738,12 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle init vpc nat gateway %s", key)
 
+	dataplaneMode, err := c.activeNatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("failed to get active dataplane mode for gateway %s: %v", key, err)
+		return err
+	}
+
 	// subnet for vpc-nat-gw has been checked when create vpc-nat-gw
 
 	pod, err := c.getNatGwPod(key, c.natGwNamespace(gw))
@@ -814,11 +817,6 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
 	}
 
-	dataplaneMode, err := c.activeNatGatewayDataplaneMode(gw)
-	if err != nil {
-		klog.Errorf("failed to get active dataplane mode for gateway %s: %v", key, err)
-		return err
-	}
 	// 无状态网关在 Pod 内初始化基础 nft 表及 TCP MSS 自动钳制
 	if dataplaneMode == util.NatDataplaneModeStatelessNft {
 		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwStatelessInit, nil); err != nil {

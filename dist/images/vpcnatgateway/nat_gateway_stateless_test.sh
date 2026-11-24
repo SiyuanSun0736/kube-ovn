@@ -79,26 +79,4 @@ nft() {
 found_key=$(nft_find_map_key_by_target sl_fip_snat "sl_fout_10_0_0_3")
 if [[ "$found_key" != "10.0.0.3" ]]; then echo "nft_find_map_key_by_target expected 10.0.0.3, got $found_key" >&2; exit 1; fi
 
-# 孤儿反向链 map key 端口提取测试（防将 '.' 误判为端口）
-test_elem_key="tcp . 8080 . 10.0.0.3"
-test_ip=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i}' <<< "$test_elem_key")
-test_port=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) print $i}' <<< "$test_elem_key")
-if [[ "$test_ip" != "10.0.0.3" || "$test_port" != "8080" ]]; then
-    echo "orphan map key parsing failed: got ip=$test_ip port=$test_port" >&2
-    exit 1
-fi
-
-# 验证精确 IP 边界匹配（防 10.0.0.1 误匹配 10.0.0.10 导致链泄漏）
-map_content="elements = { tcp . 8080 . 10.0.0.10 : jump sl_dout_tcp_10_0_0_10_8080 }"
-target_ip="10.0.0.1"
-if grep -qE "[ .]${target_ip//./\\.}[ :;]" <<< "$map_content"; then
-    echo "regex falsely matched prefix IP $target_ip in $map_content" >&2
-    exit 1
-fi
-matching_ip="10.0.0.10"
-if ! grep -qE "[ .]${matching_ip//./\\.}[ :;]" <<< "$map_content"; then
-    echo "regex failed to match exact IP $matching_ip in $map_content" >&2
-    exit 1
-fi
-
 echo 'stateless shell tests passed'
