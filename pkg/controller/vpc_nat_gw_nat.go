@@ -2616,6 +2616,10 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		}
 	}
 	if targetGw != "" {
+		owner := ""
+		if dnat.Labels[util.NftableLbSvcNsLabel] != "" && dnat.Labels[util.NftableLbSvcNameLabel] != "" {
+			owner = dnat.Labels[util.NftableLbSvcNsLabel] + "/" + dnat.Labels[util.NftableLbSvcNameLabel]
+		}
 		if err = c.validateStatelessMapping(targetGw, statelessMapping{
 			kind:          "DNAT",
 			name:          dnat.Name,
@@ -2624,6 +2628,7 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 			protocol:      dnat.Spec.Protocol,
 			port:          dnat.Spec.InternalPort,
 			externalPort:  dnat.Spec.ExternalPort,
+			owner:         owner,
 			isShare:       dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
 			isEstablished: dnatMappingEstablished(dnat),
 		}); err != nil {

@@ -112,9 +112,9 @@ func dnatMatchesDesired(existing, desired *kubeovnv1.IptablesDnatRule) bool {
 
 // statelessMapping 描述无状态规则的公私网选择器，无状态反向改写无法区分指向同一后端的多个公网身份。
 type statelessMapping struct {
-	kind, name, eip, host, protocol, port, externalPort string
-	isShare                                             bool
-	isEstablished                                       bool
+	kind, name, eip, host, protocol, port, externalPort, owner string
+	isShare                                                    bool
+	isEstablished                                              bool
 }
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
@@ -183,6 +183,10 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if appliedGw == "" {
 			appliedGw = item.Labels[util.VpcNatGatewayNameLabel]
 		}
+		owner := ""
+		if item.Labels[util.NftableLbSvcNsLabel] != "" && item.Labels[util.NftableLbSvcNameLabel] != "" {
+			owner = item.Labels[util.NftableLbSvcNsLabel] + "/" + item.Labels[util.NftableLbSvcNameLabel]
+		}
 		specEstablished := dnatMappingEstablished(item)
 		if gatewayEips[item.Spec.EIP] || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			mappings = append(mappings, statelessMapping{
@@ -193,6 +197,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 				protocol:      strings.ToLower(item.Spec.Protocol),
 				port:          item.Spec.InternalPort,
 				externalPort:  item.Spec.ExternalPort,
+				owner:         owner,
 				isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
 				isEstablished: specEstablished,
 			})
@@ -207,6 +212,7 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 					protocol:      strings.ToLower(item.Status.Protocol),
 					port:          item.Status.InternalPort,
 					externalPort:  item.Status.ExternalPort,
+					owner:         owner,
 					isShare:       item.Spec.Type == kubeovnv1.DnatRuleTypeShare,
 					isEstablished: true,
 				})
@@ -222,23 +228,20 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		if candidate.isEstablished && !existing.isEstablished {
 			continue
 		}
-		// Stateful Share records (LoadBalancer Services) are handled by conntrack and nftable LB;
-		// they do not participate in stateless reverse routing, so two stateful share rules may
-		// reuse the same backend without conflict.
-		if existing.isShare && candidate.isShare {
-			continue
-		}
-		// FIP consumes the entire public address; exclusive port DNAT may share
+		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
 		// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
-		// shared with a stateful Share-DNAT rule.
+		// shared between exclusive and Share-DNAT rules.
 		if existing.eip != "" && existing.eip == candidate.eip {
-			if existing.isShare || candidate.isShare || existing.kind != "DNAT" || candidate.kind != "DNAT" {
+			if existing.kind != "DNAT" || candidate.kind != "DNAT" || existing.isShare != candidate.isShare {
 				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", gwName, candidate.eip, existing.kind, existing.name)
 			}
 			existingExtPort, _ := strconv.Atoi(existing.externalPort)
 			candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
-			if existing.protocol == candidate.protocol && (existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)) {
-				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
+			sameExtPort := existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)
+			if existing.protocol == candidate.protocol && sameExtPort {
+				if !existing.isShare || existing.owner == "" || candidate.owner == "" || existing.owner != candidate.owner {
+					return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
+				}
 			}
 		}
 		existingHost, err := util.StatelessNATIPv4Host(existing.host)
@@ -249,9 +252,11 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 		candidatePort, _ := strconv.Atoi(candidate.port)
 		samePort := existing.port == candidate.port || (existingPort != 0 && existingPort == candidatePort)
 		// Stateless backends must have unambiguous reverse routing and cannot overlap with
-		// stateful Service backends.
+		// another public identity.
 		if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
-			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
+			if existing.eip != candidate.eip || existing.externalPort != candidate.externalPort {
+				return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
+			}
 		}
 	}
 	return nil

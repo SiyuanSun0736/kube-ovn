@@ -139,30 +139,82 @@ func TestStatelessAndShareDnatConflicts(t *testing.T) {
 
 	// Existing share rule (e.g. from an nftable LoadBalancer Service)
 	shareExisting := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-existing"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "share-existing",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel:   "default",
+				util.NftableLbSvcNameLabel: "web",
+			},
+		},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip1", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8080", ExternalPort: "80", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
 	require.NoError(t, dnatIndexer.Add(shareExisting))
 
-	// 1. Two stateful share rules with same backend endpoint are permitted (conntrack tracks individual sessions)
-	shareAnotherOk := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-another-ok"},
+	// 1. Two share rules on a stateless gateway pointing to the same backend IP:port but different EIPs are rejected (ambiguous reverse routing)
+	shareAnotherConflict := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "share-another-conflict",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel:   "default",
+				util.NftableLbSvcNameLabel: "other",
+			},
+		},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8080", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
-	require.NoError(t, c.validateDnatRule(shareAnotherOk))
+	err := c.validateDnatRule(shareAnotherConflict)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "reverse mapping must be unique")
 
 	// 1.1 Another share rule with different backend port is permitted
 	shareAnotherPortOk := &kubeovnv1.IptablesDnatRule{
-		ObjectMeta: metav1.ObjectMeta{Name: "share-another-port-ok"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "share-another-port-ok",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel:   "default",
+				util.NftableLbSvcNameLabel: "other",
+			},
+		},
 		Spec: kubeovnv1.IptablesDnatRuleSpec{
 			EIP: "eip2", InternalIP: "10.0.0.2", Protocol: "tcp", InternalPort: "8081", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
 		},
 	}
 	require.NoError(t, c.validateDnatRule(shareAnotherPortOk))
+
+	// 1.2 Another share rule with same EIP and same external port but different service is rejected
+	shareSamePortConflict := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "share-same-port-conflict",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel:   "default",
+				util.NftableLbSvcNameLabel: "other",
+			},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip1", InternalIP: "10.0.0.3", Protocol: "tcp", InternalPort: "8081", ExternalPort: "80", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	err = c.validateDnatRule(shareSamePortConflict)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "is already used by")
+
+	// 1.3 Another share rule with same EIP and different external port is permitted
+	shareSameEipDiffPortOk := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "share-same-eip-diff-port-ok",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel:   "default",
+				util.NftableLbSvcNameLabel: "other",
+			},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip1", InternalIP: "10.0.0.3", Protocol: "tcp", InternalPort: "8081", ExternalPort: "8088", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	require.NoError(t, c.validateDnatRule(shareSameEipDiffPortOk))
 
 	// 2. A stateless DNAT rule CANNOT share the same backend with a share rule
 	statelessConflictBackend := &kubeovnv1.IptablesDnatRule{
