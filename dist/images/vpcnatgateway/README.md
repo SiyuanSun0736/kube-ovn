@@ -92,7 +92,7 @@ add map ip kube_ovn_stateless_nat sl_dnat_out        { type inet_proto . inet_se
 
 ### 2.3 映射子链
 
-前述基础链、默认规则与全局 Set/Map 在网关初始化函数 `stateless_init` 中一次性建立；下述映射子链及 map 元素由 `stateless_mapping_add` 动态添加（删除时对应 `stateless_mapping_del`）。
+前述基础链、默认规则与全局 Set/Map 在网关初始化函数 `stateless_init` 中一次性建立；下述映射子链及 map 元素由 `stateless_fip_add / stateless_dnat_add` 动态添加（删除时对应 `stateless_fip_del / stateless_dnat_del`）。
 
 #### FIP 映射子链
 

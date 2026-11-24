@@ -2619,71 +2619,29 @@ add rule ip kube_ovn_stateless_nat postrouting iifname "$VPC_INTERFACE" oifname 
 NFT
 }
 
-# stateless_mapping_add 原子添加单个双向无状态 NAT 映射规则（FIP/DNAT）。
-# 通过单表内向对应 map/vmap 注入元素并下发 iptables 发卡规则保证同 VPC 互访。
-function stateless_mapping_add() {
+# stateless_fip_add_rule 添加单个双向无状态 FIP 映射规则。
+function stateless_fip_add_rule() {
     check_inited
-    local kind=$1 rule=$2 eip internal_ip external_port protocol internal_port extra
-    if [[ "$kind" == dnat ]]; then
-        IFS=, read -r eip external_port protocol internal_ip internal_port extra <<< "$rule"
-        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
-        if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$external_port" || ! stateless_port "$internal_port"; then
-            echo "Invalid stateless DNAT ports/protocol: $rule" >&2
-            return 1
-        fi
-        external_port=$((10#$external_port))
-        internal_port=$((10#$internal_port))
-        local in_chain="sl_din_${protocol}_${eip//./_}_${external_port}"
-        local prev_in_rules prev_ip="" prev_port=""
-        prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
-        if [[ -n "$prev_in_rules" ]]; then
-            prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
-            prev_port=$(grep -oE "$protocol dport set [0-9]+" <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
-            if [[ -n "$prev_ip" ]] && [[ "$prev_ip" != "$internal_ip" || ( -n "$prev_port" && "$prev_port" != "$internal_port" ) ]]; then
-                stateless_mapping_del dnat "$eip,$external_port,$protocol,$prev_ip,$prev_port"
-            fi
-        fi
-    else
-        IFS=, read -r eip internal_ip extra <<< "$rule"
-        local in_chain="sl_fin_${eip//./_}"
-        local prev_in_rules
-        prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
-        if [[ -n "$prev_in_rules" ]]; then
-            local prev_ip
-            prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
-            if [[ -n "$prev_ip" && "$prev_ip" != "$internal_ip" ]]; then
-                stateless_mapping_del fip "$eip"
-            fi
-        fi
-    fi
+    local rule=$1 eip="" internal_ip="" extra=""
+    IFS=, read -r eip internal_ip extra <<< "$rule"
     if [[ -n "$extra" ]] || ! stateless_ipv4 "$eip" || ! stateless_ipv4 "$internal_ip"; then
-        echo "Invalid stateless $kind IPv4 mapping: $rule" >&2
+        echo "Invalid stateless fip IPv4 mapping: $rule" >&2
         return 1
     fi
 
-    if [[ "$kind" == dnat ]]; then
-        local in_chain="sl_din_${protocol}_${eip//./_}_${external_port}"
-        local out_chain="sl_dout_${protocol}_${eip//./_}_${external_port}"
-        if ! nft -f - <<NFT
-add table ip kube_ovn_stateless_nat
-add chain ip kube_ovn_stateless_nat $in_chain
-flush chain ip kube_ovn_stateless_nat $in_chain
-add rule ip kube_ovn_stateless_nat $in_chain notrack ip daddr set $internal_ip $protocol dport set $internal_port
-add chain ip kube_ovn_stateless_nat $out_chain
-flush chain ip kube_ovn_stateless_nat $out_chain
-add rule ip kube_ovn_stateless_nat $out_chain ip saddr set $eip $protocol sport set $external_port
-add element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $external_port . $eip : jump $in_chain }
-add element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip : jump $out_chain }
-add element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }
-NFT
-        then
-            return 1
+    local in_chain="sl_fin_${eip//./_}"
+    local out_chain="sl_fout_${eip//./_}"
+    local prev_in_rules
+    prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+    if [[ -n "$prev_in_rules" ]]; then
+        local prev_ip
+        prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+        if [[ -n "$prev_ip" && "$prev_ip" != "$internal_ip" ]]; then
+            stateless_fip_del "$eip"
         fi
-        (add_dnat "$rule") || return 1
-    elif [[ "$kind" == fip ]]; then
-        local in_chain="sl_fin_${eip//./_}"
-        local out_chain="sl_fout_${eip//./_}"
-        if ! nft -f - <<NFT
+    fi
+
+    if ! nft -f - <<NFT
 add table ip kube_ovn_stateless_nat
 add chain ip kube_ovn_stateless_nat $in_chain
 flush chain ip kube_ovn_stateless_nat $in_chain
@@ -2695,85 +2653,155 @@ add element ip kube_ovn_stateless_nat sl_fip_dnat { $eip : jump $in_chain }
 add element ip kube_ovn_stateless_nat sl_fip_snat { $internal_ip : jump $out_chain }
 add element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }
 NFT
-        then
-            return 1
-        fi
-        (add_floating_ip "$rule") || return 1
+    then
+        return 1
     fi
+    (add_floating_ip "$rule") || return 1
 }
 
-# stateless_mapping_del 幂等删除无状态映射对应的 map 记录及关联的发卡规则。
-function stateless_mapping_del() {
-    local kind=$1 rule=$2 eip="" port="" protocol="" internal_ip="" internal_port="" extra=""
-    if [[ "$kind" == dnat ]]; then
-        IFS=, read -r eip port protocol internal_ip internal_port extra <<< "$rule"
-        protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
-        if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$port"; then
-            return 0
-        fi
-        port=$((10#$port))
-    else
-        eip=$rule
-        extra=""
-    fi
+function stateless_fip_add() {
+    local rule
+    for rule in "$@"; do
+        stateless_fip_add_rule "$rule" || return 1
+    done
+}
+
+# stateless_fip_del_rule 幂等删除单个无状态 FIP 映射及关联的发卡规则。
+function stateless_fip_del_rule() {
+    local rule=$1 eip="" internal_ip="" extra=""
+    IFS=, read -r eip internal_ip extra <<< "$rule"
     if ! stateless_ipv4 "$eip" || [[ -n "$extra" ]]; then
         return 0
     fi
 
-    if [[ "$kind" == dnat ]]; then
-        local in_chain="sl_din_${protocol}_${eip//./_}_${port}"
-        local out_chain="sl_dout_${protocol}_${eip//./_}_${port}"
-        local live_ip="" live_port=""
-        local in_rules
-        in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
-        if [[ -n "$in_rules" ]]; then
-            live_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$in_rules" | awk '{print $4}' | head -n 1)
-            live_port=$(grep -oE "$protocol dport set [0-9]+" <<< "$in_rules" | awk '{print $4}' | head -n 1)
+    local in_chain="sl_fin_${eip//./_}"
+    local out_chain="sl_fout_${eip//./_}"
+    local in_rules
+    in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+    if [[ -n "$in_rules" ]]; then
+        local int_ip
+        int_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$in_rules" | awk '{print $4}' | head -n 1)
+        if [[ -n "$int_ip" ]]; then
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" || return 1
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
         fi
-        if [[ -n "$live_ip" && -n "$live_port" ]]; then
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $live_port . $live_ip }" || return 1
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $live_port . $live_ip }" || true
-        fi
-        if [[ -n "$internal_ip" && -n "$internal_port" ]] && stateless_ipv4 "$internal_ip" && stateless_port "$internal_port"; then
-            internal_port=$((10#$internal_port))
-            if [[ "$internal_ip" != "$live_ip" || "$internal_port" != "$live_port" ]]; then
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip }" || return 1
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }" || true
-            fi
-        fi
-        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $port . $eip }" || return 1
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
-        (del_dnat "$rule") || return 1
-    elif [[ "$kind" == fip ]]; then
-        local in_chain="sl_fin_${eip//./_}"
-        local out_chain="sl_fout_${eip//./_}"
-        local in_rules
-        in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
-        if [[ -n "$in_rules" ]]; then
-            local int_ip
-            int_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$in_rules" | awk '{print $4}' | head -n 1)
-            if [[ -n "$int_ip" ]]; then
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" || return 1
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
-            fi
-        fi
-        if [[ -n "$internal_ip" ]] && stateless_ipv4 "$internal_ip"; then
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $internal_ip }" || true
-            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }" || true
-        fi
-        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_dnat { $eip }" || return 1
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
-        (del_floating_ip "$eip") || return 1
     fi
-    return 0
+    if [[ -n "$internal_ip" ]] && stateless_ipv4 "$internal_ip"; then
+        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $internal_ip }" || true
+        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }" || true
+    fi
+    nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_dnat { $eip }" || return 1
+    nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
+    nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
+    (del_floating_ip "$eip") || return 1
 }
 
-function stateless_fip_add() { local rule; for rule in "$@"; do stateless_mapping_add fip "$rule" || return 1; done; }
-function stateless_fip_del() { local rule; for rule in "$@"; do stateless_mapping_del fip "$rule" || return 1; done; }
-function stateless_dnat_add() { local rule; for rule in "$@"; do stateless_mapping_add dnat "$rule" || return 1; done; }
-function stateless_dnat_del() { local rule; for rule in "$@"; do stateless_mapping_del dnat "$rule" || return 1; done; }
+function stateless_fip_del() {
+    local rule
+    for rule in "$@"; do
+        stateless_fip_del_rule "$rule" || return 1
+    done
+}
+
+# stateless_dnat_add_rule 添加单个双向无状态 DNAT 映射规则。
+function stateless_dnat_add_rule() {
+    check_inited
+    local rule=$1 eip="" external_port="" protocol="" internal_ip="" internal_port="" extra=""
+    IFS=, read -r eip external_port protocol internal_ip internal_port extra <<< "$rule"
+    protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+    if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$external_port" || ! stateless_port "$internal_port"; then
+        echo "Invalid stateless DNAT ports/protocol: $rule" >&2
+        return 1
+    fi
+    if [[ -n "$extra" ]] || ! stateless_ipv4 "$eip" || ! stateless_ipv4 "$internal_ip"; then
+        echo "Invalid stateless dnat IPv4 mapping: $rule" >&2
+        return 1
+    fi
+    external_port=$((10#$external_port))
+    internal_port=$((10#$internal_port))
+
+    local in_chain="sl_din_${protocol}_${eip//./_}_${external_port}"
+    local out_chain="sl_dout_${protocol}_${eip//./_}_${external_port}"
+    local prev_in_rules prev_ip="" prev_port=""
+    prev_in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+    if [[ -n "$prev_in_rules" ]]; then
+        prev_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+        prev_port=$(grep -oE "$protocol dport set [0-9]+" <<< "$prev_in_rules" | awk '{print $4}' | head -n 1)
+        if [[ -n "$prev_ip" ]] && [[ "$prev_ip" != "$internal_ip" || ( -n "$prev_port" && "$prev_port" != "$internal_port" ) ]]; then
+            stateless_dnat_del "$eip,$external_port,$protocol,$prev_ip,$prev_port"
+        fi
+    fi
+
+    if ! nft -f - <<NFT
+add table ip kube_ovn_stateless_nat
+add chain ip kube_ovn_stateless_nat $in_chain
+flush chain ip kube_ovn_stateless_nat $in_chain
+add rule ip kube_ovn_stateless_nat $in_chain notrack ip daddr set $internal_ip $protocol dport set $internal_port
+add chain ip kube_ovn_stateless_nat $out_chain
+flush chain ip kube_ovn_stateless_nat $out_chain
+add rule ip kube_ovn_stateless_nat $out_chain ip saddr set $eip $protocol sport set $external_port
+add element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $external_port . $eip : jump $in_chain }
+add element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip : jump $out_chain }
+add element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }
+NFT
+    then
+        return 1
+    fi
+    (add_dnat "$rule") || return 1
+}
+
+function stateless_dnat_add() {
+    local rule
+    for rule in "$@"; do
+        stateless_dnat_add_rule "$rule" || return 1
+    done
+}
+
+# stateless_dnat_del_rule 幂等删除单个无状态 DNAT 映射及关联的发卡规则。
+function stateless_dnat_del_rule() {
+    local rule=$1 eip="" port="" protocol="" internal_ip="" internal_port="" extra=""
+    IFS=, read -r eip port protocol internal_ip internal_port extra <<< "$rule"
+    protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+    if [[ "$protocol" != tcp && "$protocol" != udp ]] || ! stateless_port "$port"; then
+        return 0
+    fi
+    if ! stateless_ipv4 "$eip" || [[ -n "$extra" ]]; then
+        return 0
+    fi
+    port=$((10#$port))
+
+    local in_chain="sl_din_${protocol}_${eip//./_}_${port}"
+    local out_chain="sl_dout_${protocol}_${eip//./_}_${port}"
+    local live_ip="" live_port=""
+    local in_rules
+    in_rules=$(nft -nn list chain ip kube_ovn_stateless_nat "$in_chain" 2>/dev/null)
+    if [[ -n "$in_rules" ]]; then
+        live_ip=$(grep -oE 'ip daddr set [0-9.]+' <<< "$in_rules" | awk '{print $4}' | head -n 1)
+        live_port=$(grep -oE "$protocol dport set [0-9]+" <<< "$in_rules" | awk '{print $4}' | head -n 1)
+    fi
+    if [[ -n "$live_ip" && -n "$live_port" ]]; then
+        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $live_port . $live_ip }" || return 1
+        nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $live_port . $live_ip }" || true
+    fi
+    if [[ -n "$internal_ip" && -n "$internal_port" ]] && stateless_ipv4 "$internal_ip" && stateless_port "$internal_port"; then
+        internal_port=$((10#$internal_port))
+        if [[ "$internal_ip" != "$live_ip" || "$internal_port" != "$live_port" ]]; then
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip }" || return 1
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }" || true
+        fi
+    fi
+    nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $port . $eip }" || return 1
+    nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
+    nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
+    (del_dnat "$rule") || return 1
+}
+
+function stateless_dnat_del() {
+    local rule
+    for rule in "$@"; do
+        stateless_dnat_del_rule "$rule" || return 1
+    done
+}
 
 opt=$1
 shift
