@@ -134,24 +134,48 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 	candidate.host = host
 	candidate.protocol = strings.ToLower(candidate.protocol)
 
-	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	gatewayEips, err := c.getGatewayEIPs(gwName)
 	if err != nil {
 		return err
 	}
-	gatewayEips := map[string]bool{}
+
+	fipMappings, err := c.collectStatelessFipMappings(gwName, gatewayEips)
+	if err != nil {
+		return err
+	}
+
+	dnatMappings, err := c.collectStatelessDnatMappings(gwName, gatewayEips)
+	if err != nil {
+		return err
+	}
+
+	mappings := append(fipMappings, dnatMappings...)
+	for _, existing := range mappings {
+		if err := checkStatelessMappingConflict(gwName, candidate, existing, gatewayEips); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) getGatewayEIPs(gwName string) (map[string]bool, error) {
+	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	gatewayEips := make(map[string]bool, len(eips))
 	for _, item := range eips {
 		if item.Spec.NatGwDp == gwName || item.Labels[util.VpcNatGatewayNameLabel] == gwName {
 			gatewayEips[item.Name] = true
 		}
 	}
+	return gatewayEips, nil
+}
 
+func (c *Controller) collectStatelessFipMappings(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
 	fips, err := c.iptablesFipsLister.List(labels.Everything())
 	if err != nil {
-		return err
-	}
-	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
-	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var mappings []statelessMapping
@@ -174,6 +198,16 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 			}
 		}
 	}
+	return mappings, nil
+}
+
+func (c *Controller) collectStatelessDnatMappings(gwName string, gatewayEips map[string]bool) ([]statelessMapping, error) {
+	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	var mappings []statelessMapping
 	for _, item := range dnats {
 		appliedEip := item.Annotations[util.VpcEipAnnotation]
 		if appliedEip == "" {
@@ -219,44 +253,45 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 			}
 		}
 	}
+	return mappings, nil
+}
 
-	for _, existing := range mappings {
-		if (existing.eip != "" && !gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
-			continue
+func checkStatelessMappingConflict(gwName string, candidate, existing statelessMapping, gatewayEips map[string]bool) error {
+	if (existing.eip != "" && !gatewayEips[existing.eip] && existing.eip != candidate.eip) || (existing.kind == candidate.kind && existing.name == candidate.name) {
+		return nil
+	}
+	// 已建立生效的映射在重放恢复时，不受未生效的新建冲突请求阻断
+	if candidate.isEstablished && !existing.isEstablished {
+		return nil
+	}
+	// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
+	// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
+	// shared between exclusive and Share-DNAT rules.
+	if existing.eip != "" && existing.eip == candidate.eip {
+		if existing.kind != "DNAT" || candidate.kind != "DNAT" || existing.isShare != candidate.isShare {
+			return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", gwName, candidate.eip, existing.kind, existing.name)
 		}
-		// 已建立生效的映射在重放恢复时，不受未生效的新建冲突请求阻断
-		if candidate.isEstablished && !existing.isEstablished {
-			continue
-		}
-		// FIP and host SNAT consume the entire public address; exclusive port DNAT may share
-		// it only with other exclusive port DNAT rules on distinct external ports. A stateless EIP cannot be
-		// shared between exclusive and Share-DNAT rules.
-		if existing.eip != "" && existing.eip == candidate.eip {
-			if existing.kind != "DNAT" || candidate.kind != "DNAT" || existing.isShare != candidate.isShare {
-				return fmt.Errorf("stateless gateway %s: EIP %s is already used by %s %s", gwName, candidate.eip, existing.kind, existing.name)
+		existingExtPort, _ := strconv.Atoi(existing.externalPort)
+		candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
+		sameExtPort := existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)
+		if existing.protocol == candidate.protocol && sameExtPort {
+			if !existing.isShare || existing.owner == "" || candidate.owner == "" || existing.owner != candidate.owner {
+				return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
 			}
-			existingExtPort, _ := strconv.Atoi(existing.externalPort)
-			candidateExtPort, _ := strconv.Atoi(candidate.externalPort)
-			sameExtPort := existing.externalPort == candidate.externalPort || (existingExtPort != 0 && existingExtPort == candidateExtPort)
-			if existing.protocol == candidate.protocol && sameExtPort {
-				if !existing.isShare || existing.owner == "" || candidate.owner == "" || existing.owner != candidate.owner {
-					return fmt.Errorf("stateless gateway %s: EIP %s port %s/%s is already used by %s %s", gwName, candidate.eip, candidate.protocol, candidate.externalPort, existing.kind, existing.name)
-				}
-			}
 		}
-		existingHost, err := util.StatelessNATIPv4Host(existing.host)
-		if err != nil {
-			continue
-		}
-		existingPort, _ := strconv.Atoi(existing.port)
-		candidatePort, _ := strconv.Atoi(candidate.port)
-		samePort := existing.port == candidate.port || (existingPort != 0 && existingPort == candidatePort)
-		// Stateless backends must have unambiguous reverse routing and cannot overlap with
-		// another public identity.
-		if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
-			if existing.eip != candidate.eip || existing.externalPort != candidate.externalPort {
-				return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
-			}
+	}
+	existingHost, err := util.StatelessNATIPv4Host(existing.host)
+	if err != nil {
+		return nil
+	}
+	existingPort, _ := strconv.Atoi(existing.port)
+	candidatePort, _ := strconv.Atoi(candidate.port)
+	samePort := existing.port == candidate.port || (existingPort != 0 && existingPort == candidatePort)
+	// Stateless backends must have unambiguous reverse routing and cannot overlap with
+	// another public identity.
+	if existingHost == candidate.host && (existing.kind != "DNAT" || candidate.kind != "DNAT" || (existing.protocol == candidate.protocol && samePort)) {
+		if existing.eip != candidate.eip || existing.externalPort != candidate.externalPort {
+			return fmt.Errorf("stateless gateway %s: backend %s conflicts with %s %s; reverse mapping must be unique", gwName, candidate.host, existing.kind, existing.name)
 		}
 	}
 	return nil
