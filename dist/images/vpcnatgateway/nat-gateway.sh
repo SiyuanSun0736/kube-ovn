@@ -2583,22 +2583,6 @@ function nft_del_safe() {
     return "$err"
 }
 
-function nft_find_map_key_by_target() {
-    local map_name=$1 target=$2
-    nft -nn list map ip kube_ovn_stateless_nat "$map_name" 2>/dev/null | awk -v target="$target" '
-    {
-      gsub(/.*elements = \{|\}/, "")
-      n = split($0, items, ",")
-      for (i = 1; i <= n; i++) {
-        item = items[i]
-        if (item ~ (": (jump|goto) " target "($|[ \t])")) {
-          sub(/:.*/, "", item)
-          gsub(/^[ \t]+|[ \t]+$/, "", item)
-          print item
-        }
-      }
-    }'
-}
 
 # stateless_init 初始化全局无状态表、Map 容器及基础 Hook 链，开销恒定为 1 对 Hook。
 # - 入向 FIP 查 map 改写目的 IP 并打 notrack，DNAT vmap 分发至子链改写端口与 IP
@@ -2749,30 +2733,14 @@ function stateless_mapping_del() {
         if [[ -n "$live_ip" && -n "$live_port" ]]; then
             nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $live_port . $live_ip }" || return 1
             nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $live_port . $live_ip }" || true
-            nft_del_safe "delete chain ip kube_ovn_stateless_nat sl_dout_${protocol}_${live_ip//./_}_${live_port}" || true
         fi
         if [[ -n "$internal_ip" && -n "$internal_port" ]] && stateless_ipv4 "$internal_ip" && stateless_port "$internal_port"; then
             internal_port=$((10#$internal_port))
             if [[ "$internal_ip" != "$live_ip" || "$internal_port" != "$live_port" ]]; then
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip }" || return 1
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }" || true
-                nft_del_safe "delete chain ip kube_ovn_stateless_nat sl_dout_${protocol}_${internal_ip//./_}_${internal_port}" || true
             fi
         fi
-        # 兼容性兜底：若有历史遗留的 sl_dout_* 链指向该 (eip, port)，清理 map 元素与链
-        local orphan_dout
-        for orphan_dout in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v e="${eip//./\\.}" -v p="$protocol" -v pt="$port" '
-          $1 == "chain" { cur = ($2 ~ ("^sl_dout_" p "_")) ? $2 : "" }
-          cur && $0 ~ ("ip saddr set " e " " p " sport set " pt "($|[ ;])") { print cur; cur = "" }
-        '); do
-            local elem_key
-            elem_key=$(nft_find_map_key_by_target sl_dnat_out "$orphan_dout")
-            if [[ -n "$elem_key" ]]; then
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $elem_key }" || return 1
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $elem_key }" || true
-            fi
-            nft_del_safe "delete chain ip kube_ovn_stateless_nat $orphan_dout" || true
-        done
         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $port . $eip }" || return 1
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
@@ -2788,27 +2756,12 @@ function stateless_mapping_del() {
             if [[ -n "$int_ip" ]]; then
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $int_ip }" || return 1
                 nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $int_ip }" || true
-                nft_del_safe "delete chain ip kube_ovn_stateless_nat sl_fout_${int_ip//./_}" || true
             fi
         fi
         if [[ -n "$internal_ip" ]] && stateless_ipv4 "$internal_ip"; then
             nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $internal_ip }" || true
             nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $internal_ip }" || true
-            nft_del_safe "delete chain ip kube_ovn_stateless_nat sl_fout_${internal_ip//./_}" || true
         fi
-        local orphan_fout
-        for orphan_fout in $(nft -nn list table ip kube_ovn_stateless_nat 2>/dev/null | awk -v e="${eip//./\\.}" '
-          $1 == "chain" { cur = ($2 ~ "^sl_fout_") ? $2 : "" }
-          cur && $0 ~ ("ip saddr set " e "($|[ ;])") { print cur; cur = "" }
-        '); do
-            local elem_key
-            elem_key=$(nft_find_map_key_by_target sl_fip_snat "$orphan_fout")
-            if [[ -n "$elem_key" ]]; then
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_snat { $elem_key }" || return 1
-                nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_ips { $elem_key }" || true
-            fi
-            nft_del_safe "delete chain ip kube_ovn_stateless_nat $orphan_fout" || true
-        done
         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_fip_dnat { $eip }" || return 1
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
         nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1

@@ -75,16 +75,5 @@ del_err=$?
 set -e
 if [[ $del_err -ne 13 ]]; then echo "nft_del_safe failed to capture exit code: $del_err" >&2; exit 1; fi
 
-# nft_find_map_key_by_target 单行多元素测试
-nft() {
-    echo 'table ip kube_ovn_stateless_nat {
-	map sl_fip_snat {
-		type ipv4_addr : verdict
-		elements = { 10.0.0.2 : jump sl_fout_10_0_0_2, 10.0.0.3 : jump sl_fout_10_0_0_3 }
-	}
-}'
-}
-found_key=$(nft_find_map_key_by_target sl_fip_snat "sl_fout_10_0_0_3")
-if [[ "$found_key" != "10.0.0.3" ]]; then echo "nft_find_map_key_by_target expected 10.0.0.3, got $found_key" >&2; exit 1; fi
 
 echo 'stateless shell tests passed'
