@@ -141,7 +141,7 @@ add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f 
 
 # 入向主链：五元组 jhash（固定 seed）mod 127 查 Maglev vmap
 add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80
-add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80 jhash ip saddr . ip daddr . meta l4proto . th sport . th dport seed 0x1a2b3c4d mod 127 vmap { 0 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c, 1 : goto sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f, ..., 126 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c }
+add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80 jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 127 seed 0x1a2b3c4d vmap { 0 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c, 1 : goto sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f, ..., 126 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c }
 
 # 共享出向子链与多后端三元组汇聚
 add chain ip kube_ovn_stateless_nat sl_dout_tcp_192_0_2_10_80
@@ -227,7 +227,9 @@ add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count ov
 
 ### 4.2 多后端 Service 无状态与 Hairpin 分流
 
-在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。其中 `N = 127` 槽位按单个 `(EIP, ExternalPort, Protocol)` 对外端口独立分配，不同 Service 或同一 Service 的不同端口互不共享，单端口支持的 Ready 后端上限为 127 个。
+在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。其中 `N = 127` 槽位按单个 `(EIP, ExternalPort, Protocol)` 对外端口独立分配，不同 Service 或同一 Service 的不同端口互不共享，单端口支持的最大 Ready 后端数为 127 个；超过 127 个后端时控制器会回退至 `table ip kube-ovn` 有状态路径，避免槽位溢出导致流量黑洞。
+
+同时，`jhash` 使用由入向链名推导的固定 `seed`，以保证网关多副本及规则重放时流映射一致；其可接受的权衡是哈希值对外部可预测（若恶意构造特定源端口，存在将流量集中到单个后端的风险）。
 
 若多后端 Service 配置了 `sessionAffinity: ClientIP`，由于五元组无状态哈希包含客户端源端口无法保证按源 IP 会话保持，控制器会跳过无状态路径（并清理可能残留的无状态规则），使其保留在 `table ip kube-ovn` 走有状态 `aff-*` 会话保持。
 

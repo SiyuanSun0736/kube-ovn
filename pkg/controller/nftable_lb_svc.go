@@ -396,8 +396,8 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		if id == nil || len(id.backends) == 0 {
 			continue
 		}
-		if len(id.backends) > 1 && id.affinity == string(v1.ServiceAffinityClientIP) {
-			// ClientIP affinity multi-backend services stay on the stateful table kube-ovn path.
+		if len(id.backends) > 1 && statelessMultiBackendFallbackReason(id, len(id.backends)) != "" {
+			// Fallback multi-backend identities stay on the stateful table kube-ovn path.
 			continue
 		}
 		isEstablished := dnatMatchesDesired(existingMap[record.Name], record)
@@ -475,6 +475,18 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 
 // nftableLbIdentity is one share DNAT map: one VIP, external port and protocol, with all
 // backends that the Service wants behind it. It is an internal desired-state value, not a CRD.
+const maxStatelessMaglevBackends = 127
+
+func statelessMultiBackendFallbackReason(identity *nftableLbIdentity, backendCount int) string {
+	if identity != nil && identity.affinity == string(v1.ServiceAffinityClientIP) {
+		return "ClientIP sessionAffinity"
+	}
+	if backendCount > maxStatelessMaglevBackends {
+		return fmt.Sprintf("backend count %d exceeds %d Maglev slots", backendCount, maxStatelessMaglevBackends)
+	}
+	return ""
+}
+
 type nftableLbIdentity struct {
 	vip             string
 	externalPort    string
@@ -574,8 +586,11 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 				statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
 				continue
 			}
-			if identity.affinity == string(v1.ServiceAffinityClientIP) {
-				// ClientIP affinity requires stateful conntrack/affinity sets; clean up any stale stateless rule.
+			if reason := statelessMultiBackendFallbackReason(identity, len(backends)); reason != "" {
+				if len(backends) > maxStatelessMaglevBackends {
+					klog.Warningf("gateway %s identity %s:%s/%s falls back to stateful LB: %s",
+						gateway, identity.vip, identity.externalPort, identity.protocol, reason)
+				}
 				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
 					identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
 			} else {

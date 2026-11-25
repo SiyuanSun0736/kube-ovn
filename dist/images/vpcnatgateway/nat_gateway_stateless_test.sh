@@ -110,7 +110,18 @@ grep -Fx "delete chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${b
 grep -Fx 'del-dnat 192.0.2.15,80,tcp' "$tmp_dir/hairpin"
 grep -Fx 'dnat 192.0.2.15,80,tcp,10.0.0.2,8080' "$tmp_dir/hairpin"
 
-# 验证多后端扩容时清理旧单后端 Hairpin DNAT 规则
+# 验证从单后端扩容到多后端时清理旧单后端 Hairpin DNAT 规则
+nft() {
+    printf '%s\n' "$*" >> "$tmp_dir/calls"
+    if [[ "$*" == '-f -' ]]; then
+        cat >> "$tmp_dir/batches"
+        return 0
+    fi
+    if [[ "$*" == "-nn list chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80" ]]; then
+        echo "notrack ip daddr set 10.0.0.2 tcp dport set 8080"
+        return 0
+    fi
+}
 : > "$tmp_dir/hairpin"
 stateless_dnat_add '192.0.2.15,80,tcp,10.0.0.2:8080@10.0.0.3:8080'
 grep -Fx 'del-dnat 192.0.2.15,80,tcp' "$tmp_dir/hairpin"
@@ -118,6 +129,27 @@ if grep -q '^dnat ' "$tmp_dir/hairpin"; then
     echo "multi-backend should not add single-backend hairpin dnat" >&2
     exit 1
 fi
+
+# 恢复多后端链 mock，验证全量删除级联清理
+nft() {
+    printf '%s\n' "$*" >> "$tmp_dir/calls"
+    if [[ "$*" == '-f -' ]]; then
+        cat >> "$tmp_dir/batches"
+        return 0
+    fi
+    if [[ "$*" == "-nn list chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80" ]]; then
+        echo "jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 127 seed 0x6f907617 vmap { 0 : goto sl_din_tcp_192_0_2_15_80_ep_${bk1}, 1 : goto sl_din_tcp_192_0_2_15_80_ep_${bk2} }"
+        return 0
+    fi
+    if [[ "$*" == "-nn list chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk1}" ]]; then
+        echo "notrack ip daddr set 10.0.0.2 tcp dport set 8080"
+        return 0
+    fi
+    if [[ "$*" == "-nn list chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk2}" ]]; then
+        echo "notrack ip daddr set 10.0.0.3 tcp dport set 8080"
+        return 0
+    fi
+}
 
 : > "$tmp_dir/calls"
 stateless_dnat_del '192.0.2.15,80,tcp'

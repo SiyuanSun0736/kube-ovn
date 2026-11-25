@@ -2809,7 +2809,7 @@ function stateless_dnat_add_rule() {
         return 1
     fi
 
-    local -a backend_list=()
+    local -a backend_list=() raw_list=()
     local -A wanted_backends=()
     local item b_ip b_port
     IFS='@' read -ra raw_list <<< "$raw_backends"
@@ -2935,6 +2935,8 @@ function stateless_dnat_add_rule() {
         fi
     done
 
+    # Hairpin 兜底分两路：单后端靠 iptables SHARED_DNAT，多后端靠 table ip kube-ovn；
+    # 仅在曾为单后端（prev_tuples == 1）时清理 SHARED_DNAT，避免多后端每次 reconcile 都跑 iptables-save。
     if [[ $count -eq 1 ]]; then
         local target_tuple="${backend_list[0]}"
         if [[ ${#prev_tuples[@]} -ne 1 || "${prev_tuples[0]}" != "$target_tuple" ]]; then
@@ -2942,7 +2944,7 @@ function stateless_dnat_add_rule() {
         fi
         IFS=':' read -r b_ip b_port <<< "$target_tuple"
         (add_dnat "$eip,$external_port,$protocol,$b_ip,$b_port") || return 1
-    else
+    elif [[ ${#prev_tuples[@]} -eq 1 ]]; then
         (del_dnat "$eip,$external_port,$protocol") || return 1
     fi
 }

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -217,6 +218,25 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "", pods, clusterOnlyIdentities, []*kubeovnv1.IptablesDnatRule{clusterIPRecord}, nil))
 	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
 	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
+
+	// 8. More than 127 backends falls back to stateful LB and cleans up stateless rule
+	programmed = map[string][]string{}
+	largeBackends := make([]string, 0, maxStatelessMaglevBackends+1)
+	for i := range maxStatelessMaglevBackends + 1 {
+		largeBackends = append(largeBackends, fmt.Sprintf("10.0.%d.%d:8080", i/250, (i%250)+1))
+	}
+	largeIdentities := []*nftableLbIdentity{
+		{
+			vip:          "1.1.1.1",
+			externalPort: "80",
+			protocol:     "tcp",
+			backends:     largeBackends,
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, largeIdentities, nil, nil))
+	require.Empty(t, programmed[natGwStatelessDnatAdd])
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.NotEmpty(t, programmed[natGwNftDnatMapAdd])
 }
 
 // TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile
