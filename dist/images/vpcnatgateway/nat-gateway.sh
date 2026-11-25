@@ -2863,14 +2863,6 @@ function stateless_dnat_add_rule() {
     fi
 
     local -a cmds=("add table ip kube_ovn_stateless_nat")
-    local tuple
-    for tuple in "${prev_tuples[@]}"; do
-        if [[ -z "${wanted_backends[$tuple]:-}" ]]; then
-            IFS=':' read -r b_ip b_port <<< "$tuple"
-            cmds+=("delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $b_port . $b_ip }")
-            cmds+=("delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $b_port . $b_ip }")
-        fi
-    done
 
     if [[ $count -eq 1 ]]; then
         IFS=':' read -r b_ip b_port <<< "${backend_list[0]}"
@@ -2920,16 +2912,31 @@ function stateless_dnat_add_rule() {
         return 1
     fi
 
-    # 主链已原子切换，安全清理不再被引用的旧端点子链
+    # 主链已原子切换，安全清理不再被引用的旧端点子链与已下线后端的出向元素
     for ep_chain in "${stale_ep_chains[@]}"; do
         if [[ -z "${wanted_ep_chains[$ep_chain]:-}" ]]; then
             nft_del_safe "delete chain ip kube_ovn_stateless_nat $ep_chain" || true
         fi
     done
 
+    local tuple
+    for tuple in "${prev_tuples[@]}"; do
+        if [[ -z "${wanted_backends[$tuple]:-}" ]]; then
+            IFS=':' read -r b_ip b_port <<< "$tuple"
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $b_port . $b_ip }" || true
+            nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $b_port . $b_ip }" || true
+        fi
+    done
+
     if [[ $count -eq 1 ]]; then
-        IFS=':' read -r b_ip b_port <<< "${backend_list[0]}"
+        local target_tuple="${backend_list[0]}"
+        if [[ ${#prev_tuples[@]} -ne 1 || "${prev_tuples[0]}" != "$target_tuple" ]]; then
+            (del_dnat "$eip,$external_port,$protocol") || return 1
+        fi
+        IFS=':' read -r b_ip b_port <<< "$target_tuple"
         (add_dnat "$eip,$external_port,$protocol,$b_ip,$b_port") || return 1
+    else
+        (del_dnat "$eip,$external_port,$protocol") || return 1
     fi
 }
 

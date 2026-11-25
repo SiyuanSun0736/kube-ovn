@@ -100,11 +100,23 @@ nft() {
 }
 : > "$tmp_dir/batches"
 : > "$tmp_dir/calls"
+: > "$tmp_dir/hairpin"
 stateless_dnat_add '192.0.2.15,80,tcp,10.0.0.2:8080'
-grep -F 'delete element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.3 }' "$tmp_dir/batches"
-grep -F 'delete element ip kube_ovn_stateless_nat sl_notrack_tuples { tcp . 8080 . 10.0.0.3 }' "$tmp_dir/batches"
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.3 }' "$tmp_dir/calls"
+grep -Fx 'delete element ip kube_ovn_stateless_nat sl_notrack_tuples { tcp . 8080 . 10.0.0.3 }' "$tmp_dir/calls"
 grep -Fx "delete chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk1}" "$tmp_dir/calls"
 grep -Fx "delete chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk2}" "$tmp_dir/calls"
+grep -Fx 'del-dnat 192.0.2.15,80,tcp' "$tmp_dir/hairpin"
+grep -Fx 'dnat 192.0.2.15,80,tcp,10.0.0.2,8080' "$tmp_dir/hairpin"
+
+# 验证多后端扩容时清理旧单后端 Hairpin DNAT 规则
+: > "$tmp_dir/hairpin"
+stateless_dnat_add '192.0.2.15,80,tcp,10.0.0.2:8080@10.0.0.3:8080'
+grep -Fx 'del-dnat 192.0.2.15,80,tcp' "$tmp_dir/hairpin"
+if grep -q '^dnat ' "$tmp_dir/hairpin"; then
+    echo "multi-backend should not add single-backend hairpin dnat" >&2
+    exit 1
+fi
 
 : > "$tmp_dir/calls"
 stateless_dnat_del '192.0.2.15,80,tcp'
@@ -115,6 +127,31 @@ grep -Fx "delete chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${b
 grep -Fx 'delete element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.2 }' "$tmp_dir/calls"
 grep -Fx 'delete element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.3 }' "$tmp_dir/calls"
 grep -Fx 'delete chain ip kube_ovn_stateless_nat sl_dout_tcp_192_0_2_15_80' "$tmp_dir/calls"
+
+# 验证单后端变更与幂等行为：变更时先 del_dnat 再 add_dnat，未变更时不触发 del_dnat
+nft() {
+    printf '%s\n' "$*" >> "$tmp_dir/calls"
+    if [[ "$*" == '-f -' ]]; then
+        cat >> "$tmp_dir/batches"
+        return 0
+    fi
+    if [[ "$*" == "-nn list chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_16_80" ]]; then
+        echo "notrack ip daddr set 10.0.0.2 tcp dport set 8080"
+        return 0
+    fi
+}
+: > "$tmp_dir/hairpin"
+stateless_dnat_add '192.0.2.16,80,tcp,10.0.0.2,8080'
+if grep -q '^del-dnat ' "$tmp_dir/hairpin"; then
+    echo "unchanged single backend should not trigger del-dnat" >&2
+    exit 1
+fi
+grep -Fx 'dnat 192.0.2.16,80,tcp,10.0.0.2,8080' "$tmp_dir/hairpin"
+
+: > "$tmp_dir/hairpin"
+stateless_dnat_add '192.0.2.16,80,tcp,10.0.0.4,8080'
+grep -Fx 'del-dnat 192.0.2.16,80,tcp' "$tmp_dir/hairpin"
+grep -Fx 'dnat 192.0.2.16,80,tcp,10.0.0.4,8080' "$tmp_dir/hairpin"
 
 # Invalid deletion inputs must succeed as no-op and never block cleanup
 stateless_dnat_del '192.0.2.11,080,tcp'
