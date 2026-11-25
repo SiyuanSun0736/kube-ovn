@@ -2077,9 +2077,9 @@ func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalIP)
 	addRules = append(addRules, rule)
-	operation, err := c.natGatewayOperation(dp, natGwSubnetFipAdd)
+	operation, err := c.natGatewayOperation(dp, natGwFipAdd)
 	if err != nil {
-		klog.Errorf("gateway %s operation %s: %v", dp, natGwSubnetFipAdd, err)
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwFipAdd, err)
 		return err
 	}
 	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, addRules); err != nil {
@@ -2354,9 +2354,9 @@ func (c *Controller) deleteFipInPod(dp, v4ip, internalIP string) error {
 	}
 	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP).
 	// In stateless mode, providing internalIP enables precise O(1) element deletion without rule inspection.
-	operation, err := c.natGatewayOperation(dp, natGwSubnetFipDel)
+	operation, err := c.natGatewayOperation(dp, natGwFipDel)
 	if err != nil {
-		klog.Errorf("gateway %s operation %s: %v", dp, natGwSubnetFipDel, err)
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwFipDel, err)
 		return err
 	}
 	rule := v4ip
