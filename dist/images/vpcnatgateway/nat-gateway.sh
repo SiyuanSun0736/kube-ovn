@@ -2897,7 +2897,7 @@ function stateless_dnat_add_rule() {
         cmds+=(
             "add chain ip kube_ovn_stateless_nat $in_chain"
             "flush chain ip kube_ovn_stateless_nat $in_chain"
-            "add rule ip kube_ovn_stateless_nat $in_chain jhash ip saddr . ip daddr . meta l4proto . th sport . th dport seed $hash_seed mod $STATELESS_HASH_SLOTS vmap { $vmap_entries }"
+            "add rule ip kube_ovn_stateless_nat $in_chain jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod $STATELESS_HASH_SLOTS seed $hash_seed vmap { $vmap_entries }"
         )
     fi
 
