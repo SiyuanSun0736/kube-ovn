@@ -70,7 +70,8 @@ bk1=$(nft_backend_hash 10.0.0.2 8080)
 bk2=$(nft_backend_hash 10.0.0.3 8080)
 grep -F "add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk1}" "$tmp_dir/batches"
 grep -F "add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_15_80_ep_${bk2}" "$tmp_dir/batches"
-grep -F 'jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 127 vmap {' "$tmp_dir/batches"
+expected_seed="0x$(echo -n 'sl_din_tcp_192_0_2_15_80' | md5sum | cut -c1-8)"
+grep -F "jhash ip saddr . ip daddr . meta l4proto . th sport . th dport seed ${expected_seed} mod 127 vmap {" "$tmp_dir/batches"
 grep -F '0 : goto sl_din_tcp_192_0_2_15_80_ep_' "$tmp_dir/batches"
 grep -F '126 : goto sl_din_tcp_192_0_2_15_80_ep_' "$tmp_dir/batches"
 grep -F 'add element ip kube_ovn_stateless_nat sl_dnat_out { tcp . 8080 . 10.0.0.2 : jump sl_dout_tcp_192_0_2_15_80 }' "$tmp_dir/batches"

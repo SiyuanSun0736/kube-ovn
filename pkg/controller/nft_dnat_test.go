@@ -186,6 +186,37 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.Empty(t, programmed[natGwStatelessDnatAdd])
 	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
 	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
+
+	// 6. Multi-backend identity with ClientIP affinity stays stateful and cleans up stateless rule
+	programmed = map[string][]string{}
+	affinityIdentities := []*nftableLbIdentity{
+		{
+			vip:             "1.1.1.1",
+			externalPort:    "80",
+			protocol:        "tcp",
+			backends:        []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+			affinity:        string(v1.ServiceAffinityClientIP),
+			affinityTimeout: 10800,
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, affinityIdentities, nil, nil))
+	require.Empty(t, programmed[natGwStatelessDnatAdd])
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Equal(t, []string{"1.1.1.1,80,tcp,clientip,10800,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwNftDnatMapAdd])
+
+	// 7. Dropping EIP while retaining ClusterIP still cleans up the retired EIP stateless rule even when current eipIP is empty
+	programmed = map[string][]string{}
+	clusterOnlyIdentities := []*nftableLbIdentity{
+		{
+			vip:          "10.96.0.10",
+			externalPort: "80",
+			protocol:     "tcp",
+			backends:     []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "", pods, clusterOnlyIdentities, []*kubeovnv1.IptablesDnatRule{clusterIPRecord}, nil))
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
 }
 
 // TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile

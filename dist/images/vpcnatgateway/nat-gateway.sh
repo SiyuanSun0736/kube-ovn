@@ -2704,6 +2704,7 @@ function stateless_fip_del() {
     done
 }
 
+# 固定 Maglev 一致性哈希槽位总数（取质数 127 确保步长互质且表体积轻量）
 STATELESS_HASH_SLOTS=127
 
 # stateless_maglev_vmap_entries 根据排序后的后端列表生成固定 127 槽位的 Maglev 一致性哈希 vmap 映射。
@@ -2711,10 +2712,12 @@ STATELESS_HASH_SLOTS=127
 function stateless_maglev_vmap_entries() {
     awk -v M="$STATELESS_HASH_SLOTS" '
     BEGIN {
+        # POSIX / BusyBox awk 无内置 ord()，预先构造可打印 ASCII 字符查表字典
         for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i
         n = 0
     }
     {
+        # 为每个后端 ip:port 计算两个独立哈希，决定 Maglev 起始偏移与探测步长
         key = $1
         chains[n] = $2
         h1 = 5381
@@ -2725,6 +2728,7 @@ function stateless_maglev_vmap_entries() {
             h1 = int((h1 * 33 + ch) % 2147483647)
             h2 = int((h2 * 131 + ch + 17) % 2147483647)
         }
+        # M 为质数，skip 取 [1, M-1] 必与 M 互质，保证遍历所有槽位不产生环路
         offset[n] = int(h1 % M)
         skip[n] = int(h2 % (M - 1)) + 1
         next_idx[n] = 0
@@ -2734,6 +2738,7 @@ function stateless_maglev_vmap_entries() {
         if (n == 0) exit 0
         for (s = 0; s < M; s++) slot[s] = -1
         filled = 0
+        # 轮询为各后端分配偏好序列中的空槽位，扩缩容时仅迁移约 1/N 槽位
         while (filled < M) {
             for (b = 0; b < n; b++) {
                 c = int((offset[b] + next_idx[b] * skip[b]) % M)
@@ -2760,7 +2765,7 @@ function stateless_maglev_vmap_entries() {
     }'
 }
 
-# stateless_dnat_collect_chain_tuples 从指定链规则文本中提取 "<ip>,<port>" 后端元组。
+# stateless_dnat_collect_chain_tuples 从指定链规则文本中提取 "<ip>:<port>" 后端元组。
 function stateless_dnat_collect_chain_tuples() {
     local chain_rules=$1 protocol=$2
     local ip port
@@ -2887,10 +2892,12 @@ function stateless_dnat_add_rule() {
         done
         local vmap_entries
         vmap_entries=$(printf '%s' "$maglev_input" | stateless_maglev_vmap_entries)
+        local hash_seed
+        hash_seed="0x$(echo -n "$in_chain" | md5sum | cut -c1-8)"
         cmds+=(
             "add chain ip kube_ovn_stateless_nat $in_chain"
             "flush chain ip kube_ovn_stateless_nat $in_chain"
-            "add rule ip kube_ovn_stateless_nat $in_chain jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod $STATELESS_HASH_SLOTS vmap { $vmap_entries }"
+            "add rule ip kube_ovn_stateless_nat $in_chain jhash ip saddr . ip daddr . meta l4proto . th sport . th dport seed $hash_seed mod $STATELESS_HASH_SLOTS vmap { $vmap_entries }"
         )
     fi
 
@@ -2990,11 +2997,8 @@ function stateless_dnat_del_rule() {
     fi
 
     nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_in { $protocol . $port . $eip }" || return 1
-    nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
-    for ep_chain in "${del_ep_chains[@]}"; do
-        nft_del_safe "delete chain ip kube_ovn_stateless_nat $ep_chain" || return 1
-    done
 
+    # 先清理反向出向映射再删发现链（in_chain/ep_chain），避免中途失败重试时丢失后端元组导致 out_chain 无法删除
     local tuple b_ip b_port
     for tuple in "${del_tuples[@]}"; do
         IFS=':' read -r b_ip b_port <<< "$tuple"
@@ -3006,6 +3010,11 @@ function stateless_dnat_del_rule() {
         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_dnat_out { $protocol . $internal_port . $internal_ip }" || return 1
         nft_del_safe "delete element ip kube_ovn_stateless_nat sl_notrack_tuples { $protocol . $internal_port . $internal_ip }" || true
     fi
+
+    nft_del_safe "delete chain ip kube_ovn_stateless_nat $in_chain" || return 1
+    for ep_chain in "${del_ep_chains[@]}"; do
+        nft_del_safe "delete chain ip kube_ovn_stateless_nat $ep_chain" || return 1
+    done
     nft_del_safe "delete chain ip kube_ovn_stateless_nat $out_chain" || return 1
     (del_dnat "$rule") || return 1
 }
