@@ -192,6 +192,16 @@ for invalid in '192.0.2.2,::1' '999.1.1.1,10.0.0.1'; do
     if stateless_fip_add "$invalid"; then echo "accepted invalid mapping $invalid" >&2; exit 1; fi
 done
 if stateless_dnat_add '192.0.2.1,80,sctp,10.0.0.2,8080'; then exit 1; fi
+# 超过 STATELESS_HASH_SLOTS(127) 个后端必须直接拒绝，避免生成未进 vmap 的孤儿链
+over_backends=""
+for i in $(seq 1 128); do
+    [[ -n "$over_backends" ]] && over_backends+="@"
+    over_backends+="10.0.1.${i}:8080"
+done
+if stateless_dnat_add "192.0.2.17,80,tcp,${over_backends}"; then
+    echo "accepted more than $STATELESS_HASH_SLOTS backends" >&2
+    exit 1
+fi
 # Installation failures must reach the controller; never report success after a failed batch.
 nft() { return 1; }
 if stateless_fip_add '192.0.2.1,10.0.0.2'; then exit 1; fi

@@ -227,7 +227,7 @@ add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count ov
 
 ### 4.2 多后端 Service 无状态与 Hairpin 分流
 
-在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。其中 `N = 127` 槽位按单个 `(EIP, ExternalPort, Protocol)` 对外端口独立分配，不同 Service 或同一 Service 的不同端口互不共享，单端口支持的最大 Ready 后端数为 127 个；超过 127 个后端时控制器会回退至 `table ip kube-ovn` 有状态路径，避免槽位溢出导致流量黑洞。
+在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。其中 `N = 127` 槽位按单个 `(EIP, ExternalPort, Protocol)` 对外端口独立分配，不同 Service 或同一 Service 的不同端口互不共享，单端口支持的最大 Ready 后端数为 127 个；超过 127 个后端时控制器会回退至 `table ip kube-ovn` 有状态路径，避免槽位溢出导致流量黑洞（后端数在 127↔128 临界点跨越切换时，因 `notrack` 与 `tracked` 状态变化，已建立的外部长连接会被中断）。
 
 同时，`jhash` 使用由入向链名推导的固定 `seed`，以保证网关多副本及规则重放时流映射一致；其可接受的权衡是哈希值对外部可预测（若恶意构造特定源端口，存在将流量集中到单个后端的风险）。
 

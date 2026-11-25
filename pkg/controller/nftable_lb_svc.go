@@ -396,7 +396,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		if id == nil || len(id.backends) == 0 {
 			continue
 		}
-		if len(id.backends) > 1 && statelessMultiBackendFallbackReason(id, len(id.backends)) != "" {
+		if len(id.backends) > 1 && statelessMultiBackendFallbackReason(id) != "" {
 			// Fallback multi-backend identities stay on the stateful table kube-ovn path.
 			continue
 		}
@@ -475,18 +475,6 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 
 // nftableLbIdentity is one share DNAT map: one VIP, external port and protocol, with all
 // backends that the Service wants behind it. It is an internal desired-state value, not a CRD.
-const maxStatelessMaglevBackends = 127
-
-func statelessMultiBackendFallbackReason(identity *nftableLbIdentity, backendCount int) string {
-	if identity != nil && identity.affinity == string(v1.ServiceAffinityClientIP) {
-		return "ClientIP sessionAffinity"
-	}
-	if backendCount > maxStatelessMaglevBackends {
-		return fmt.Sprintf("backend count %d exceeds %d Maglev slots", backendCount, maxStatelessMaglevBackends)
-	}
-	return ""
-}
-
 type nftableLbIdentity struct {
 	vip             string
 	externalPort    string
@@ -495,6 +483,21 @@ type nftableLbIdentity struct {
 	affinity        string
 	affinityTimeout int32
 	isEIP           bool
+}
+
+const maxStatelessMaglevBackends = 127
+
+func statelessMultiBackendFallbackReason(identity *nftableLbIdentity) string {
+	if identity == nil {
+		return ""
+	}
+	if identity.affinity == string(v1.ServiceAffinityClientIP) {
+		return "ClientIP sessionAffinity"
+	}
+	if len(identity.backends) > maxStatelessMaglevBackends {
+		return fmt.Sprintf("backend count %d exceeds %d Maglev slots", len(identity.backends), maxStatelessMaglevBackends)
+	}
+	return ""
 }
 
 // buildNftableLbIdentities groups Service accounting records into the identities the Service
@@ -573,21 +576,20 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 		}
 
 		if isEipIdentity {
-			backends := dedupSortedBackends(identity.backends)
-			if len(backends) == 1 {
-				host, port, err := net.SplitHostPort(backends[0])
+			if len(identity.backends) == 1 {
+				host, port, err := net.SplitHostPort(identity.backends[0])
 				if err != nil {
 					klog.Errorf("gateway %s invalid backend %s for identity %s:%s/%s: %v",
-						gateway, backends[0], identity.vip, identity.externalPort, identity.protocol, err)
-					return fmt.Errorf("invalid backend %s: %w", backends[0], err)
+						gateway, identity.backends[0], identity.vip, identity.externalPort, identity.protocol, err)
+					return fmt.Errorf("invalid backend %s: %w", identity.backends[0], err)
 				}
 				statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s,%s",
 					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), host, port))
 				statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
 				continue
 			}
-			if reason := statelessMultiBackendFallbackReason(identity, len(backends)); reason != "" {
-				if len(backends) > maxStatelessMaglevBackends {
+			if reason := statelessMultiBackendFallbackReason(identity); reason != "" {
+				if len(identity.backends) > maxStatelessMaglevBackends {
 					klog.Warningf("gateway %s identity %s:%s/%s falls back to stateful LB: %s",
 						gateway, identity.vip, identity.externalPort, identity.protocol, reason)
 				}
@@ -596,7 +598,7 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 			} else {
 				// Multi-backend uses stateless 5-tuple hash for external ingress and keeps stateful table kube-ovn for Hairpin.
 				statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s",
-					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), strings.Join(backends, "@")))
+					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), strings.Join(identity.backends, "@")))
 			}
 		}
 		rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,

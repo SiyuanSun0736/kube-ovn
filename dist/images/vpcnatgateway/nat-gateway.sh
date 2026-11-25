@@ -2832,6 +2832,10 @@ function stateless_dnat_add_rule() {
         echo "No valid backends in stateless DNAT rule: $rule" >&2
         return 1
     fi
+    if (( count > STATELESS_HASH_SLOTS )); then
+        echo "Too many backends ($count > $STATELESS_HASH_SLOTS) in stateless DNAT rule: $rule" >&2
+        return 1
+    fi
     if [[ $count -gt 1 ]]; then
         mapfile -t backend_list < <(printf '%s\n' "${backend_list[@]}" | sort -u)
     fi
@@ -2936,7 +2940,7 @@ function stateless_dnat_add_rule() {
     done
 
     # Hairpin 兜底分两路：单后端靠 iptables SHARED_DNAT，多后端靠 table ip kube-ovn；
-    # 仅在曾为单后端（prev_tuples == 1）时清理 SHARED_DNAT，避免多后端每次 reconcile 都跑 iptables-save。
+    # 在曾为单后端或线上状态未知（prev_tuples <= 1）时清理 SHARED_DNAT，确认稳态多后端时跳过 iptables-save。
     if [[ $count -eq 1 ]]; then
         local target_tuple="${backend_list[0]}"
         if [[ ${#prev_tuples[@]} -ne 1 || "${prev_tuples[0]}" != "$target_tuple" ]]; then
@@ -2944,7 +2948,7 @@ function stateless_dnat_add_rule() {
         fi
         IFS=':' read -r b_ip b_port <<< "$target_tuple"
         (add_dnat "$eip,$external_port,$protocol,$b_ip,$b_port") || return 1
-    elif [[ ${#prev_tuples[@]} -eq 1 ]]; then
+    elif [[ ${#prev_tuples[@]} -le 1 ]]; then
         (del_dnat "$eip,$external_port,$protocol") || return 1
     fi
 }

@@ -156,7 +156,7 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 			vip:          "1.1.1.1",
 			externalPort: "80",
 			protocol:     "tcp",
-			backends:     []string{"10.0.0.6:8080", "10.0.0.5:8080"},
+			backends:     []string{"10.0.0.5:8080", "10.0.0.6:8080"},
 		},
 	}
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, multiBackendIdentities, nil, nil))
