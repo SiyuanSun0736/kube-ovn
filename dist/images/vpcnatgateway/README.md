@@ -14,7 +14,7 @@ Kube-OVN VPC NAT Gateway 在运行中使用两张 nftables 表：
 | 南北向独占 DNAT | `kube_ovn_stateless_nat` | `untracked` (notrack) | 入向 `sl_dnat_in` 改目的 IP:Port，出向 `sl_dnat_out` 改源 IP:Port |
 | 单后端公网 EIP Service | `kube_ovn_stateless_nat` | `untracked` (notrack) | 动态写入 `sl_dnat_in` 与 `sl_dnat_out` 直通 |
 | 多后端公网 EIP Service | `kube_ovn_stateless_nat` | `untracked` (notrack) | 入向五元组 `jhash mod 127` Maglev 一致性哈希分发至 `_ep_<bkhash>` 子链，出向汇聚至共享 `sl_dout_*` |
-| ClusterIP / lanIP / 多后端发卡 | `kube-ovn` | `tracked` (有状态) | 未经过公网卡，保留在 `service-ips` vmap 走有状态路径 |
+| ClusterIP / lanIP / 多后端发卡 / ClientIP 亲和性多后端 | `kube-ovn` | `tracked` (有状态) | 未经过公网卡，或需按客户端 IP 会话保持时保留在 `service-ips` vmap 走有状态路径 |
 | 单后端发卡流量 (Hairpin) | `iptables` (HAIRPIN 链) | `tracked` (有状态) | 未命中出向公网卡 FIB 校验，回退有状态链路 |
 | 多对一 SNAT 网段 | `iptables` (SNAT 链) | `tracked` (有状态) | 无状态回程无法反解多对一端口，走有状态路径 |
 
@@ -139,9 +139,9 @@ add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c 
 add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f
 add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f notrack ip daddr set 10.0.1.11 tcp dport set 8080
 
-# 入向主链：五元组 jhash mod 127 查 Maglev vmap
+# 入向主链：五元组 jhash（固定 seed）mod 127 查 Maglev vmap
 add chain ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80
-add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80 jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 127 vmap { 0 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c, 1 : goto sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f, ..., 126 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c }
+add rule ip kube_ovn_stateless_nat sl_din_tcp_192_0_2_10_80 jhash ip saddr . ip daddr . meta l4proto . th sport . th dport seed 0x1a2b3c4d mod 127 vmap { 0 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c, 1 : goto sl_din_tcp_192_0_2_10_80_ep_0018b634e9d8d64f, ..., 126 : goto sl_din_tcp_192_0_2_10_80_ep_0efcb8350f3a691c }
 
 # 共享出向子链与多后端三元组汇聚
 add chain ip kube_ovn_stateless_nat sl_dout_tcp_192_0_2_10_80
@@ -227,7 +227,9 @@ add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count ov
 
 ### 4.2 多后端 Service 无状态与 Hairpin 分流
 
-在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。
+在 `stateless-nft` 模式下，公网 EIP Service 无论 1 个还是多个 Ready 后端均下发至 `kube_ovn_stateless_nat`（多后端采用固定 `N = 127` 五元组 Maglev 一致性哈希），0 后端时自动清理无状态规则。其中 `N = 127` 槽位按单个 `(EIP, ExternalPort, Protocol)` 对外端口独立分配，不同 Service 或同一 Service 的不同端口互不共享，单端口支持的 Ready 后端上限为 127 个。
+
+若多后端 Service 配置了 `sessionAffinity: ClientIP`，由于五元组无状态哈希包含客户端源端口无法保证按源 IP 会话保持，控制器会跳过无状态路径（并清理可能残留的无状态规则），使其保留在 `table ip kube-ovn` 走有状态 `aff-*` 会话保持。
 
 同时，多后端场景会保留 `table ip kube-ovn` 中的 Share-DNAT 表项以兜底 VPC 内部发卡（Hairpin）流量；ClusterIP 与 `lanIP` 流量不经过公网卡，严格保留在有状态路径，防止与公网 EIP 产生出向三元组反向映射冲突。
 
