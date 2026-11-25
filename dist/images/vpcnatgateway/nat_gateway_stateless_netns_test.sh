@@ -106,6 +106,48 @@ gw stateless-dnat-del '192.0.2.11,81,udp'
 
 ! ip netns exec sl-gw nft list map ip kube_ovn_stateless_nat sl_dnat_in | grep -q 192.0.2.11
 ip netns exec sl-gw conntrack -F >/dev/null 2>&1
+
+# Multi-backend stateless DNAT (N=127 Maglev 5-tuple hash) distributes across backends with zero conntrack.
+ip -n sl-lan addr add 10.0.0.3/24 dev eth0
+cat > "$tmp/id_server.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+bind_ip = sys.argv[1]
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(f"{bind_ip}:{self.client_address[0]}".encode())
+    def log_message(self, *args):
+        pass
+HTTPServer((bind_ip, 9090), Handler).serve_forever()
+PY
+ip netns exec sl-lan python3 "$tmp/id_server.py" 10.0.0.2 &
+ip netns exec sl-lan python3 "$tmp/id_server.py" 10.0.0.3 &
+for attempt in {1..20}; do
+    if ip netns exec sl-lan curl -fsS --max-time 1 http://10.0.0.2:9090/ >/dev/null 2>&1 &&
+       ip netns exec sl-lan curl -fsS --max-time 1 http://10.0.0.3:9090/ >/dev/null 2>&1; then
+        break
+    fi
+    sleep .1
+done
+gw stateless-dnat-add '192.0.2.11,80,tcp,10.0.0.2:9090@10.0.0.3:9090'
+seen_2=0
+seen_3=0
+for _ in {1..30}; do
+    resp=$(ip netns exec sl-wan curl --noproxy '*' -fsS --max-time 3 http://192.0.2.11/)
+    case "$resp" in
+        10.0.0.2:192.0.2.2) seen_2=1 ;;
+        10.0.0.3:192.0.2.2) seen_3=1 ;;
+        *) echo "unexpected multi-backend response: $resp" >&2; exit 1 ;;
+    esac
+done
+[[ $seen_2 -eq 1 && $seen_3 -eq 1 ]] || { echo "multi-backend traffic did not hit both backends ($seen_2,$seen_3)" >&2; exit 1; }
+assert_no_conntrack
+gw stateless-dnat-del '192.0.2.11,80,tcp'
+! ip netns exec sl-gw nft list map ip kube_ovn_stateless_nat sl_dnat_in | grep -q 192.0.2.11
+ip netns exec sl-gw conntrack -F >/dev/null 2>&1
+
 # SNAT uses stateful iptables path with full conntrack protection and CIDR support.
 gw snat-add '192.0.2.12,10.0.0.0/24'
 # Outbound traffic from Pod is SNAT-ed to EIP

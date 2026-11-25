@@ -148,19 +148,20 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, nil, []*kubeovnv1.IptablesDnatRule{record}, nil))
 	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
 
-	// 3. Multi-backend identity gracefully falls back to stateful nft-dnat-map-add and cleans up stateless rule
+	// 3. Multi-backend identity programs stateless-dnat-add for external ingress and keeps stateful nft-dnat-map-add for Hairpin
 	programmed = map[string][]string{}
 	multiBackendIdentities := []*nftableLbIdentity{
 		{
 			vip:          "1.1.1.1",
 			externalPort: "80",
 			protocol:     "tcp",
-			backends:     []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+			backends:     []string{"10.0.0.6:8080", "10.0.0.5:8080"},
 		},
 	}
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, multiBackendIdentities, nil, nil))
-	require.NotEmpty(t, programmed[natGwNftDnatMapAdd])
-	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Equal(t, []string{"1.1.1.1,80,tcp,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwStatelessDnatAdd])
+	require.Equal(t, []string{"1.1.1.1,80,tcp,none,0,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwNftDnatMapAdd])
+	require.Empty(t, programmed[natGwStatelessDnatDel])
 
 	// 4. ClusterIP identity stays stateful on a stateless gateway
 	programmed = map[string][]string{}

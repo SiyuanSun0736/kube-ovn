@@ -386,8 +386,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		}
 		idKey := eipIP + "/" + record.Spec.ExternalPort + "/" + strings.ToLower(record.Spec.Protocol)
 		id := identities[idKey]
-		if id == nil || len(id.backends) != 1 {
-			// Multi-backend or empty backends fall back to stateful nftables LB, not subject to stateless 1:1 constraints.
+		if id == nil || len(id.backends) == 0 {
 			continue
 		}
 		isEstablished := dnatMatchesDesired(existingMap[record.Name], record)
@@ -548,29 +547,33 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 			continue
 		}
 
-		if isEipIdentity && len(identity.backends) == 1 {
-			host, port, err := net.SplitHostPort(identity.backends[0])
-			if err != nil {
-				klog.Errorf("gateway %s invalid backend %s for identity %s:%s/%s: %v",
-					gateway, identity.backends[0], identity.vip, identity.externalPort, identity.protocol, err)
-				return fmt.Errorf("invalid backend %s: %w", identity.backends[0], err)
+		if isEipIdentity {
+			backends := dedupSortedBackends(identity.backends)
+			if len(backends) == 1 {
+				host, port, err := net.SplitHostPort(backends[0])
+				if err != nil {
+					klog.Errorf("gateway %s invalid backend %s for identity %s:%s/%s: %v",
+						gateway, backends[0], identity.vip, identity.externalPort, identity.protocol, err)
+					return fmt.Errorf("invalid backend %s: %w", backends[0], err)
+				}
+				statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s,%s",
+					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), host, port))
+				statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+				continue
 			}
-			statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s,%s",
-				identity.vip, identity.externalPort, strings.ToLower(identity.protocol), host, port))
-			statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
-		} else {
-			rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
-				identity.backends, identity.affinity, identity.affinityTimeout)
-			if err != nil {
-				return fmt.Errorf("failed to build share dnat identity %s:%s/%s: %w",
-					identity.vip, identity.externalPort, identity.protocol, err)
-			}
-			addRules = append(addRules, rule)
-			if isEipIdentity {
-				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
-					identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
-			}
+			// Multi-backend uses stateless 5-tuple hash for external ingress and keeps stateful table kube-ovn for Hairpin.
+			statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s",
+				identity.vip, identity.externalPort, strings.ToLower(identity.protocol), strings.Join(backends, "@")))
 		}
+		rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
+			identity.backends, identity.affinity, identity.affinityTimeout)
+		if err != nil {
+			klog.Errorf("gateway %s failed to build share dnat identity %s:%s/%s: %v",
+				gateway, identity.vip, identity.externalPort, identity.protocol, err)
+			return fmt.Errorf("failed to build share dnat identity %s:%s/%s: %w",
+				identity.vip, identity.externalPort, identity.protocol, err)
+		}
+		addRules = append(addRules, rule)
 	}
 
 	if len(statefulDelRules) != 0 {
