@@ -379,6 +379,12 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	for _, rule := range existing {
 		existingMap[rule.Name] = rule
 	}
+	retiringNames := make(map[string]bool)
+	for _, rule := range existing {
+		if desired[rule.Name] == nil {
+			retiringNames[rule.Name] = true
+		}
+	}
 	identities := buildNftableLbIdentities(desired, eipIP)
 	for _, record := range desired {
 		if record.Spec.EIP == "" {
@@ -386,8 +392,12 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		}
 		idKey := eipIP + "/" + record.Spec.ExternalPort + "/" + strings.ToLower(record.Spec.Protocol)
 		id := identities[idKey]
-		if id == nil || len(id.backends) != 1 {
-			// Multi-backend or empty backends fall back to stateful nftables LB, not subject to stateless 1:1 constraints.
+		// 仅跳过 0 后端身份；单后端与多后端公网 EIP 均走无状态表，每个后端都必须接受反向唯一性校验
+		if id == nil || len(id.backends) == 0 {
+			continue
+		}
+		if len(id.backends) > 1 && statelessMultiBackendFallbackReason(id) != "" {
+			// Fallback multi-backend identities stay on the stateful table kube-ovn path.
 			continue
 		}
 		isEstablished := dnatMatchesDesired(existingMap[record.Name], record)
@@ -402,6 +412,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			owner:         key,
 			isShare:       true,
 			isEstablished: isEstablished,
+			retiringNames: retiringNames,
 		}); err != nil {
 			c.recorder.Event(cachedSvc, v1.EventTypeWarning, "StatelessConflict", err.Error())
 			return err
@@ -471,6 +482,22 @@ type nftableLbIdentity struct {
 	backends        []string
 	affinity        string
 	affinityTimeout int32
+	isEIP           bool
+}
+
+const maxStatelessMaglevBackends = 127
+
+func statelessMultiBackendFallbackReason(identity *nftableLbIdentity) string {
+	if identity == nil {
+		return ""
+	}
+	if identity.affinity == string(v1.ServiceAffinityClientIP) {
+		return "ClientIP sessionAffinity"
+	}
+	if len(identity.backends) > maxStatelessMaglevBackends {
+		return fmt.Sprintf("backend count %d exceeds %d Maglev slots", len(identity.backends), maxStatelessMaglevBackends)
+	}
+	return ""
 }
 
 // buildNftableLbIdentities groups Service accounting records into the identities the Service
@@ -548,28 +575,59 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 			continue
 		}
 
-		if isEipIdentity && len(identity.backends) == 1 {
-			host, port, err := net.SplitHostPort(identity.backends[0])
-			if err != nil {
-				klog.Errorf("gateway %s invalid backend %s for identity %s:%s/%s: %v",
-					gateway, identity.backends[0], identity.vip, identity.externalPort, identity.protocol, err)
-				return fmt.Errorf("invalid backend %s: %w", identity.backends[0], err)
+		if isEipIdentity {
+			if len(identity.backends) == 1 {
+				host, port, err := net.SplitHostPort(identity.backends[0])
+				if err != nil {
+					klog.Errorf("gateway %s invalid backend %s for identity %s:%s/%s: %v",
+						gateway, identity.backends[0], identity.vip, identity.externalPort, identity.protocol, err)
+					return fmt.Errorf("invalid backend %s: %w", identity.backends[0], err)
+				}
+				statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s,%s",
+					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), host, port))
+				statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+				continue
 			}
-			statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s,%s",
-				identity.vip, identity.externalPort, strings.ToLower(identity.protocol), host, port))
-			statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
-		} else {
-			rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
-				identity.backends, identity.affinity, identity.affinityTimeout)
-			if err != nil {
-				return fmt.Errorf("failed to build share dnat identity %s:%s/%s: %w",
-					identity.vip, identity.externalPort, identity.protocol, err)
-			}
-			addRules = append(addRules, rule)
-			if isEipIdentity {
+			if reason := statelessMultiBackendFallbackReason(identity); reason != "" {
+				if len(identity.backends) > maxStatelessMaglevBackends {
+					klog.Warningf("gateway %s identity %s:%s/%s falls back to stateful LB: %s",
+						gateway, identity.vip, identity.externalPort, identity.protocol, reason)
+				}
 				statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
 					identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
+			} else {
+				// Multi-backend uses stateless 5-tuple hash for external ingress and keeps stateful table kube-ovn for Hairpin.
+				statelessAddRules = append(statelessAddRules, fmt.Sprintf("%s,%s,%s,%s",
+					identity.vip, identity.externalPort, strings.ToLower(identity.protocol), strings.Join(identity.backends, "@")))
 			}
+		}
+		rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
+			identity.backends, identity.affinity, identity.affinityTimeout)
+		if err != nil {
+			klog.Errorf("gateway %s failed to build share dnat identity %s:%s/%s: %v",
+				gateway, identity.vip, identity.externalPort, identity.protocol, err)
+			return fmt.Errorf("failed to build share dnat identity %s:%s/%s: %w",
+				identity.vip, identity.externalPort, identity.protocol, err)
+		}
+		addRules = append(addRules, rule)
+	}
+
+	// Retire stale identities before adding replacements so port/EIP changes release old reverse tuples first.
+	for key, identity := range nftableLbExistingIdentities(existing) {
+		if _, ok := wanted[key]; ok {
+			continue
+		}
+		if _, ok := protected[key]; ok {
+			// The Service lost this EIP identity to another Service winner, whose claim proves it
+			// owns the nft map now: deleting here would tear down what the winner just
+			// programmed, and no event tells the winner to rebuild it. The loser's records already
+			// dropped the identity, so nothing else references it from this Service.
+			continue
+		}
+		statefulDelRules = append(statefulDelRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+		if isStateless && identity.isEIP {
+			statelessDelRules = append(statelessDelRules, fmt.Sprintf("%s,%s,%s",
+				identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
 		}
 	}
 
@@ -596,39 +654,6 @@ func (c *Controller) programNftableLbServiceIdentities(gateway, eipIP string, po
 	}
 	if len(addRules) != 0 {
 		if err := c.execNatGwRulesInPods(pods, natGwNftDnatMapAdd, addRules); err != nil {
-			return err
-		}
-	}
-
-	delRules := make([]string, 0, len(existing))
-	statelessUnwantedDel := make([]string, 0, len(existing))
-	for key, identity := range nftableLbExistingIdentities(existing) {
-		if _, ok := wanted[key]; ok {
-			continue
-		}
-		if _, ok := protected[key]; ok {
-			// The Service lost this EIP identity to another Service winner, whose claim proves it
-			// owns the nft map now: deleting here would tear down what the winner just
-			// programmed, and no event tells the winner to rebuild it. The loser's records already
-			// dropped the identity, so nothing else references it from this Service.
-			continue
-		}
-		rule := nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort)
-		delRules = append(delRules, rule)
-		if isStateless && eipIP != "" && identity.vip == eipIP {
-			statelessUnwantedDel = append(statelessUnwantedDel, fmt.Sprintf("%s,%s,%s",
-				identity.vip, identity.externalPort, strings.ToLower(identity.protocol)))
-		}
-	}
-	if len(delRules) != 0 {
-		if err := c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
-			klog.Errorf("failed to delete stateful dnat rules on gateway %s: %v", gateway, err)
-			return err
-		}
-	}
-	if len(statelessUnwantedDel) != 0 {
-		if err := c.execNatGwRulesInPods(pods, natGwStatelessDnatDel, statelessUnwantedDel); err != nil {
-			klog.Errorf("failed to delete stateless dnat rules on gateway %s: %v", gateway, err)
 			return err
 		}
 	}
@@ -687,20 +712,28 @@ func nftableLbExistingIdentities(records []*kubeovnv1.IptablesDnatRule) map[stri
 	identities := make(map[string]*nftableLbIdentity)
 	for _, record := range records {
 		protocol := strings.ToLower(record.Spec.Protocol)
-		add := func(vip string) {
+		add := func(vip string, isEIP bool) {
 			if vip == "" {
 				return
 			}
 			key := vip + "/" + record.Spec.ExternalPort + "/" + protocol
-			identities[key] = &nftableLbIdentity{vip: vip, externalPort: record.Spec.ExternalPort, protocol: protocol}
+			existing, ok := identities[key]
+			if ok {
+				if isEIP {
+					existing.isEIP = true
+				}
+				return
+			}
+			identities[key] = &nftableLbIdentity{vip: vip, externalPort: record.Spec.ExternalPort, protocol: protocol, isEIP: isEIP}
 		}
 		vip := record.Status.V4ip
 		if vip == "" {
 			vip = record.Labels[util.EipV4IpLabel]
 		}
-		add(vip)
+		hasEIP := record.Spec.EIP != "" || record.Labels[util.EipV4IpLabel] != ""
+		add(vip, hasEIP && vip != record.Spec.ClusterIP)
 		if record.Spec.ClusterIP != vip {
-			add(record.Spec.ClusterIP)
+			add(record.Spec.ClusterIP, false)
 		}
 	}
 	return identities

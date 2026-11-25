@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -148,7 +149,7 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, nil, []*kubeovnv1.IptablesDnatRule{record}, nil))
 	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
 
-	// 3. Multi-backend identity gracefully falls back to stateful nft-dnat-map-add and cleans up stateless rule
+	// 3. Multi-backend identity programs stateless-dnat-add for external ingress and keeps stateful nft-dnat-map-add for Hairpin
 	programmed = map[string][]string{}
 	multiBackendIdentities := []*nftableLbIdentity{
 		{
@@ -159,8 +160,9 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 		},
 	}
 	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, multiBackendIdentities, nil, nil))
-	require.NotEmpty(t, programmed[natGwNftDnatMapAdd])
-	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Equal(t, []string{"1.1.1.1,80,tcp,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwStatelessDnatAdd])
+	require.Equal(t, []string{"1.1.1.1,80,tcp,none,0,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwNftDnatMapAdd])
+	require.Empty(t, programmed[natGwStatelessDnatDel])
 
 	// 4. ClusterIP identity stays stateful on a stateless gateway
 	programmed = map[string][]string{}
@@ -185,6 +187,56 @@ func TestProgramNftableLbServiceIdentities_Stateless(t *testing.T) {
 	require.Empty(t, programmed[natGwStatelessDnatAdd])
 	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
 	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
+
+	// 6. Multi-backend identity with ClientIP affinity stays stateful and cleans up stateless rule
+	programmed = map[string][]string{}
+	affinityIdentities := []*nftableLbIdentity{
+		{
+			vip:             "1.1.1.1",
+			externalPort:    "80",
+			protocol:        "tcp",
+			backends:        []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+			affinity:        string(v1.ServiceAffinityClientIP),
+			affinityTimeout: 10800,
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, affinityIdentities, nil, nil))
+	require.Empty(t, programmed[natGwStatelessDnatAdd])
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Equal(t, []string{"1.1.1.1,80,tcp,clientip,10800,10.0.0.5:8080@10.0.0.6:8080"}, programmed[natGwNftDnatMapAdd])
+
+	// 7. Dropping EIP while retaining ClusterIP still cleans up the retired EIP stateless rule even when current eipIP is empty
+	programmed = map[string][]string{}
+	clusterOnlyIdentities := []*nftableLbIdentity{
+		{
+			vip:          "10.96.0.10",
+			externalPort: "80",
+			protocol:     "tcp",
+			backends:     []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "", pods, clusterOnlyIdentities, []*kubeovnv1.IptablesDnatRule{clusterIPRecord}, nil))
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.Contains(t, programmed[natGwNftDnatMapDel], "1.1.1.1,80,tcp")
+
+	// 8. More than 127 backends falls back to stateful LB and cleans up stateless rule
+	programmed = map[string][]string{}
+	largeBackends := make([]string, 0, maxStatelessMaglevBackends+1)
+	for i := range maxStatelessMaglevBackends + 1 {
+		largeBackends = append(largeBackends, fmt.Sprintf("10.0.%d.%d:8080", i/250, (i%250)+1))
+	}
+	largeIdentities := []*nftableLbIdentity{
+		{
+			vip:          "1.1.1.1",
+			externalPort: "80",
+			protocol:     "tcp",
+			backends:     largeBackends,
+		},
+	}
+	require.NoError(t, c.programNftableLbServiceIdentities("gw", "1.1.1.1", pods, largeIdentities, nil, nil))
+	require.Empty(t, programmed[natGwStatelessDnatAdd])
+	require.Contains(t, programmed[natGwStatelessDnatDel], "1.1.1.1,80,tcp")
+	require.NotEmpty(t, programmed[natGwNftDnatMapAdd])
 }
 
 // TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile

@@ -115,6 +115,7 @@ type statelessMapping struct {
 	kind, name, eip, host, protocol, port, externalPort, owner string
 	isShare                                                    bool
 	isEstablished                                              bool
+	retiringNames                                              map[string]bool
 }
 
 // validateStatelessMapping 校验无状态映射的 EIP 独占性与后端反向改写唯一性，防止规则冲突。
@@ -153,6 +154,9 @@ func (c *Controller) validateStatelessMapping(gwName string, candidate stateless
 	}
 
 	for _, existing := range mappings {
+		if candidate.retiringNames[existing.name] {
+			continue
+		}
 		if err := checkStatelessMappingConflict(gwName, candidate, existing, gatewayEips); err != nil {
 			return err
 		}
