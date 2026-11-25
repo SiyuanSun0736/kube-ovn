@@ -21,7 +21,7 @@ func TestNatGatewayOperation(t *testing.T) {
 	c := &Controller{vpcNatGatewayLister: listers.NewVpcNatGatewayLister(indexer)}
 	gw := &kubeovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: "gw"}}
 	require.NoError(t, indexer.Add(gw))
-	for _, op := range []string{natGwSubnetFipAdd, natGwSubnetFipDel, natGwDnatAdd, natGwDnatDel, natGwSnatAdd, natGwSnatDel} {
+	for _, op := range []string{natGwFipAdd, natGwFipDel, natGwDnatAdd, natGwDnatDel, natGwSnatAdd, natGwSnatDel} {
 		got, err := c.natGatewayOperation("gw", op)
 		require.NoError(t, err)
 		require.Equal(t, op, got)
@@ -30,7 +30,7 @@ func TestNatGatewayOperation(t *testing.T) {
 	gw.Spec.DataplaneMode = util.NatDataplaneModeStatelessNft
 	require.NoError(t, indexer.Update(gw))
 	for op, want := range map[string]string{
-		natGwSubnetFipAdd: "stateless-fip-add", natGwSubnetFipDel: "stateless-fip-del",
+		natGwFipAdd: "stateless-fip-add", natGwFipDel: "stateless-fip-del",
 		natGwDnatAdd: natGwDnatAdd, natGwDnatDel: natGwDnatDel,
 		natGwSnatAdd: natGwSnatAdd, natGwSnatDel: natGwSnatDel,
 	} {

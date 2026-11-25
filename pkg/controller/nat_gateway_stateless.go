@@ -41,9 +41,9 @@ func (c *Controller) natGatewayOperation(dp, operation string) (string, error) {
 		return operation, nil
 	}
 	switch operation {
-	case natGwSubnetFipAdd:
+	case natGwFipAdd:
 		return natGwStatelessFipAdd, nil
-	case natGwSubnetFipDel:
+	case natGwFipDel:
 		return natGwStatelessFipDel, nil
 	default:
 		return operation, nil
