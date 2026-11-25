@@ -450,10 +450,6 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 		return errors.New("iptables nat gw not enable")
 	}
 
-	if err := c.validateFipRule(cachedFip); err != nil {
-		return err
-	}
-
 	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
@@ -469,6 +465,10 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 				return fmt.Errorf("failed to mark fip %s not ready after its eip became unavailable: %w", key, patchErr)
 			}
 		}
+		return err
+	}
+
+	if err := c.validateFipRule(cachedFip); err != nil {
 		return err
 	}
 
@@ -824,10 +824,6 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		return errors.New("iptables nat gw not enable")
 	}
 
-	if err := c.validateDnatRule(cachedDnat); err != nil {
-		return err
-	}
-
 	gwName := cachedDnat.Labels[util.VpcNatGatewayNameLabel]
 	var eip *kubeovnv1.IptablesEIP
 	if dnatUsesEip(&cachedDnat.Spec) {
@@ -849,6 +845,10 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			return err
 		}
 		gwName = eip.Spec.NatGwDp
+	}
+
+	if err := c.validateDnatRule(cachedDnat); err != nil {
+		return err
 	}
 	if dup, duplicateErr := c.isDnatDuplicated(gwName, cachedDnat); dup || duplicateErr != nil {
 		if dup && cachedDnat.Status.Ready {
@@ -2067,6 +2067,7 @@ func (c *Controller) redoSnat(key, redo string, eipReady bool) error {
 	return nil
 }
 
+// createFipInPod 向指定的 VPC NAT 网关 Pod 下发创建 FIP 规则指令（无状态模式下路由至 stateless-fip-add）。
 func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2076,8 +2077,13 @@ func (c *Controller) createFipInPod(dp, v4ip, internalIP string) error {
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalIP)
 	addRules = append(addRules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSubnetFipAdd, addRules); err != nil {
-		klog.Errorf("failed to create fip, err: %v", err)
+	operation, err := c.natGatewayOperation(dp, natGwSubnetFipAdd)
+	if err != nil {
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwSubnetFipAdd, err)
+		return err
+	}
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, addRules); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s internalIP %s: %v", dp, v4ip, internalIP, err)
 		return err
 	}
 	return nil
@@ -2110,9 +2116,13 @@ func (c *Controller) finalDeleteFipInPod(key string, cachedFip *kubeovnv1.Iptabl
 			statusNatGwDp = eip.Spec.NatGwDp
 		}
 	}
+	statusInternalIP := cachedFip.Status.InternalIP
+	if statusInternalIP == "" {
+		statusInternalIP = cachedFip.Spec.InternalIP
+	}
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("fip %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
-	} else if err := c.deleteFipInPod(statusNatGwDp, statusV4ip); err != nil {
+	} else if err := c.deleteFipInPod(statusNatGwDp, statusV4ip, statusInternalIP); err != nil {
 		klog.Errorf("failed to delete fip %s, %v", key, err)
 		firstErr = err
 	}
@@ -2134,8 +2144,8 @@ func (c *Controller) finalDeleteFipInPod(key string, cachedFip *kubeovnv1.Iptabl
 			klog.Warningf("fip %s not ready: skip spec-based cleanup due to incomplete spec identity (v4ip=%q, natGwDp=%q)", key, specV4ip, specNatGwDp)
 			return firstErr
 		}
-		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp {
-			if err = c.deleteFipInPod(specNatGwDp, specV4ip); err != nil {
+		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || (cachedFip.Spec.InternalIP != "" && cachedFip.Spec.InternalIP != statusInternalIP) {
+			if err = c.deleteFipInPod(specNatGwDp, specV4ip, cachedFip.Spec.InternalIP); err != nil {
 				klog.Errorf("failed spec-based cleanup for fip %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2195,10 +2205,18 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		klog.Errorf("dnat %s has v4ip %s but externalPort is empty in both Status and Spec, skip pod cleanup", key, statusV4ip)
 		return nil
 	}
+	statusInternalIP := cachedDnat.Status.InternalIP
+	if statusInternalIP == "" {
+		statusInternalIP = cachedDnat.Spec.InternalIP
+	}
+	statusInternalPort := cachedDnat.Status.InternalPort
+	if statusInternalPort == "" {
+		statusInternalPort = cachedDnat.Spec.InternalPort
+	}
 	if statusV4ip == "" || statusNatGwDp == "" {
 		klog.Warningf("dnat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if err := c.deleteDnatInPod(statusNatGwDp, statusProtocol,
-		statusV4ip, statusExternalPort); err != nil {
+		statusV4ip, statusExternalPort, statusInternalIP, statusInternalPort); err != nil {
 		klog.Errorf("failed to delete dnat %s, %v", key, err)
 		firstErr = err
 	}
@@ -2224,7 +2242,7 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 			return firstErr
 		}
 		if specV4ip != statusV4ip || specNatGwDp != statusNatGwDp || specProtocol != statusProtocol || specExternalPort != statusExternalPort {
-			if err = c.deleteDnatInPod(specNatGwDp, specProtocol, specV4ip, specExternalPort); err != nil {
+			if err = c.deleteDnatInPod(specNatGwDp, specProtocol, specV4ip, specExternalPort, cachedDnat.Spec.InternalIP, cachedDnat.Spec.InternalPort); err != nil {
 				klog.Errorf("failed spec-based cleanup for dnat %s, %v", key, err)
 				if firstErr == nil {
 					firstErr = err
@@ -2312,7 +2330,8 @@ func (c *Controller) finalDeleteSnatInPod(key string, cachedSnat *kubeovnv1.Ipta
 	return firstErr
 }
 
-func (c *Controller) deleteFipInPod(dp, v4ip string) error {
+// deleteFipInPod 向指定的 VPC NAT 网关 Pod 下发删除 FIP 规则指令（无状态模式下路由至 stateless-fip-del）。
+func (c *Controller) deleteFipInPod(dp, v4ip, internalIP string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.
@@ -2333,32 +2352,51 @@ func (c *Controller) deleteFipInPod(dp, v4ip string) error {
 		}
 		return err
 	}
-	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP)
-	if err = c.execNatGwRules(gwPod, natGwSubnetFipDel, []string{v4ip}); err != nil {
-		klog.Errorf("failed to delete fip, err: %v", err)
+	// del_floating_ip matches by EIP only (FIP is 1:1, identity = EIP).
+	// In stateless mode, providing internalIP enables precise O(1) element deletion without rule inspection.
+	operation, err := c.natGatewayOperation(dp, natGwSubnetFipDel)
+	if err != nil {
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwSubnetFipDel, err)
+		return err
+	}
+	rule := v4ip
+	if internalIP != "" {
+		rule = fmt.Sprintf("%s,%s", v4ip, internalIP)
+	}
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, []string{rule}); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s: %v", dp, v4ip, err)
 		return err
 	}
 	return nil
 }
 
+// createDnatInPod 向指定的 VPC NAT 网关 Pod 下发创建 DNAT 规则指令（无状态模式下规整端口并路由至 stateless-dnat-add）。
 func (c *Controller) createDnatInPod(dp, protocol, v4ip, internalIP, externalPort, internalPort string) error {
+	protocol = strings.ToLower(protocol)
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
 		klog.Errorf("failed to get nat gw pod, %v", err)
+		return err
+	}
+	operation, err := c.natGatewayOperation(dp, natGwDnatAdd)
+	if err != nil {
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwDnatAdd, err)
 		return err
 	}
 	var addRules []string
 	rule := fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
 	addRules = append(addRules, rule)
 
-	if err = c.execNatGwRules(gwPod, natGwDnatAdd, addRules); err != nil {
-		klog.Errorf("failed to create dnat, err: %v", err)
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, addRules); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s:%s protocol %s backend %s:%s: %v", dp, v4ip, externalPort, protocol, internalIP, internalPort, err)
 		return err
 	}
 	return nil
 }
 
-func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) error {
+// deleteDnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 DNAT 规则指令（无状态模式下规整端口并路由至 stateless-dnat-del）。
+func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort, internalIP, internalPort string) error {
+	protocol = strings.ToLower(protocol)
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
 	// the live CRs. Only a gateway that is known to be running has to be reached.
@@ -2380,15 +2418,25 @@ func (c *Controller) deleteDnatInPod(dp, protocol, v4ip, externalPort string) er
 		return err
 	}
 
-	// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only
+	operation, err := c.natGatewayOperation(dp, natGwDnatDel)
+	if err != nil {
+		klog.Errorf("gateway %s operation %s: %v", dp, natGwDnatDel, err)
+		return err
+	}
+	// del_dnat matches by identity triplet (EIP, ExternalPort, Protocol) only.
+	// In stateless mode, providing internalIP and internalPort enables precise O(1) element deletion without rule inspection.
 	rule := fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)
-	if err = c.execNatGwRules(gwPod, natGwDnatDel, []string{rule}); err != nil {
-		klog.Errorf("failed to delete dnat, err: %v", err)
+	if internalIP != "" && internalPort != "" {
+		rule = fmt.Sprintf("%s,%s,%s,%s,%s", v4ip, externalPort, protocol, internalIP, internalPort)
+	}
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, operation, []string{rule}); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s:%s protocol %s: %v", dp, v4ip, externalPort, protocol, err)
 		return err
 	}
 	return nil
 }
 
+// createSnatInPod 向指定的 VPC NAT 网关 Pod 下发创建 SNAT 规则指令。
 func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	gwPod, err := c.getNatGwPod(dp, c.natGwNamespaceByName(dp))
 	if err != nil {
@@ -2408,13 +2456,14 @@ func (c *Controller) createSnatInPod(dp, v4ip, internalCIDR string) error {
 	}
 
 	rules = append(rules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSnatAdd, rules); err != nil {
-		klog.Errorf("failed to exec nat gateway rule, err: %v", err)
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, natGwSnatAdd, rules); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s internalCIDR %s: %v", dp, v4ip, internalCIDR, err)
 		return err
 	}
 	return nil
 }
 
+// deleteSnatInPod 向指定的 VPC NAT 网关 Pod 下发删除 SNAT 规则指令。
 func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	// A gateway with no running instance holds no data plane to clean up: the rules live in the
 	// container's writable layer, so a replacement instance starts empty and is programmed from
@@ -2440,8 +2489,8 @@ func (c *Controller) deleteSnatInPod(dp, v4ip, internalCIDR string) error {
 	var delRules []string
 	rule := fmt.Sprintf("%s,%s", v4ip, internalCIDR)
 	delRules = append(delRules, rule)
-	if err = c.execNatGwRules(gwPod, natGwSnatDel, delRules); err != nil {
-		klog.Errorf("failed to delete snat, err: %v", err)
+	if err = c.execNatGwRulesInPods([]*corev1.Pod{gwPod}, natGwSnatDel, delRules); err != nil {
+		klog.Errorf("failed to apply gateway %s EIP %s internalCIDR %s: %v", dp, v4ip, internalCIDR, err)
 		return err
 	}
 	return nil
@@ -2566,6 +2615,36 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		klog.Error(err)
 		return err
 	}
+	targetGw := dnat.Labels[util.VpcNatGatewayNameLabel]
+	if targetGw == "" {
+		targetGw = dnat.Status.NatGwDp
+	}
+	if targetGw == "" && dnatUsesEip(&dnat.Spec) {
+		if eip, err := c.iptablesEipsLister.Get(dnat.Spec.EIP); err == nil && eip != nil && eip.DeletionTimestamp.IsZero() {
+			targetGw = eip.Spec.NatGwDp
+		}
+	}
+	if targetGw != "" {
+		owner := ""
+		if dnat.Labels[util.NftableLbSvcNsLabel] != "" && dnat.Labels[util.NftableLbSvcNameLabel] != "" {
+			owner = dnat.Labels[util.NftableLbSvcNsLabel] + "/" + dnat.Labels[util.NftableLbSvcNameLabel]
+		}
+		if err = c.validateStatelessMapping(targetGw, statelessMapping{
+			kind:          "DNAT",
+			name:          dnat.Name,
+			eip:           dnat.Spec.EIP,
+			host:          dnat.Spec.InternalIP,
+			protocol:      dnat.Spec.Protocol,
+			port:          dnat.Spec.InternalPort,
+			externalPort:  dnat.Spec.ExternalPort,
+			owner:         owner,
+			isShare:       dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare,
+			isEstablished: dnatMappingEstablished(dnat),
+		}); err != nil {
+			klog.Errorf("validate stateless dnat rule %s: %v", dnat.Name, err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2591,6 +2670,26 @@ func (c *Controller) validateFipRule(fip *kubeovnv1.IptablesFIPRule) error {
 	if util.CheckProtocol(fip.Spec.InternalIP) != kubeovnv1.ProtocolIPv4 {
 		err = fmt.Errorf("%s: internalIP %q must be IPv4, IPv6 is not supported", fip.Name, fip.Spec.InternalIP)
 		klog.Error(err)
+		return err
+	}
+	eip, err := c.iptablesEipsLister.Get(fip.Spec.EIP)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if eip.Spec.NatGwDp == "" || !eip.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	if err = c.validateStatelessMapping(eip.Spec.NatGwDp, statelessMapping{
+		kind:          "FIP",
+		name:          fip.Name,
+		eip:           fip.Spec.EIP,
+		host:          fip.Spec.InternalIP,
+		isEstablished: fipMappingEstablished(fip),
+	}); err != nil {
+		klog.Errorf("validate stateless fip rule %s: %v", fip.Name, err)
 		return err
 	}
 	return nil

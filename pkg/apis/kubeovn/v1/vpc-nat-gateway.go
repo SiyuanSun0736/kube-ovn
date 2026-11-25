@@ -88,8 +88,12 @@ type VpcNatGatewaySpec struct {
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
 	// DataplaneMode specifies whether the NAT gateway operates in stateless data plane mode.
 	// Valid value is "stateless-nft". Unset or empty indicates default stateful mode.
+	// In stateless mode, FIP and exclusive DNAT mappings operate statelessly without conntrack,
+	// while SNAT and hairpin traffic retain stateful conntrack handling.
+	// Once initialized, dataplaneMode is immutable; delete and recreate the gateway to switch mode.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Enum="";stateless-nft
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="dataplaneMode is immutable; delete and recreate the gateway to switch mode"
 	DataplaneMode string `json:"dataplaneMode,omitempty"`
 	// TCPConnLimit configures the maximum concurrent TCP connections for the NAT gateway.
 	// When unset or set to 0, TCP connlimit is disabled. Set to a positive integer to enable.
