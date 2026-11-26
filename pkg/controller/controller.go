@@ -1563,6 +1563,11 @@ func (c *Controller) startWorkers(ctx context.Context) {
 			if err := c.markAndCleanLSP(); err != nil {
 				klog.Errorf("gc lsp error: %v", err)
 			}
+			// orphan IP CRs whose lsp is already gone are invisible to markAndCleanLSP,
+			// without this backstop they block subnet/vpc deletion forever
+			if err := c.gcIP(); err != nil {
+				klog.Errorf("gc ip error: %v", err)
+			}
 		}, time.Duration(c.config.GCInterval)*time.Second, ctx.Done())
 	}
 

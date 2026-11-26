@@ -1257,6 +1257,9 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 		// Pod with same name exists, just return here
 		return nil
 	}
+	// a compensating delete may carry an old pod snapshot taken before the deletion timestamp was set,
+	// so a pod that is gone from the cache must be treated as deleted, otherwise its IP CR is leaked
+	podDeleted := !pod.DeletionTimestamp.IsZero() || p == nil
 
 	if aaps := pod.Annotations[util.AAPsAnnotation]; aaps != "" {
 		for vipName := range strings.SplitSeq(aaps, ",") {
@@ -1276,7 +1279,7 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 	var ipcrToDelete []string
 	isStsPod, stsName, stsUID := isStatefulSetPod(pod)
 	if isStsPod {
-		if !pod.DeletionTimestamp.IsZero() {
+		if podDeleted {
 			klog.Infof("handle deletion of sts pod %s", podKey)
 			isOwnerRefToDel = isStatefulSetPodToDel(c.config.KubeClient, pod, stsName, stsUID)
 			if !isOwnerRefToDel {
@@ -1311,7 +1314,7 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 				return err
 			}
 		}
-		if pod.DeletionTimestamp != nil {
+		if podDeleted {
 			klog.Infof("handle deletion of vm pod %s", podKey)
 			isOwnerRefToDel = c.isVMToDel(pod, vmName)
 			if !isOwnerRefToDel {

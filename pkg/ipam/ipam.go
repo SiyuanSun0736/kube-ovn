@@ -349,6 +349,14 @@ func (ipam *IPAM) AddOrUpdateSubnet(name, cidrStr, gw string, excludeIps []strin
 	return nil
 }
 
+// GetSubnet reads Subnets under the lock: subnet workers add and delete entries concurrently
+func (ipam *IPAM) GetSubnet(subnetName string) (*Subnet, bool) {
+	ipam.mutex.RLock()
+	defer ipam.mutex.RUnlock()
+	subnet, ok := ipam.Subnets[subnetName]
+	return subnet, ok
+}
+
 func (ipam *IPAM) DeleteSubnet(subnetName string) {
 	ipam.mutex.Lock()
 	defer ipam.mutex.Unlock()

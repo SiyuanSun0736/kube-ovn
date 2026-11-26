@@ -94,7 +94,7 @@ func (c *Controller) exportCentralizedSubnetInfo(subnet *kubeovnv1.Subnet) {
 }
 
 func (c *Controller) exportSubnetIPAMInfo(subnet *kubeovnv1.Subnet) {
-	ipamSubnet, ok := c.ipam.Subnets[subnet.Name]
+	ipamSubnet, ok := c.ipam.GetSubnet(subnet.Name)
 	if !ok {
 		klog.Errorf("failed to get subnet %s in ipam", subnet.Name)
 		return
@@ -118,7 +118,7 @@ func (c *Controller) exportSubnetIPAMInfo(subnet *kubeovnv1.Subnet) {
 }
 
 func (c *Controller) exportSubnetIPAssignedInfo(subnet *kubeovnv1.Subnet) {
-	ipamSubnet, ok := c.ipam.Subnets[subnet.Name]
+	ipamSubnet, ok := c.ipam.GetSubnet(subnet.Name)
 	if !ok {
 		klog.Errorf("failed to get subnet %s in ipam", subnet.Name)
 		return

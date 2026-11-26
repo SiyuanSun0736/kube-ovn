@@ -14,6 +14,7 @@ import (
 	"go.uber.org/mock/gomock"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
@@ -1968,4 +1969,101 @@ func TestHandleAddOrUpdatePodQueuesNatGwInit(t *testing.T) {
 			requireQueueItem(t, queue, "gw")
 		})
 	}
+}
+
+// A compensating delete can carry a pod snapshot taken before kubernetes set the deletion
+// timestamp (see qbox/las#5154): the pod is already gone, its statefulset too, yet the old code
+// read the missing timestamp as "owner still alive" and left the IP CR behind, which keeps the
+// subnet (and the vpc) from ever finishing deletion.
+func TestHandleDeletePodStaleStsSnapshot(t *testing.T) {
+	const (
+		namespace = "ns"
+		stsName   = "sts"
+		podName   = "sts-0"
+		stsUID    = "6c1d1b0a-0000-4000-8000-000000000002"
+	)
+	portName := ovs.PodNameToPortName(podName, namespace, util.OvnProvider)
+
+	// snapshot of a running sts pod: no deletion timestamp
+	stsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      podName,
+			UID:       types.UID("pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+				Kind:       util.KindStatefulSet,
+				Name:       stsName,
+				UID:        types.UID(stsUID),
+			}},
+			Annotations: map[string]string{
+				util.LogicalSwitchAnnotation:                         "ovn-default",
+				util.AllocatedAnnotation:                             "true",
+				fmt.Sprintf(util.IPAddressAnnotationTemplate, "ovn"): "10.0.0.2",
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
+
+	newController := func(t *testing.T, sts []*appsv1.StatefulSet) *fakeController {
+		t.Helper()
+		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			Namespaces: []*corev1.Namespace{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        namespace,
+					Annotations: map[string]string{util.LogicalSwitchAnnotation: "ovn-default"},
+				},
+			}},
+			Subnets: []*kubeovnv1.Subnet{{
+				ObjectMeta: metav1.ObjectMeta{Name: "ovn-default"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "ovn-cluster"},
+			}},
+			// the pod itself is already gone from the api server
+			StatefulSets: sts,
+			IPs: []*kubeovnv1.IP{{
+				ObjectMeta: metav1.ObjectMeta{Name: portName},
+				Spec: kubeovnv1.IPSpec{
+					PodName:   podName,
+					Namespace: namespace,
+					Subnet:    "ovn-default",
+					PodType:   util.KindStatefulSet,
+				},
+			}},
+		})
+		require.NoError(t, err)
+		fc.mockOvnClient.EXPECT().
+			ListNormalLogicalSwitchPorts(gomock.Any(), map[string]string{"pod": namespace + "/" + podName}).
+			Return([]ovnnb.LogicalSwitchPort{{Name: portName}}, nil)
+		return fc
+	}
+
+	t.Run("deleted statefulset releases the ip of a stale snapshot", func(t *testing.T) {
+		fc := newController(t, nil)
+		c := fc.fakeController
+		fc.mockOvnClient.EXPECT().DeleteLogicalSwitchPort(portName).Return(nil)
+
+		key := namespace + "/" + podName
+		c.deletingPodObjMap.Store(key, stsPod)
+		require.NoError(t, c.handleDeletePod(key))
+
+		_, err := c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), portName, metav1.GetOptions{})
+		require.True(t, k8serrors.IsNotFound(err), "the ip CR of a deleted statefulset must not survive")
+	})
+
+	t.Run("live statefulset keeps the ip", func(t *testing.T) {
+		replicas := int32(1)
+		fc := newController(t, []*appsv1.StatefulSet{{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: stsName, UID: types.UID(stsUID)},
+			Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+		}})
+		c := fc.fakeController
+		fc.mockOvnClient.EXPECT().RemovePortFromPortGroups(portName).Return(nil)
+
+		key := namespace + "/" + podName
+		c.deletingPodObjMap.Store(key, stsPod)
+		require.NoError(t, c.handleDeletePod(key))
+
+		_, err := c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), portName, metav1.GetOptions{})
+		require.NoError(t, err, "a pod restart of a live statefulset must keep its ip")
+	})
 }
