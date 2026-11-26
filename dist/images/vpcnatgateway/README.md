@@ -246,7 +246,7 @@ h1 = int((h1 * 33 + ch) % 2147483647)
 h2 = int((h2 * 131 + ch + 17) % 2147483647)
 ```
 
-`h1`（初值 `5381`，乘数 `33`）改写自 Daniel J. Bernstein 的 `djb2` 字符串哈希（参考 https://www.cse.yorku.ca/~oz/hash.html ），`h2`（初值 `0`，乘数 `131`，偏移 `17`）则参考了常见的 BKDRHash 乘数，为 [Maglev 论文](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud) 所需的第二路独立散列提供计算。原版 C 实现依赖无符号整数溢出截断，而 `awk` 数值底层是 IEEE 754 双精度浮点数（精确整数上限为 $2^{53}$），因此每步改对梅森质数 `2147483647`（$2^{31}-1$）取模，使中间值最大不超过约 $2.81 \times 10^{11}$，避免计算过程中出现精度丢失。
+`h1`（初值 `5381`，乘数 `33`）改写自 Daniel J. Bernstein 的 `djb2` 字符串哈希（参考 https://www.cse.yorku.ca/~oz/hash.html ），`h2`（初值 `0`，乘数 `131`，偏移 `17`）则参考了常见的 BKDRHash 乘数，为 [Maglev 论文](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf) 所需的第二路独立散列提供计算。原版 C 实现依赖无符号整数溢出截断，而 `awk` 数值底层是 IEEE 754 双精度浮点数（精确整数上限为 $2^{53}$），因此每步改对梅森质数 `2147483647`（$2^{31}-1$）取模，使中间值最大不超过约 $2.81 \times 10^{11}$，避免计算过程中出现精度丢失。
 
 接着用这两组哈希算出每个后端的偏好序列参数：起始偏移 `offset = h1 % 127`（`0..126`），探测步长 `skip = (h2 % 126) + 1`（`1..126`）。由于 `127` 是质数，任意 `skip` 都与 `127` 互质，因此序列 `(offset + k * skip) mod 127`（$k = 0..126$）能够不重复地遍历全部 127 个槽位。
 
