@@ -91,7 +91,7 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 		}
 
 		// 验证不搞越界猜测，明确 fail-fast 返回错误
-		_, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup)
+		_, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup, nil)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "failed to get external subnet las-derived-subnet-not-found")
 	})
@@ -209,7 +209,7 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 func TestNatGwTCRedirectTarget(t *testing.T) {
 	t.Run("nil pod", func(t *testing.T) {
 		subnet := &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: "ext-subnet"}}
-		_, err := natGwTCRedirectTarget(nil, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(nil, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "NAT gateway pod is missing")
 	})
 
@@ -219,7 +219,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			Spec:       kubeovnv1.SubnetSpec{Provider: "invalid-provider-without-dot"},
 		}
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nat-gw", Namespace: "kube-system"}}
-		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "is not a valid NAD format")
 	})
 
@@ -252,7 +252,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		}
 
 		// 1. 成功解析直通网卡索引与 MAC
-		target, err := natGwTCRedirectTarget(pod, subnet, "", lookup)
+		target, err := natGwTCRedirectTarget(pod, subnet, "", lookup, nil)
 		require.NoError(t, err)
 		require.Equal(t, 12, target.TargetIfindex)
 		require.Equal(t, net.HardwareAddr{2, 0, 0, 0, 0, 2}, target.TargetMAC)
@@ -267,7 +267,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		}
 		for _, status := range invalidStatuses {
 			pod.Annotations[nadv1.NetworkStatusAnnot] = status
-			_, err := natGwTCRedirectTarget(pod, subnet, "", lookup)
+			_, err := natGwTCRedirectTarget(pod, subnet, "", lookup, nil)
 			require.Error(t, err, "status %q", status)
 		}
 
@@ -275,7 +275,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		pod.Annotations[nadv1.NetworkStatusAnnot] = `[{"name":"kube-system/wan","mac":"02:00:00:00:00:02"}]`
 		_, err = natGwTCRedirectTarget(pod, subnet, "", func(string) (netlink.Link, error) {
 			return nil, errors.New("link missing")
-		})
+		}, nil)
 		require.Error(t, err)
 	})
 
@@ -294,7 +294,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 				},
 			},
 		}
-		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "has no network status for kube-system/wan")
 	})
 
@@ -319,7 +319,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			}
 			return nil, errors.New("not found")
 		}
-		target, err := natGwTCRedirectTargetWithAlias(pod, subnet, "bond0", nil, lookupByAlias)
+		target, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, lookupByAlias)
 		require.NoError(t, err)
 		require.Equal(t, 88, target.TargetIfindex)
 		require.Equal(t, 0, target.ParentIfindex)
@@ -347,7 +347,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			}
 			return nil, errors.New("not found")
 		}
-		target, err := natGwTCRedirectTargetWithAlias(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		target, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
 		require.NoError(t, err)
 		require.Equal(t, 99, target.TargetIfindex)
 		require.Equal(t, 0, target.ParentIfindex)
@@ -374,7 +374,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			}
 			return nil, errors.New("not found")
 		}
-		target, err := natGwTCRedirectTargetWithAlias(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		target, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
 		require.NoError(t, err)
 		require.Equal(t, 101, target.TargetIfindex)
 		require.Equal(t, 0, target.ParentIfindex)
@@ -399,7 +399,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		lookupByAlias := func(_ string) (netlink.Link, error) {
 			return nil, errors.New("link alias not found")
 		}
-		_, err := natGwTCRedirectTargetWithAlias(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		_, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
 		require.ErrorContains(t, err, "failed to locate host veth by alias")
 		require.ErrorContains(t, err, "link alias not found")
 	})

@@ -18,14 +18,10 @@ import (
 // getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。
 // 直接以 EIP 本身指定的 ExternalSubnet 为准精准定位外网网卡。
 func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
-	return c.getNatGwTCRedirectTargetWithAlias(pod, eip, netlink.LinkByName, netlink.LinkByAlias)
+	return c.getNatGwTCRedirectTargetInternal(pod, eip, netlink.LinkByName, netlink.LinkByAlias)
 }
 
-func (c *Controller) getNatGwTCRedirectTargetInternal(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
-	return c.getNatGwTCRedirectTargetWithAlias(pod, eip, lookup, nil)
-}
-
-func (c *Controller) getNatGwTCRedirectTargetWithAlias(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
+func (c *Controller) getNatGwTCRedirectTargetInternal(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	if eip.Spec.ExternalSubnet == "" {
 		return TCRedirectTarget{}, fmt.Errorf("iptables-eip %s has empty externalSubnet", eip.Name)
 	}
@@ -33,16 +29,12 @@ func (c *Controller) getNatGwTCRedirectTargetWithAlias(pod *corev1.Pod, eip *kub
 	if err != nil {
 		return TCRedirectTarget{}, fmt.Errorf("failed to get external subnet %s for EIP %s: %w", eip.Spec.ExternalSubnet, eip.Name, err)
 	}
-	return natGwTCRedirectTargetWithAlias(pod, subnet, c.config.TcBpfInterface, lookup, lookupByAlias)
+	return natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, lookup, lookupByAlias)
 }
 
 // TC Ingress 接收网卡与外网子网的 macvlan 父设备可以不是同一个设备。
 // 通过后者进行直通路由并精准重定向到 Pod 的真实硬件 MAC 地址。
-func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
-	return natGwTCRedirectTargetWithAlias(pod, subnet, defaultParent, lookup, nil)
-}
-
-func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
+func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	if pod == nil {
 		return TCRedirectTarget{}, errors.New("NAT gateway pod is missing")
 	}
