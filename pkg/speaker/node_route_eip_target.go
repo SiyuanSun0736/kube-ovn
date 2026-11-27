@@ -87,18 +87,29 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 		}
 	} else {
 		// 非 macvlan 模式（例如 OVS Underlay veth-pair 或 ptp 模式）：
-		// 1. 优先通过 CNI 写入宿主端 veth 的确定性 ifalias 直接定位（不依赖宿主机路由，也兼容无 IPAM）；
+		// 1. 优先通过 CNI 写入宿主端 veth 的确定性 ifalias 直接定位（不依赖宿主机路由，也不依赖 Multus network-status / IPAM）；
 		// 2. 未命中 alias 时回退至通过 Pod 外部 IP 的宿主机路由反查宿主机端 veth 设备。
-		for _, status := range statuses {
-			if status.Name != expectedNetName {
-				continue
+		if lookupByAlias != nil {
+			ifName := "net1"
+			macStr := pod.Annotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, subnet.Spec.Provider)]
+			for _, status := range statuses {
+				if status.Name != expectedNetName {
+					continue
+				}
+				if status.Interface != "" {
+					ifName = status.Interface
+				}
+				if status.Mac != "" {
+					macStr = status.Mac
+				}
+				break
 			}
-			gwNet1Mac, err := net.ParseMAC(status.Mac)
-			if err != nil {
-				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
-			}
-			if lookupByAlias != nil && status.Interface != "" {
-				alias := util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, status.Interface)
+			if macStr != "" {
+				gwNet1Mac, err := net.ParseMAC(macStr)
+				if err != nil {
+					return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", expectedNetName, err)
+				}
+				alias := util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, ifName)
 				if hostLink, err := lookupByAlias(alias); err == nil && hostLink != nil {
 					gwRedirectTarget := TCRedirectTarget{TargetIfindex: hostLink.Attrs().Index, ParentIfindex: 0, TargetMAC: gwNet1Mac}
 					if !validTCRedirectTarget(gwRedirectTarget) {
@@ -106,6 +117,15 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 					}
 					return gwRedirectTarget, nil
 				}
+			}
+		}
+		for _, status := range statuses {
+			if status.Name != expectedNetName {
+				continue
+			}
+			gwNet1Mac, err := net.ParseMAC(status.Mac)
+			if err != nil {
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
 			}
 			if len(status.IPs) == 0 {
 				continue
