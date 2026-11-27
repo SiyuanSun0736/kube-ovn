@@ -335,6 +335,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "vpc-nat-gw-ovn-noipam-0",
 				Namespace: "kube-system",
+				UID:       "pod-uid-noipam",
 				Annotations: map[string]string{
 					nadv1.NetworkStatusAnnot:                                    `[{"name":"generic-veth","interface":"eth0","ips":["10.222.0.250"],"mac":"ba:65:2d:c7:7b:1e"}]`,
 					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
@@ -342,7 +343,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			},
 		}
 		lookupByAlias := func(alias string) (netlink.Link, error) {
-			if alias == "kube-system/vpc-nat-gw-ovn-noipam-0/net1" {
+			if alias == "kube-system/vpc-nat-gw-ovn-noipam-0/pod-uid-noipam/net1" {
 				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 99, Name: "f6fca7b7_net1_h"}}, nil
 			}
 			return nil, errors.New("not found")
@@ -363,13 +364,14 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "vpc-nat-gw-ovn-no-annot-0",
 				Namespace: "kube-system",
+				UID:       "pod-uid-no-annot",
 				Annotations: map[string]string{
 					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
 				},
 			},
 		}
 		lookupByAlias := func(alias string) (netlink.Link, error) {
-			if alias == "kube-system/vpc-nat-gw-ovn-no-annot-0/net1" {
+			if alias == "kube-system/vpc-nat-gw-ovn-no-annot-0/pod-uid-no-annot/net1" {
 				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 101, Name: "f6fca7b7_net1_h"}}, nil
 			}
 			return nil, errors.New("not found")
