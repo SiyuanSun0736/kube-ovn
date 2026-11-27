@@ -352,6 +352,56 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		require.Equal(t, 0, target.ParentIfindex)
 		require.Equal(t, "ae:06:1c:85:06:ec", target.TargetMAC.String())
 	})
+
+	t.Run("veth ovs underlay mode without any network-status", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2002.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-no-annot-0",
+				Namespace: "kube-system",
+				Annotations: map[string]string{
+					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
+				},
+			},
+		}
+		lookupByAlias := func(alias string) (netlink.Link, error) {
+			if alias == "kube-system/vpc-nat-gw-ovn-no-annot-0/net1" {
+				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 101, Name: "f6fca7b7_net1_h"}}, nil
+			}
+			return nil, errors.New("not found")
+		}
+		target, err := natGwTCRedirectTargetWithAlias(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		require.NoError(t, err)
+		require.Equal(t, 101, target.TargetIfindex)
+		require.Equal(t, 0, target.ParentIfindex)
+		require.Equal(t, "ae:06:1c:85:06:ec", target.TargetMAC.String())
+	})
+
+	t.Run("veth ovs underlay mode reports alias error when noIPAM fallback has no IP", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2002.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-alias-err-0",
+				Namespace: "kube-system",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot:                                    `[{"name":"kube-system/public-ovn-2002","interface":"net1"}]`,
+					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
+				},
+			},
+		}
+		lookupByAlias := func(_ string) (netlink.Link, error) {
+			return nil, errors.New("link alias not found")
+		}
+		_, err := natGwTCRedirectTargetWithAlias(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		require.ErrorContains(t, err, "failed to locate host veth by alias")
+		require.ErrorContains(t, err, "link alias not found")
+	})
 }
 
 // TestSyncNodeRouteEIPsDeduplicatesGatewayErrors 验证多个 EIP 共享同一个失败的 NAT 网关时，

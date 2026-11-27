@@ -52,13 +52,13 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 	}
 	expectedNetName := nadNamespace + "/" + nadName
 
-	statuses, err := nadutils.GetNetworkStatus(pod)
-	if err != nil {
-		return TCRedirectTarget{}, fmt.Errorf("failed to get network status for Pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
+	statuses, statusErr := nadutils.GetNetworkStatus(pod)
 
 	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
 	if master != "" {
+		if statusErr != nil {
+			return TCRedirectTarget{}, fmt.Errorf("failed to get network status for Pod %s/%s: %w", pod.Namespace, pod.Name, statusErr)
+		}
 		name, err := util.GenMacvlanIfaceName(master)
 		if err != nil {
 			return TCRedirectTarget{}, err
@@ -89,28 +89,34 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 		// 非 macvlan 模式（例如 OVS Underlay veth-pair 或 ptp 模式）：
 		// 1. 优先通过 CNI 写入宿主端 veth 的确定性 ifalias 直接定位（不依赖宿主机路由，也不依赖 Multus network-status / IPAM）；
 		// 2. 未命中 alias 时回退至通过 Pod 外部 IP 的宿主机路由反查宿主机端 veth 设备。
+		var alias string
+		var aliasErr error
 		if lookupByAlias != nil {
 			ifName := "net1"
 			macStr := pod.Annotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, subnet.Spec.Provider)]
-			for _, status := range statuses {
-				if status.Name != expectedNetName {
-					continue
+			if statusErr == nil {
+				for _, status := range statuses {
+					if status.Name != expectedNetName {
+						continue
+					}
+					if status.Interface != "" {
+						ifName = status.Interface
+					}
+					if status.Mac != "" {
+						macStr = status.Mac
+					}
+					break
 				}
-				if status.Interface != "" {
-					ifName = status.Interface
-				}
-				if status.Mac != "" {
-					macStr = status.Mac
-				}
-				break
 			}
 			if macStr != "" {
 				gwNet1Mac, err := net.ParseMAC(macStr)
 				if err != nil {
 					return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", expectedNetName, err)
 				}
-				alias := util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, ifName)
-				if hostLink, err := lookupByAlias(alias); err == nil && hostLink != nil {
+				alias = util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, ifName)
+				var hostLink netlink.Link
+				hostLink, aliasErr = lookupByAlias(alias)
+				if aliasErr == nil && hostLink != nil {
 					gwRedirectTarget := TCRedirectTarget{TargetIfindex: hostLink.Attrs().Index, ParentIfindex: 0, TargetMAC: gwNet1Mac}
 					if !validTCRedirectTarget(gwRedirectTarget) {
 						return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
@@ -119,16 +125,22 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 				}
 			}
 		}
+		if statusErr != nil {
+			if aliasErr != nil {
+				return TCRedirectTarget{}, fmt.Errorf("failed to locate host veth by alias %q for pod %s/%s (%s): %w (network status error: %w)", alias, pod.Namespace, pod.Name, expectedNetName, aliasErr, statusErr)
+			}
+			return TCRedirectTarget{}, fmt.Errorf("failed to get network status for Pod %s/%s: %w", pod.Namespace, pod.Name, statusErr)
+		}
 		for _, status := range statuses {
 			if status.Name != expectedNetName {
+				continue
+			}
+			if len(status.IPs) == 0 {
 				continue
 			}
 			gwNet1Mac, err := net.ParseMAC(status.Mac)
 			if err != nil {
 				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
-			}
-			if len(status.IPs) == 0 {
-				continue
 			}
 			podIP := net.ParseIP(status.IPs[0])
 			if podIP == nil {
@@ -155,6 +167,9 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 				return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
 			}
 			return gwRedirectTarget, nil
+		}
+		if aliasErr != nil {
+			return TCRedirectTarget{}, fmt.Errorf("failed to locate host veth by alias %q for pod %s/%s (%s): %w", alias, pod.Namespace, pod.Name, expectedNetName, aliasErr)
 		}
 	}
 	return TCRedirectTarget{}, fmt.Errorf("pod %s/%s has no network status for %s", pod.Namespace, pod.Name, expectedNetName)

@@ -1526,7 +1526,12 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 		templateAnnotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, net1Subnet.Spec.Provider)] = "true"
 		if util.IsOvnProvider(net1Subnet.Spec.Provider) {
 			templateAnnotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, net1Subnet.Spec.Provider)] = net1Subnet.Name
-			templateAnnotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, net1Subnet.Spec.Provider)] = util.GenerateMac()
+			macKey := fmt.Sprintf(util.MacAddressAnnotationTemplate, net1Subnet.Spec.Provider)
+			if oldSts != nil && oldSts.Spec.Template.Annotations[macKey] != "" {
+				templateAnnotations[macKey] = oldSts.Spec.Template.Annotations[macKey]
+			} else {
+				templateAnnotations[macKey] = util.GenerateMac()
+			}
 			templateAnnotations[fmt.Sprintf(util.PodNicAnnotationTemplate, net1Subnet.Spec.Provider)] = util.VethType
 			if net1Subnet.Spec.Vlan != "" {
 				vlan, err := c.vlansLister.Get(net1Subnet.Spec.Vlan)

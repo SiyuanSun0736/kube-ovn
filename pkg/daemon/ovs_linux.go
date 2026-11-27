@@ -413,8 +413,17 @@ func configureHostNic(nicName, alias string) error {
 		return fmt.Errorf("can not set host nic %s qlen: %w", nicName, err)
 	}
 	if alias != "" {
-		if err = netlink.LinkSetAlias(hostLink, alias); err != nil {
-			klog.Errorf("failed to set alias %s on host nic %s: %v", alias, nicName, err)
+		if oldLink, err := netlink.LinkByAlias(alias); err == nil && oldLink != nil && oldLink.Attrs().Index != hostLink.Attrs().Index {
+			klog.Warningf("clearing stale alias %q from host nic %s (ifindex=%d) before assigning to %s (ifindex=%d)",
+				alias, oldLink.Attrs().Name, oldLink.Attrs().Index, nicName, hostLink.Attrs().Index)
+			if err := netlink.LinkSetAlias(oldLink, ""); err != nil {
+				klog.Errorf("failed to clear stale alias %q on host nic %s: %v", alias, oldLink.Attrs().Name, err)
+			}
+		}
+		if len(alias) >= 256 {
+			klog.Errorf("host nic %s alias %q length %d exceeds Linux IFALIASZ limit (255), skipping LinkSetAlias", nicName, alias, len(alias))
+		} else if err = netlink.LinkSetAlias(hostLink, alias); err != nil {
+			klog.Errorf("failed to set alias %q (len=%d) on host nic %s: %v", alias, len(alias), nicName, err)
 		}
 	}
 
