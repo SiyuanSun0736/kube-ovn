@@ -175,7 +175,8 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 		return nil, fmt.Errorf("failed to parse mac %s %w", macAddr, err)
 	}
 	if !yusur.IsYusurSmartNic(deviceID) {
-		if err = configureHostNic(hostNicName); err != nil {
+		alias := util.GenNatGwHostVethAlias(podNamespace, podName, ifName)
+		if err = configureHostNic(hostNicName, alias); err != nil {
 			klog.Error(err)
 			return nil, err
 		}
@@ -393,7 +394,7 @@ func generateNicName(containerID, ifname string) (string, string) {
 	return fmt.Sprintf("%s_%s_h", containerID[0:12-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", containerID[0:12-len(ifname)], ifname)
 }
 
-func configureHostNic(nicName string) error {
+func configureHostNic(nicName, alias string) error {
 	hostLink, err := netlink.LinkByName(nicName)
 	if err != nil {
 		return fmt.Errorf("can not find host nic %s: %w", nicName, err)
@@ -406,6 +407,11 @@ func configureHostNic(nicName string) error {
 	}
 	if err = netlink.LinkSetTxQLen(hostLink, 1000); err != nil {
 		return fmt.Errorf("can not set host nic %s qlen: %w", nicName, err)
+	}
+	if alias != "" {
+		if err = netlink.LinkSetAlias(hostLink, alias); err != nil {
+			klog.Errorf("failed to set alias %s on host nic %s: %v", alias, nicName, err)
+		}
 	}
 
 	return nil

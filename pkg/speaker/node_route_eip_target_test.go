@@ -297,6 +297,33 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
 		require.ErrorContains(t, err, "has no network status for kube-system/wan")
 	})
+
+	t.Run("veth ovs underlay mode via alias", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2001.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-0",
+				Namespace: "kube-system",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot: `[{"name":"kube-system/public-ovn-2001","interface":"net1","mac":"02:00:00:00:00:99"}]`,
+				},
+			},
+		}
+		lookupByAlias := func(alias string) (netlink.Link, error) {
+			if alias == "kube-system/vpc-nat-gw-ovn-0/net1" {
+				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 88, Name: "abcdef12_net1_h"}}, nil
+			}
+			return nil, errors.New("not found")
+		}
+		target, err := natGwTCRedirectTargetWithAlias(pod, subnet, "bond0", nil, lookupByAlias)
+		require.NoError(t, err)
+		require.Equal(t, 88, target.TargetIfindex)
+		require.Equal(t, 0, target.ParentIfindex)
+		require.Equal(t, "02:00:00:00:00:99", target.TargetMAC.String())
+	})
 }
 
 // TestSyncNodeRouteEIPsDeduplicatesGatewayErrors 验证多个 EIP 共享同一个失败的 NAT 网关时，

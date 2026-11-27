@@ -1519,7 +1519,7 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 			klog.Error(err)
 			return nil, err
 		}
-	} else {
+	} else if !util.IsOvnProvider(net1Subnet.Spec.Provider) {
 		// NAT gateway uses no-IPAM mode in network attachment definition when NoDefaultEIP is enabled
 		// This allows macvlan/other CNI plugins to work without IP allocation from Kube-OVN
 		klog.Infof("skipping IP allocation for NAT gateway %s (NoDefaultEIP enabled)", gw.Name)

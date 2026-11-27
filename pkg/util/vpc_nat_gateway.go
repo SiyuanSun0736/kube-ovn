@@ -76,6 +76,11 @@ func GenNatGwPodName(name string) string {
 	return GenNatGwPodNameWithPrefix(VpcNatGwNamePrefix, name)
 }
 
+// GenNatGwHostVethAlias returns the deterministic netlink ifalias for a Pod's host-side veth interface.
+func GenNatGwHostVethAlias(podNamespace, podName, ifName string) string {
+	return fmt.Sprintf("%s/%s/%s", podNamespace, podName, ifName)
+}
+
 // GenNatGwPodNameWithPrefix returns the full name of the NAT gateway pod within a StatefulSet
 // with an explicit name prefix.
 func GenNatGwPodNameWithPrefix(prefix, name string) string {

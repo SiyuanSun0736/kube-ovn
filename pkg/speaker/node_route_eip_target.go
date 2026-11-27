@@ -18,10 +18,14 @@ import (
 // getNatGwTCRedirectTarget 获取 EIP 对应的 NAT 网关 Pod 的 TC 重定向直通目标。
 // 直接以 EIP 本身指定的 ExternalSubnet 为准精准定位外网网卡。
 func (c *Controller) getNatGwTCRedirectTarget(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP) (TCRedirectTarget, error) {
-	return c.getNatGwTCRedirectTargetInternal(pod, eip, netlink.LinkByName)
+	return c.getNatGwTCRedirectTargetWithAlias(pod, eip, netlink.LinkByName, netlink.LinkByAlias)
 }
 
 func (c *Controller) getNatGwTCRedirectTargetInternal(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
+	return c.getNatGwTCRedirectTargetWithAlias(pod, eip, lookup, nil)
+}
+
+func (c *Controller) getNatGwTCRedirectTargetWithAlias(pod *corev1.Pod, eip *kubeovnv1.IptablesEIP, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	if eip.Spec.ExternalSubnet == "" {
 		return TCRedirectTarget{}, fmt.Errorf("iptables-eip %s has empty externalSubnet", eip.Name)
 	}
@@ -29,12 +33,16 @@ func (c *Controller) getNatGwTCRedirectTargetInternal(pod *corev1.Pod, eip *kube
 	if err != nil {
 		return TCRedirectTarget{}, fmt.Errorf("failed to get external subnet %s for EIP %s: %w", eip.Spec.ExternalSubnet, eip.Name, err)
 	}
-	return natGwTCRedirectTarget(pod, subnet, c.config.TcBpfInterface, lookup)
+	return natGwTCRedirectTargetWithAlias(pod, subnet, c.config.TcBpfInterface, lookup, lookupByAlias)
 }
 
 // TC Ingress 接收网卡与外网子网的 macvlan 父设备可以不是同一个设备。
 // 通过后者进行直通路由并精准重定向到 Pod 的真实硬件 MAC 地址。
 func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
+	return natGwTCRedirectTargetWithAlias(pod, subnet, defaultParent, lookup, nil)
+}
+
+func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultParent string, lookup, lookupByAlias func(string) (netlink.Link, error)) (TCRedirectTarget, error) {
 	if pod == nil {
 		return TCRedirectTarget{}, errors.New("NAT gateway pod is missing")
 	}
@@ -78,11 +86,26 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 			return gwRedirectTarget, nil
 		}
 	} else {
-		// 非 macvlan 模式（例如 ptp / veth-pair 模式）：
-		// 通过查询 Pod 外部 IP 的宿主机路由反查目标宿主机端 veth 设备。
+		// 非 macvlan 模式（例如 OVS Underlay veth-pair 或 ptp 模式）：
+		// 1. 优先通过 CNI 写入宿主端 veth 的确定性 ifalias 直接定位（不依赖宿主机路由，也兼容无 IPAM）；
+		// 2. 未命中 alias 时回退至通过 Pod 外部 IP 的宿主机路由反查宿主机端 veth 设备。
 		for _, status := range statuses {
 			if status.Name != expectedNetName {
 				continue
+			}
+			gwNet1Mac, err := net.ParseMAC(status.Mac)
+			if err != nil {
+				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
+			}
+			if lookupByAlias != nil && status.Interface != "" {
+				alias := util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, status.Interface)
+				if hostLink, err := lookupByAlias(alias); err == nil && hostLink != nil {
+					gwRedirectTarget := TCRedirectTarget{TargetIfindex: hostLink.Attrs().Index, ParentIfindex: 0, TargetMAC: gwNet1Mac}
+					if !validTCRedirectTarget(gwRedirectTarget) {
+						return TCRedirectTarget{}, fmt.Errorf("invalid target for Pod %s/%s", pod.Namespace, pod.Name)
+					}
+					return gwRedirectTarget, nil
+				}
 			}
 			if len(status.IPs) == 0 {
 				continue
@@ -101,10 +124,6 @@ func natGwTCRedirectTarget(pod *corev1.Pod, subnet *kubeovnv1.Subnet, defaultPar
 				return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s is not a direct route (has gateway %s)", podIP, routes[0].Gw)
 			}
 			gwHostIfindex := routes[0].LinkIndex
-			gwNet1Mac, err := net.ParseMAC(status.Mac)
-			if err != nil {
-				return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", status.Name, err)
-			}
 			if defaultParent != "" {
 				if plink, err := lookup(defaultParent); err == nil && gwHostIfindex == plink.Attrs().Index {
 					return TCRedirectTarget{}, fmt.Errorf("route for pod IP %s points to ingress interface %s (%d), not a local pod veth", podIP, defaultParent, plink.Attrs().Index)
