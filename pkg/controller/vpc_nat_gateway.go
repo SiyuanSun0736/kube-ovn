@@ -1519,11 +1519,25 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 			klog.Error(err)
 			return nil, err
 		}
-	} else if !util.IsOvnProvider(net1Subnet.Spec.Provider) {
+	} else {
 		// NAT gateway uses no-IPAM mode in network attachment definition when NoDefaultEIP is enabled
-		// This allows macvlan/other CNI plugins to work without IP allocation from Kube-OVN
+		// This allows macvlan/OVN Underlay CNI plugins to work without IP allocation from Kube-OVN
 		klog.Infof("skipping IP allocation for NAT gateway %s (NoDefaultEIP enabled)", gw.Name)
 		templateAnnotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, net1Subnet.Spec.Provider)] = "true"
+		if util.IsOvnProvider(net1Subnet.Spec.Provider) {
+			templateAnnotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, net1Subnet.Spec.Provider)] = net1Subnet.Name
+			templateAnnotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, net1Subnet.Spec.Provider)] = util.GenerateMac()
+			templateAnnotations[fmt.Sprintf(util.PodNicAnnotationTemplate, net1Subnet.Spec.Provider)] = util.VethType
+			if net1Subnet.Spec.Vlan != "" {
+				vlan, err := c.vlansLister.Get(net1Subnet.Spec.Vlan)
+				if err != nil {
+					klog.Errorf("failed to get vlan %s for external subnet %s: %v", net1Subnet.Spec.Vlan, net1Subnet.Name, err)
+					return nil, err
+				}
+				templateAnnotations[fmt.Sprintf(util.ProviderNetworkTemplate, net1Subnet.Spec.Provider)] = vlan.Spec.Provider
+				templateAnnotations[fmt.Sprintf(util.VlanIDAnnotationTemplate, net1Subnet.Spec.Provider)] = strconv.Itoa(vlan.Spec.ID)
+			}
+		}
 	}
 
 	selectors := util.GenNatGwSelectors(gw.Spec.Selector)

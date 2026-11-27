@@ -319,7 +319,7 @@ func (csh cniServerHandler) handleAdd(req *restful.Request, resp *restful.Respon
 		} else {
 			vmMigration = true
 		}
-		if pod.Annotations[fmt.Sprintf(util.ActivationStrategyTemplate, podRequest.Provider)] != "" {
+		if noIPAM || pod.Annotations[fmt.Sprintf(util.ActivationStrategyTemplate, podRequest.Provider)] != "" {
 			gatewayCheckMode = gatewayCheckModeDisabled
 		}
 

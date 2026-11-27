@@ -1006,6 +1006,14 @@ func (c *Controller) reconcileRouteSubnets(pod *v1.Pod, needRoutePodNets []*kube
 
 		podIP = pod.Annotations[fmt.Sprintf(util.IPAddressAnnotationTemplate, podNet.ProviderName)]
 		subnet = podNet.Subnet
+		if podIP == "" && pod.Annotations[util.VpcNatGatewayAnnotation] != "" {
+			mac := pod.Annotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, podNet.ProviderName)]
+			portName := ovs.PodNameToPortName(podName, pod.Namespace, podNet.ProviderName)
+			if err := c.OVNNbClient.CreateLogicalSwitchPort(subnet.Name, portName, "", mac, podName, pod.Namespace, false, "", "", false, nil, subnet.Spec.Vpc); err != nil {
+				klog.Errorf("failed to create no-ipam logical switch port %s on subnet %s for nat gw pod %s/%s: %v", portName, subnet.Name, namespace, name, err)
+				return err
+			}
+		}
 
 		// Check if pod uses nodeSwitch subnet
 		if subnet.Name == c.config.NodeSwitch {
