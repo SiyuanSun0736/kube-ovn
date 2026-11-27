@@ -110,6 +110,27 @@ static __always_inline int redirect_to_target(struct __sk_buff *skb, void *data,
         return bpf_redirect_neigh(target->ifindex, NULL, 0, 0);
     }
 
+    // 绕过 OVS/localnet 直接二层重定向至容器口（如 Underlay veth-pair）时，
+    // 若入站报文携带 802.1Q/802.1AD VLAN Tag（含硬件 offload vlan_tci 或内联 VLAN 头），
+    // 需先剥除 VLAN 封装，避免无 VLAN 子接口的容器网卡无法在 IP 层接收。
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        void *cur_data = (void *)(long)skb->data;
+        void *cur_data_end = (void *)(long)skb->data_end;
+        struct ethhdr *eth = cur_data;
+        if ((void *)(eth + 1) > cur_data_end) {
+            return TC_ACT_SHOT;
+        }
+        if (!skb->vlan_present &&
+            eth->h_proto != bpf_htons(ETH_P_8021Q) &&
+            eth->h_proto != bpf_htons(ETH_P_8021AD)) {
+            break;
+        }
+        if (bpf_skb_vlan_pop(skb) < 0) {
+            return TC_ACT_SHOT;
+        }
+    }
+
     // 若配置了目标容器网卡的 MAC 地址，则原子改写以太网目的 MAC（外层 MAC 偏移为 0）
     if (target->target_mac[0] | target->target_mac[1] | target->target_mac[2] |
         target->target_mac[3] | target->target_mac[4] | target->target_mac[5]) {

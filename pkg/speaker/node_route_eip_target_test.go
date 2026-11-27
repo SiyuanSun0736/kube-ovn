@@ -307,13 +307,14 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "vpc-nat-gw-ovn-0",
 				Namespace: "kube-system",
+				UID:       "pod-uid-123",
 				Annotations: map[string]string{
 					nadv1.NetworkStatusAnnot: `[{"name":"kube-system/public-ovn-2001","interface":"net1","mac":"02:00:00:00:00:99"}]`,
 				},
 			},
 		}
 		lookupByAlias := func(alias string) (netlink.Link, error) {
-			if alias == "kube-system/vpc-nat-gw-ovn-0/net1" {
+			if alias == "kube-system/vpc-nat-gw-ovn-0/pod-uid-123/net1" {
 				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 88, Name: "abcdef12_net1_h"}}, nil
 			}
 			return nil, errors.New("not found")

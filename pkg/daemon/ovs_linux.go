@@ -71,7 +71,7 @@ func (csh cniServerHandler) configureDpdkNic(podName, podNamespace, provider, ne
 	return ovs.SetInterfaceBandwidth(podName, podNamespace, ifaceID, egress, ingress)
 }
 
-func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns, containerID, vfDriver, ifName, mac string, mtu int, ip, gateway string, isDefaultRoute, vmMigration bool, routes []request.Route, _, _ []string, ingress, egress, deviceID, latency, limit, loss, jitter string, gwCheckMode int, u2oInterconnectionIP, oldPodName, encapIP string) ([]request.Route, error) {
+func (csh cniServerHandler) configureNic(podName, podNamespace, podUID, provider, netns, containerID, vfDriver, ifName, mac string, mtu int, ip, gateway string, isDefaultRoute, vmMigration bool, routes []request.Route, _, _ []string, ingress, egress, deviceID, latency, limit, loss, jitter string, gwCheckMode int, u2oInterconnectionIP, oldPodName, encapIP string) ([]request.Route, error) {
 	var err error
 	var hostNicName, containerNicName, pfPci string
 	var vfID int
@@ -179,7 +179,7 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 		return nil, fmt.Errorf("failed to parse mac %s %w", macAddr, err)
 	}
 	if !yusur.IsYusurSmartNic(deviceID) {
-		alias := util.GenNatGwHostVethAlias(podNamespace, podName, ifName)
+		alias := util.GenNatGwHostVethAlias(podNamespace, podName, podUID, ifName)
 		if err = configureHostNic(hostNicName, alias); err != nil {
 			klog.Error(err)
 			return nil, err

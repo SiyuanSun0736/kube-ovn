@@ -113,7 +113,7 @@ func natGwTCRedirectTargetWithAlias(pod *corev1.Pod, subnet *kubeovnv1.Subnet, d
 				if err != nil {
 					return TCRedirectTarget{}, fmt.Errorf("invalid MAC for network %s: %w", expectedNetName, err)
 				}
-				alias = util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, ifName)
+				alias = util.GenNatGwHostVethAlias(pod.Namespace, pod.Name, string(pod.UID), ifName)
 				var hostLink netlink.Link
 				hostLink, aliasErr = lookupByAlias(alias)
 				if aliasErr == nil && hostLink != nil {
