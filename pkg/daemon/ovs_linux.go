@@ -1256,6 +1256,9 @@ func configureNic(link, ip string, macAddr net.HardwareAddr, mtu int, detectIPv4
 	}
 
 	for ipStr := range strings.SplitSeq(ip, ",") {
+		if ipStr == "" {
+			continue
+		}
 		// Do not reassign same address for link
 		if _, ok := ipDelMap[ipStr]; ok {
 			delete(ipDelMap, ipStr)
