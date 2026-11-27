@@ -112,8 +112,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 			"external_ids:vendor=" + util.CniTypeName,
 			"external_ids:pod_name=" + podName,
 			"external_ids:pod_namespace=" + podNamespace,
-			"external_ids:ip=" + ipStr,
 			"external_ids:pod_netns=" + netns,
+		}
+		if ipStr != "" {
+			args = append(args, "external_ids:ip="+ipStr)
 		}
 		if encapIP != "" {
 			args = append(args, "external_ids:encap-ip="+encapIP)
@@ -130,8 +132,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 			"external_ids:vendor=" + util.CniTypeName,
 			"external_ids:pod_name=" + podName,
 			"external_ids:pod_namespace=" + podNamespace,
-			"external_ids:ip=" + ipStr,
 			"external_ids:pod_netns=" + netns,
+		}
+		if ipStr != "" {
+			args = append(args, "external_ids:ip="+ipStr)
 		}
 		if encapIP != "" {
 			args = append(args, "external_ids:encap-ip="+encapIP)
