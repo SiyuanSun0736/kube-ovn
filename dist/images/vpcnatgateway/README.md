@@ -235,7 +235,24 @@ add rule ip kube-ovn conn-limit tcp flags & (fin|syn|rst|ack) == syn ct count ov
 
 同时，多后端场景会保留 `table ip kube-ovn` 中的 Share-DNAT 表项以兜底 VPC 内部发卡（Hairpin）流量；ClusterIP 与 `lanIP` 流量不经过公网卡，严格保留在有状态路径，防止与公网 EIP 产生出向三元组反向映射冲突。
 
-### 4.3 分片与 ICMP
+### 4.3 Maglev 槽位生成算法（`stateless_maglev_vmap_entries`）
+
+[nat-gateway.sh](nat-gateway.sh) 用纯 POSIX / BusyBox `awk` 生成固定 127 个槽位的 Maglev 一致性哈希表。
+
+因为 POSIX / BusyBox `awk` 没有内置 `ord()` 函数，`BEGIN` 块先构建了一张 ASCII `32..126` 的字符编码查表字典 `ord[]`，用来逐字符读取排序后的 `<ip>:<port>` 字符串，再计算两组独立哈希：
+
+```awk
+h1 = int((h1 * 33 + ch) % 2147483647)
+h2 = int((h2 * 131 + ch + 17) % 2147483647)
+```
+
+`h1`（初值 `5381`，乘数 `33`）改写自 Daniel J. Bernstein 的 `djb2` 字符串哈希（参考 https://www.cse.yorku.ca/~oz/hash.html ），`h2`（初值 `0`，乘数 `131`，偏移 `17`）则参考了常见的 BKDRHash 乘数，为 [Maglev 论文](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf) 所需的第二路独立散列提供计算。原版 C 实现依赖无符号整数溢出截断，而 `awk` 数值底层是 IEEE 754 双精度浮点数（精确整数上限为 $2^{53}$），因此每步改对梅森质数 `2147483647`（$2^{31}-1$）取模，使中间值最大不超过约 $2.81 \times 10^{11}$，避免计算过程中出现精度丢失。
+
+接着用这两组哈希算出每个后端的偏好序列参数：起始偏移 `offset = h1 % 127`（`0..126`），探测步长 `skip = (h2 % 126) + 1`（`1..126`）。由于 `127` 是质数，任意 `skip` 都与 `127` 互质，因此序列 `(offset + k * skip) mod 127`（$k = 0..126$）能够不重复地遍历全部 127 个槽位。
+
+所有后端按字典序排序后，轮流沿各自的偏好序列占领下一个空槽（`slot[c] == -1`），直到 127 个槽位全部填满（`vmap` 不允许留空槽）。扩缩容时存活后端自身的 `offset` 和 `skip` 保持不变，但因重新轮询填槽会改变碰撞顺位，仅当后端数远小于槽位数（$N \ll 127$）时槽位迁移率才接近 $1/N$；当 $N$ 接近 `127` 时，存活后端之间的槽位重分配会明显增多（迁移比例高于 $1/N$），部分发往健康后端的存量 TCP 连接也可能因此中断。
+
+### 4.4 分片与 ICMP
 
 notrack 绕过了 conntrack defrag，UDP 大包分片中除首片外的报文不带传输层端口，无法匹配 DNAT 规则。
 
